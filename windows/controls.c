@@ -935,6 +935,205 @@ static HTREEITEM tree_find_child_by_name(HWND tv, HTREEITEM parent,
     return NULL;
 }
 
+/*
+ * Fetch the text of a tree item, growing the buffer until it all fits.
+ */
+static char *tree_item_text(HWND tv, HTREEITEM item)
+{
+    size_t size = 128;
+
+    while (size <= 65536) {
+        char *text = snewn(size, char);
+        TVITEM tvi;
+
+        memset(&tvi, 0, sizeof(tvi));
+        tvi.hItem = item;
+        tvi.mask = TVIF_TEXT;
+        tvi.pszText = text;
+        tvi.cchTextMax = (int)size;
+
+        if (!TreeView_GetItem(tv, &tvi)) {
+            sfree(text);
+            return NULL;
+        }
+        if (strlen(text) < size - 1)
+            return text;               /* not truncated, so it's all there */
+        sfree(text);
+        size *= 2;
+    }
+
+    return NULL;
+}
+
+/*
+ * Build the '/'-separated path of an item, in the form it has in a
+ * session name (so a folder "tools" inside "dev" gives "dev/tools").
+ */
+static char *tree_item_path(HWND tv, HTREEITEM item)
+{
+    HTREEITEM *chain = NULL;
+    size_t nchain = 0, i;
+    HTREEITEM it = item;
+    strbuf *path;
+    char *result = NULL;
+
+    /* Collect the chain of ancestors, starting at this item. */
+    while (it) {
+        chain = sresize(chain, nchain + 1, HTREEITEM);
+        chain[nchain++] = it;
+        it = TreeView_GetParent(tv, it);
+    }
+
+    path = strbuf_new();
+    for (i = nchain; i-- > 0 ;) {
+        char *text = tree_item_text(tv, chain[i]);
+        if (!text) {
+            strbuf_free(path);
+            goto done;
+        }
+        if (path->len)
+            put_byte(path, '/');
+        put_data(path, text, strlen(text));
+        sfree(text);
+    }
+    result = strbuf_to_str(path);
+
+  done:
+    sfree(chain);
+    return result;
+}
+
+/*
+ * Which folders the user has opened. The portable dialog layer rebuilds
+ * the whole contents of a list box whenever it refreshes, and throws
+ * the control away altogether when the user switches to another
+ * configuration panel, so without remembering this the folders would
+ * snap shut at every opportunity. The list is also kept in the Registry,
+ * so it survives from one run of PuTTY to the next.
+ *
+ * Each entry is a folder path exactly as it appears in a session name,
+ * e.g. "dev" or "dev/tools".
+ */
+#define EXPANDED_FOLDERS_KEY   PUTTY_REG_POS "\\SessionsExpanded"
+#define EXPANDED_FOLDERS_VALUE "ExpandedFolders"
+
+static strbuf *expanded_folders = NULL;
+static bool expanded_folders_loaded = false;
+
+/*
+ * True while the contents of a tree are being rebuilt. Expand and
+ * collapse notifications that arrive during a rebuild are the effect of
+ * what we're doing, not something the user asked for, so they are
+ * ignored.
+ */
+static bool tree_rebuilding = false;
+
+/* The list of expanded folders, read from the Registry on first use. */
+static strbuf *get_expanded_folders(void)
+{
+    if (!expanded_folders_loaded) {
+        HKEY rkey;
+
+        expanded_folders_loaded = true;
+        rkey = open_regkey_ro(HKEY_CURRENT_USER, EXPANDED_FOLDERS_KEY);
+        if (rkey) {
+            expanded_folders = get_reg_multi_sz(rkey, EXPANDED_FOLDERS_VALUE);
+            close_regkey(rkey);
+        }
+        if (!expanded_folders)
+            expanded_folders = strbuf_new();
+    }
+    return expanded_folders;
+}
+
+static bool folder_is_expanded(const char *path)
+{
+    BinarySource src[1];
+    const char *entry;
+
+    BinarySource_BARE_INIT_PL(src, ptrlen_from_strbuf(get_expanded_folders()));
+    while (true) {
+        entry = get_asciz(src);
+        if (get_err(src))
+            break;
+        if (*entry && !strcmp(entry, path))
+            return true;
+    }
+
+    return false;
+}
+
+/* Note that a folder is now open (or shut), and save the new list. */
+static void set_folder_expanded(const char *path, bool expanded)
+{
+    strbuf *newlist = strbuf_new();
+    BinarySource src[1];
+    const char *entry;
+    bool found = false, changed = false;
+
+    BinarySource_BARE_INIT_PL(src, ptrlen_from_strbuf(get_expanded_folders()));
+    while (true) {
+        entry = get_asciz(src);
+        if (get_err(src))
+            break;
+        if (!*entry)                   /* ignore empty entries */
+            continue;
+        if (!strcmp(entry, path)) {
+            found = true;
+            if (!expanded) {
+                changed = true;
+                continue;              /* drop it from the list */
+            }
+        }
+        put_asciz(newlist, entry);
+    }
+
+    if (expanded && !found) {
+        put_asciz(newlist, path);
+        changed = true;
+    }
+
+    if (!changed) {
+        strbuf_free(newlist);          /* nothing to record */
+        return;
+    }
+
+    if (newlist->len == 0)
+        put_byte(newlist, '\0');       /* an empty MULTI_SZ value */
+
+    strbuf_free(expanded_folders);
+    expanded_folders = newlist;
+
+    {
+        HKEY rkey = create_regkey(HKEY_CURRENT_USER, EXPANDED_FOLDERS_KEY);
+        if (rkey) {
+            put_reg_multi_sz(rkey, EXPANDED_FOLDERS_VALUE, newlist);
+            close_regkey(rkey);
+        }
+    }
+}
+
+/*
+ * Open every folder which the user had open before. This has to be done
+ * after the whole tree has been populated, because a folder can only be
+ * expanded once it has children to show.
+ */
+static void tree_restore_expanded_folders(HWND tv, HTREEITEM parent)
+{
+    HTREEITEM item = TreeView_GetChild(tv, parent);
+
+    while (item) {
+        char *path = tree_item_path(tv, item);
+        if (path) {
+            if (folder_is_expanded(path))
+                TreeView_Expand(tv, item, TVE_EXPAND);
+            sfree(path);
+        }
+        tree_restore_expanded_folders(tv, item);
+        item = TreeView_GetNextSibling(tv, item);
+    }
+}
+
 /* Add a name to the tree, creating any folders it names on the way. */
 static void tree_add_item(HWND tv, const char *name, int index)
 {
@@ -2358,6 +2557,26 @@ bool winctrl_handle_notify(struct dlgparam *dp, WPARAM wParam, LPARAM lParam)
       case TVN_SELCHANGED:
         ctrl->handler(ctrl, dp, dp->data, EVENT_SELCHANGE);
         break;
+
+      case TVN_ITEMEXPANDED: {
+        /*
+         * A folder has been opened or shut: remember that, so that it
+         * stays that way when the list is rebuilt.
+         */
+        NMTREEVIEW *nmtv = (NMTREEVIEW *)lParam;
+
+        if (tree_rebuilding)
+            break;             /* our own doing, not the user's */
+
+        if (tree_index_of_item(nh->hwndFrom, nmtv->itemNew.hItem) < 0) {
+            char *path = tree_item_path(nh->hwndFrom, nmtv->itemNew.hItem);
+            if (path) {
+                set_folder_expanded(path, nmtv->action == TVE_EXPAND);
+                sfree(path);
+            }
+        }
+        break;
+      }
     }
 
     return false;
@@ -2516,6 +2735,7 @@ void dlg_listbox_clear(dlgcontrol *ctrl, dlgparam *dp)
             (c->ctrl->type == CTRL_EDITBOX &&
              c->ctrl->editbox.has_list)));
     if (listbox_is_tree(c)) {
+        tree_rebuilding = true;
         TreeView_DeleteAllItems(GetDlgItem(dp->hwnd, c->base_id+1));
         return;
     }
@@ -2648,8 +2868,19 @@ void dlg_listbox_select(dlgcontrol *ctrl, dlgparam *dp, int index)
     if (listbox_is_tree(c)) {
         HWND tv = GetDlgItem(dp->hwnd, c->base_id+1);
         HTREEITEM item = tree_item_by_index(tv, TVI_ROOT, index);
-        if (item)
+        if (item) {
+            /*
+             * Selecting an item makes the tree reveal it, which can
+             * open folders that were shut. That's useful when the user
+             * is typing a session name, but it isn't the user opening
+             * the folder themselves, so don't add it to the list of
+             * folders we remember as open.
+             */
+            bool was_rebuilding = tree_rebuilding;
+            tree_rebuilding = true;
             TreeView_SelectItem(tv, item);
+            tree_rebuilding = was_rebuilding;
+        }
         return;
     }
     msg = (c->ctrl->listbox.height != 0 ? LB_SETCURSEL : CB_SETCURSEL);
@@ -2773,6 +3004,8 @@ void dlg_update_start(dlgcontrol *ctrl, dlgparam *dp)
 {
     struct winctrl *c = dlg_findbyctrl(dp, ctrl);
     if (c && c->ctrl->type == CTRL_LISTBOX) {
+        if (c->ctrl->listbox.tree)
+            tree_rebuilding = true;
         SendDlgItemMessage(dp->hwnd, c->base_id+1, WM_SETREDRAW, false, 0);
     }
 }
@@ -2783,6 +3016,14 @@ void dlg_update_done(dlgcontrol *ctrl, dlgparam *dp)
     if (c && c->ctrl->type == CTRL_LISTBOX) {
         HWND hw = GetDlgItem(dp->hwnd, c->base_id+1);
         SendMessage(hw, WM_SETREDRAW, true, 0);
+        if (c->ctrl->listbox.tree) {
+            /*
+             * The tree has been rebuilt from scratch, so put back any
+             * folders the user had open.
+             */
+            tree_rebuilding = false;
+            tree_restore_expanded_folders(hw, TVI_ROOT);
+        }
         InvalidateRect(hw, NULL, true);
     }
 }
