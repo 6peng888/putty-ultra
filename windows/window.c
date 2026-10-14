@@ -1090,16 +1090,19 @@ static HFONT tab_label_font(void)
 
 /*
  * Compose the caption of tab idx: its 1-based number (so the tabs can
- * be told apart at a glance) and the session title, with a leading '*'
- * on the active tab.
+ * be told apart at a glance) followed by the session title.
+ *
+ * Nothing about the text depends on whether the tab is the active one:
+ * the active tab is indicated by its background instead (see the
+ * WM_PAINT handler), so that switching tabs cannot change how wide any
+ * tab is.
  */
 static void tab_label(int idx, wchar_t *buf, size_t buflen)
 {
     const wchar_t *name = tab_list[idx]->window_name ?
         tab_list[idx]->window_name : L"";
 
-    _snwprintf(buf, buflen, L"%s%d: %s", idx == tab_active ? L"* " : L"",
-               idx + 1, name);
+    _snwprintf(buf, buflen, L"%d: %s", idx + 1, name);
     buf[buflen - 1] = L'\0';
 }
 
@@ -1588,6 +1591,10 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
          * Draw from the rectangles worked out by tab_update_layout (so
          * painting and clicking always agree), in a font scaled to the
          * frame's DPI.
+         *
+         * The active tab is marked by its background: the system
+         * highlight colour, with the matching text colour. Inactive tabs
+         * take the strip's own colour, so they merge into it.
          */
         HFONT oldf = SelectObject(hdc, tab_label_font());
         SetBkMode(hdc, TRANSPARENT);
@@ -1597,14 +1604,18 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
         for (int i = 0; i < g_tabcount; i++) {
             RECT tr = g_tabrects[i], trtext, cr;
             wchar_t label[1024];
+            bool active = (i == tab_active);
 
             if (tr.right <= tr.left || tr.bottom <= tr.top)
                 continue;             /* this tab has no room in the strip */
 
-            FillRect(hdc, &tr, GetSysColorBrush(
-                         i == tab_active ? COLOR_WINDOW : COLOR_BTNFACE));
-            DrawEdge(hdc, &tr,
-                     i == tab_active ? EDGE_RAISED : EDGE_ETCHED, BF_RECT);
+            FillRect(hdc, &tr, GetSysColorBrush(active ?
+                                                COLOR_HIGHLIGHT :
+                                                COLOR_BTNFACE));
+            DrawEdge(hdc, &tr, active ? EDGE_RAISED : EDGE_ETCHED, BF_RECT);
+            SetTextColor(hdc, GetSysColor(active ?
+                                          COLOR_HIGHLIGHTTEXT :
+                                          COLOR_BTNTEXT));
 
             /* Close box on the right-hand end of the tab */
             cr = tr;
@@ -1622,6 +1633,7 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
 
         if (g_plusrect.right > g_plusrect.left &&
             g_plusrect.bottom > g_plusrect.top) {
+            SetTextColor(hdc, GetSysColor(COLOR_BTNTEXT));
             DrawEdge(hdc, &g_plusrect, EDGE_RAISED, BF_RECT);
             DrawTextW(hdc, L"+", -1, &g_plusrect,
                       DT_CENTER | DT_VCENTER | DT_SINGLELINE);
