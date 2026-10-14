@@ -339,6 +339,14 @@ struct dlgcontrol {
              * right-hand side.
              */
             bool hscroll;
+            /*
+             * If this is set, the list is displayed as a tree: entries
+             * whose names contain '/' are arranged into a folder
+             * hierarchy, and only the leaf entries are selectable by
+             * index. Front ends which don't implement this will simply
+             * show a flat list.
+             */
+            bool tree;
         } listbox;
         struct { /* for CTRL_FILESELECT */
             char shortcut;

@@ -126,6 +126,16 @@ static INT_PTR pds_default_dlgproc(PortableDialogStuff *pds, HWND hwnd,
             ret = 0;
         return ret;
       }
+      case WM_NOTIFY:
+        /*
+         * Controls which report things via WM_NOTIFY (i.e. the tree
+         * view used for saved sessions) get a look-in, once the dialog
+         * is fully set up.
+         */
+        if (pds->initialised && winctrl_handle_notify(pds->dp, wParam, lParam))
+            return 1;
+        return 0;
+
       case WM_HELP:
         if (!winctrl_context_help(pds->dp,
                                   hwnd, ((LPHELPINFO)lParam)->iCtrlId))
@@ -527,7 +537,7 @@ static INT_PTR GenericMainDlgProc(HWND hwnd, UINT msg, WPARAM wParam,
       case WM_INITDIALOG:
         pds_initdialog_start(pds, hwnd);
 
-        pds_create_controls(pds, TREE_BASE, IDCX_STDBASE, 3, 3, 235, "");
+        pds_create_controls(pds, TREE_BASE, IDCX_STDBASE, 3, 3, 312, "");
 
         SendMessage(hwnd, WM_SETICON, (WPARAM) ICON_BIG,
                     (LPARAM) LoadIcon(hinst, MAKEINTRESOURCE(IDI_CFGICON)));
@@ -559,7 +569,7 @@ static INT_PTR GenericMainDlgProc(HWND hwnd, UINT msg, WPARAM wParam,
             r.left = 3;
             r.right = r.left + 95;
             r.top = 13;
-            r.bottom = r.top + 219;
+            r.bottom = r.top + 293;
             MapDialogRect(hwnd, &r);
             treeview = CreateWindowEx(WS_EX_CLIENTEDGE, WC_TREEVIEW, "",
                                       WS_CHILD | WS_VISIBLE |
@@ -715,7 +725,16 @@ static INT_PTR GenericMainDlgProc(HWND hwnd, UINT msg, WPARAM wParam,
             InvalidateRect (hwnd, NULL, true);
 
             SetFocus(((LPNMHDR) lParam)->hwndFrom);     /* ensure focus stays */
+            return 0;
         }
+        /*
+         * Notifications from anywhere else (i.e. from a tree-view
+         * styled list box such as the saved-session list) are the
+         * business of the control they come from.
+         */
+        if (pds->initialised &&
+            winctrl_handle_notify(pds->dp, wParam, lParam))
+            return 1;
         return 0;
 
       default:

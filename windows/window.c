@@ -1083,25 +1083,90 @@ static void close_tab(int idx)
     DestroyWindow(w->term_hwnd);
 }
 
+/*
+ * Fill in a menu with the saved sessions. Sessions whose names contain
+ * '/' are grouped into submenus named after the folders, i.e. the
+ * session "prod/web-01" appears in the "prod" submenu as "web-01"; the
+ * name may have any number of '/'s in it.
+ *
+ * The ID stored with each session's menu item encodes its index in
+ * sesslist, so the command handler can work out which session was
+ * picked.
+ */
+static void build_savedsess_menu(HMENU menu)
+{
+    /*
+     * level_menu[N] is the menu to which the next item at that depth
+     * should be added, and level_prefix[N] describes the folder path
+     * that menu stands for (as a prefix of the session name currently
+     * being processed).
+     */
+    HMENU level_menu[9];
+    const char *level_prefix[9];
+    size_t level_prefixlen[9];
+    int nlevels = 1;
+    const char *prevname = NULL;
+    int i, limit;
+
+    while (DeleteMenu(menu, 0, MF_BYPOSITION))
+        continue;
+
+    if (sesslist.nsessions <= 1) {
+        AppendMenu(menu, MF_GRAYED, IDM_SAVED_MIN, "(No sessions)");
+        return;
+    }
+
+    level_menu[0] = menu;
+
+    limit = (sesslist.nsessions <= MENU_SAVED_MAX + 1)
+        ? sesslist.nsessions : MENU_SAVED_MAX + 1;
+
+    /*
+     * sesslist is sorted, so the sessions in any one folder arrive
+     * consecutively, and a folder only needs a new submenu when the
+     * previous session didn't have the same folder path.
+     */
+    for (i = 1; i < limit; i++) {
+        const char *name = sesslist.sessions[i];
+        const char *p = name;
+        const char *slash;
+        int level = 0;
+
+        while ((slash = strchr(p, '/')) != NULL) {
+            size_t plen = (size_t)(slash - name) + 1;
+
+            if (level + 1 >= nlevels ||
+                level_prefixlen[level + 1] != plen ||
+                !prevname ||
+                memcmp(level_prefix[level + 1], name, plen) != 0) {
+                HMENU sub = CreatePopupMenu();
+                char *label = dupprintf("%.*s", (int)(slash - p), p);
+                AppendMenu(level_menu[level], MF_POPUP | MF_ENABLED,
+                           (UINT_PTR)sub, label);
+                sfree(label);
+                level_menu[level + 1] = sub;
+                level_prefix[level + 1] = name;
+                level_prefixlen[level + 1] = plen;
+                nlevels = level + 2;
+            }
+
+            level++;
+            p = slash + 1;
+        }
+
+        AppendMenu(level_menu[level], MF_ENABLED,
+                   IDM_SAVED_MIN + (i - 1) * MENU_SAVED_STEP, p);
+        prevname = name;
+    }
+}
+
 static void frame_build_saved_menu(void)
 {
     if (!frame_savedsess_menu)
         return;
-    while (DeleteMenu(frame_savedsess_menu, 0, MF_BYPOSITION))
-        continue;
     get_sesslist(&sesslist, false);
     get_sesslist(&sesslist, true);
-    if (sesslist.nsessions <= 1) {
-        AppendMenu(frame_savedsess_menu, MF_GRAYED, IDM_SAVED_MIN,
-                   "(No sessions)");
-    } else {
-        int limit = (sesslist.nsessions <= MENU_SAVED_MAX + 1)
-            ? sesslist.nsessions : MENU_SAVED_MAX + 1;
-        for (int p = 0; p + 1 < limit; p++)
-            AppendMenu(frame_savedsess_menu, MF_ENABLED,
-                       IDM_SAVED_MIN + p * MENU_SAVED_STEP,
-                       sesslist.sessions[p + 1]);
-    }
+    build_savedsess_menu(frame_savedsess_menu);
 }
 
 static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
@@ -1795,19 +1860,9 @@ void cleanup_exit(int code)
  */
 static void update_savedsess_menu(WinGuiSeat *wgs)
 {
-    int i;
-    while (DeleteMenu(wgs->savedsess_menu, 0, MF_BYPOSITION)) ;
-    /* skip sesslist.sessions[0] == Default Settings */
-    for (i = 1;
-         i < ((sesslist.nsessions <= MENU_SAVED_MAX+1) ? sesslist.nsessions
-                                                       : MENU_SAVED_MAX+1);
-         i++)
-        AppendMenu(wgs->savedsess_menu, MF_ENABLED,
-                   IDM_SAVED_MIN + (i-1)*MENU_SAVED_STEP,
-                   sesslist.sessions[i]);
-    if (sesslist.nsessions <= 1)
-        AppendMenu(wgs->savedsess_menu, MF_GRAYED, IDM_SAVED_MIN,
-                   "(No sessions)");
+    /* sesslist.sessions[0] ("Default Settings") is skipped by the
+     * builder, which only ever lists sessions from index 1 onwards. */
+    build_savedsess_menu(wgs->savedsess_menu);
 }
 
 /*

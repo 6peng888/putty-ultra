@@ -617,6 +617,7 @@ void winctrl_layout(struct dlgparam *dp, struct winctrls *wc,
                     struct ctlpos *cp, struct controlset *s, int *id);
 bool winctrl_handle_command(struct dlgparam *dp, UINT msg,
                             WPARAM wParam, LPARAM lParam);
+bool winctrl_handle_notify(struct dlgparam *dp, WPARAM wParam, LPARAM lParam);
 void winctrl_rem_shortcuts(struct dlgparam *dp, struct winctrl *c);
 bool winctrl_context_help(struct dlgparam *dp, HWND hwnd, int id);
 
@@ -802,6 +803,8 @@ HKEY open_regkey_fn(bool create, bool write, HKEY base, const char *path, ...);
 void close_regkey(HKEY key);
 void del_regkey(HKEY key, const char *name);
 char *enum_regkey(HKEY key, int index);
+bool enum_regvalue(HKEY key, int index, strbuf *name_out,
+                   DWORD *type_out, strbuf *data_out);
 bool get_reg_dword(HKEY key, const char *name, DWORD *out);
 bool put_reg_dword(HKEY key, const char *name, DWORD value);
 char *get_reg_sz(HKEY key, const char *name);

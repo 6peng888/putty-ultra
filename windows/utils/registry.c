@@ -71,6 +71,52 @@ char *enum_regkey(HKEY key, int index)
     }
 }
 
+/*
+ * Enumerate the values in a registry key, for the benefit of the code
+ * that migrates old Registry-based saved sessions into files. On
+ * success, `name_out' receives the value name (0-terminated), `type_out'
+ * the value type, and `data_out' the raw data: for REG_SZ that's the
+ * string (including its terminating NUL, if the registry supplied one),
+ * and for REG_DWORD the four raw bytes of the number.
+ */
+bool enum_regvalue(HKEY key, int index, strbuf *name_out,
+                   DWORD *type_out, strbuf *data_out)
+{
+    size_t namesize = MAX_PATH + 1, datasize = 256;
+
+    while (1) {
+        char *name = snewn(namesize, char);
+        BYTE *data = snewn(datasize, BYTE);
+        DWORD namelen = namesize, datalen = datasize, type;
+        LONG status = RegEnumValue(key, index, name, &namelen, NULL,
+                                   &type, data, &datalen);
+
+        if (status == ERROR_SUCCESS) {
+            strbuf_clear(name_out);
+            put_data(name_out, name, namelen);
+            put_byte(name_out, '\0');
+            strbuf_clear(data_out);
+            put_data(data_out, data, datalen);
+            put_byte(data_out, '\0');
+            *type_out = type;
+            sfree(name);
+            sfree(data);
+            return true;
+        }
+
+        sfree(name);
+        sfree(data);
+
+        if (status != ERROR_MORE_DATA)
+            return false;
+
+        if (namelen + 1 > namesize)
+            namesize = namelen + 1;
+        if (datalen > datasize)
+            datasize = datalen;
+    }
+}
+
 bool get_reg_dword(HKEY key, const char *name, DWORD *out)
 {
     DWORD type, size;

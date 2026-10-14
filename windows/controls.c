@@ -37,6 +37,12 @@
 #define COMBOHEIGHT 12
 #define PUSHBTNHEIGHT 14
 #define PROGBARHEIGHT 14
+/*
+ * A tree view needs a bit more room per line than a list box, because
+ * tree items are taller than list box lines.
+ */
+#define TREEHEIGHT 12
+#define TREEINCREMENT 11
 
 DECL_WINDOWS_FUNCTION(static, void, InitCommonControls, (void));
 DECL_WINDOWS_FUNCTION(static, BOOL, MakeDragList, (HWND));
@@ -792,6 +798,196 @@ void listbox(struct ctlpos *cp, const char *stext,
           WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
           LBS_NOTIFY | LBS_HASSTRINGS | LBS_USETABSTOPS |
           (multi ? LBS_MULTIPLESEL : 0),
+          WS_EX_CLIENTEDGE, "", lid);
+}
+
+/*
+ * ======================================================================
+ * Tree view, used in place of a list box when the portable dialog layer
+ * asks for one (ctrl->listbox.tree).
+ *
+ * This lets us display a folder hierarchy for things whose names
+ * contain '/', which is how saved sessions are organised. The text
+ * given to dlg_listbox_add() is the whole name, e.g. "prod/web-01";
+ * the index by which the portable layer refers to an item is stored in
+ * that item's lParam. Folder items have lParam -1, which is not a valid
+ * index, so to the portable layer a selected folder looks exactly like
+ * nothing being selected at all.
+ * ======================================================================
+ */
+
+#define TV_FOLDER_PARAM (-1)
+
+#if _WIN32_IE >= 0x0400 && defined NONAMELESSUNION
+#define TREEINSITEM DUMMYUNIONNAME.item
+#else
+#define TREEINSITEM item
+#endif
+
+static int tree_index_of_item(HWND tv, HTREEITEM item)
+{
+    TVITEM tvi;
+
+    if (!item)
+        return -1;
+
+    memset(&tvi, 0, sizeof(tvi));
+    tvi.hItem = item;
+    tvi.mask = TVIF_PARAM;
+    if (!TreeView_GetItem(tv, &tvi))
+        return -1;
+
+    return (int)tvi.lParam;
+}
+
+/* Find the item with a given index, anywhere in the tree. */
+static HTREEITEM tree_item_by_index(HWND tv, HTREEITEM parent, int index)
+{
+    HTREEITEM item = TreeView_GetChild(tv, parent);
+
+    while (item) {
+        HTREEITEM sub;
+
+        if (tree_index_of_item(tv, item) == index)
+            return item;
+
+        sub = tree_item_by_index(tv, item, index);
+        if (sub)
+            return sub;
+
+        item = TreeView_GetNextSibling(tv, item);
+    }
+
+    return NULL;
+}
+
+/* Count the session (i.e. non-folder) items in a subtree. */
+static int tree_count_items(HWND tv, HTREEITEM parent)
+{
+    int count = 0;
+    HTREEITEM item = TreeView_GetChild(tv, parent);
+
+    while (item) {
+        if (tree_index_of_item(tv, item) >= 0)
+            count++;
+        count += tree_count_items(tv, item);
+        item = TreeView_GetNextSibling(tv, item);
+    }
+
+    return count;
+}
+
+static HTREEITEM tree_insert_item(HWND tv, HTREEITEM parent,
+                                  const char *text, size_t len, int index)
+{
+    char *name = snewn(len + 1, char);
+    TVINSERTSTRUCT ins;
+    HTREEITEM item;
+
+    memcpy(name, text, len);
+    name[len] = '\0';
+
+    memset(&ins, 0, sizeof(ins));
+    ins.hParent = parent;
+    ins.hInsertAfter = TVI_LAST;
+    ins.TREEINSITEM.mask = TVIF_TEXT | TVIF_PARAM | TVIF_CHILDREN;
+    ins.TREEINSITEM.pszText = name;
+    ins.TREEINSITEM.lParam = index;
+    ins.TREEINSITEM.cChildren = (index == TV_FOLDER_PARAM);
+
+    item = TreeView_InsertItem(tv, &ins);
+    sfree(name);
+    return item;
+}
+
+static HTREEITEM tree_find_child_by_name(HWND tv, HTREEITEM parent,
+                                         const char *name, size_t len)
+{
+    char *buf = snewn(len + 2, char);
+    HTREEITEM item = TreeView_GetChild(tv, parent);
+
+    while (item) {
+        TVITEM tvi;
+
+        memset(&tvi, 0, sizeof(tvi));
+        tvi.hItem = item;
+        tvi.mask = TVIF_TEXT | TVIF_PARAM;
+        tvi.pszText = buf;
+        tvi.cchTextMax = len + 2;
+
+        /*
+         * The buffer is one character longer than the name we're
+         * looking for, so a longer name can't be mistaken for a match:
+         * it will come back truncated but non-terminated early, and
+         * the strlen test will reject it.
+         */
+        if (TreeView_GetItem(tv, &tvi) &&
+            (int)tvi.lParam == TV_FOLDER_PARAM &&
+            strlen(buf) == len && !memcmp(buf, name, len)) {
+            sfree(buf);
+            return item;
+        }
+
+        item = TreeView_GetNextSibling(tv, item);
+    }
+
+    sfree(buf);
+    return NULL;
+}
+
+/* Add a name to the tree, creating any folders it names on the way. */
+static void tree_add_item(HWND tv, const char *name, int index)
+{
+    HTREEITEM parent = TVI_ROOT;
+    const char *p = name;
+
+    while (1) {
+        const char *slash = strchr(p, '/');
+        size_t len = slash ? (size_t)(slash - p) : strlen(p);
+
+        if (!slash) {
+            tree_insert_item(tv, parent, p, len, index);
+            return;
+        }
+
+        if (len > 0) {
+            HTREEITEM folder = tree_find_child_by_name(tv, parent, p, len);
+            if (!folder)
+                folder = tree_insert_item(tv, parent, p, len,
+                                          TV_FOLDER_PARAM);
+            parent = folder;
+        }
+
+        p = slash + 1;
+    }
+}
+
+/*
+ * A tree view with a static labelling it.
+ */
+void treebox(struct ctlpos *cp, const char *stext,
+             int sid, int lid, int lines)
+{
+    RECT r;
+
+    if (stext != NULL) {
+        r.left = GAPBETWEEN;
+        r.top = cp->ypos;
+        r.right = cp->width;
+        r.bottom = STATICHEIGHT;
+        cp->ypos += r.bottom + GAPWITHIN;
+        doctl(cp, r, "STATIC", WS_CHILD | WS_VISIBLE, 0, stext, sid);
+    }
+
+    r.left = GAPBETWEEN;
+    r.top = cp->ypos;
+    r.right = cp->width;
+    r.bottom = TREEHEIGHT + (lines - 1) * TREEINCREMENT;
+    cp->ypos += r.bottom + GAPBETWEEN;
+    doctl(cp, r, WC_TREEVIEW,
+          WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
+          TVS_HASLINES | TVS_LINESATROOT | TVS_HASBUTTONS |
+          TVS_SHOWSELALWAYS,
           WS_EX_CLIENTEDGE, "", lid);
 }
 
@@ -1635,6 +1831,10 @@ void winctrl_layout(struct dlgparam *dp, struct winctrls *wc,
                     staticddl(&pos, escaped, base_id,
                               base_id+1, ctrl->listbox.percentwidth);
                 }
+            } else if (ctrl->listbox.tree) {
+                /* Ordinary list, shown as a folder hierarchy. */
+                treebox(&pos, escaped, base_id, base_id+1,
+                        ctrl->listbox.height);
             } else {
                 /* Ordinary list. */
                 listbox(&pos, escaped, base_id, base_id+1,
@@ -2097,6 +2297,73 @@ bool winctrl_handle_command(struct dlgparam *dp, UINT msg,
 }
 
 /*
+ * The dialog-box procedure calls this function to let us handle the
+ * notifications (WM_NOTIFY) sent by those of our controls which use
+ * them, which currently means the tree view that saved sessions are
+ * displayed in.
+ */
+bool winctrl_handle_notify(struct dlgparam *dp, WPARAM wParam, LPARAM lParam)
+{
+    NMHDR *nh = (NMHDR *)lParam;
+    struct winctrl *c;
+    dlgcontrol *ctrl;
+    HTREEITEM item;
+    int i;
+
+    if (!nh)
+        return false;
+
+    c = NULL;
+    for (i = 0; i < dp->nctrltrees; i++) {
+        c = winctrl_findbyid(dp->controltrees[i], (int)LOWORD(wParam));
+        if (c)
+            break;
+    }
+    if (!c)
+        return false;
+
+    /* Make sure it really came from the control we think it did. */
+    if (nh->hwndFrom != GetDlgItem(dp->hwnd, c->base_id+1))
+        return false;
+
+    ctrl = c->ctrl;
+    if (!ctrl || !ctrl->handler)
+        return false;
+    if (ctrl->type != CTRL_LISTBOX || !ctrl->listbox.tree)
+        return false;
+
+    switch (nh->code) {
+      case NM_SETFOCUS:
+        winctrl_set_focus(ctrl, dp, true);
+        break;
+
+      case NM_KILLFOCUS:
+        winctrl_set_focus(ctrl, dp, false);
+        break;
+
+      case NM_DBLCLK:
+        /*
+         * Double-clicking a session loads it, exactly as in a list
+         * box. Double-clicking a folder is left to the tree view
+         * itself, which expands or collapses it.
+         */
+        item = TreeView_GetSelection(nh->hwndFrom);
+        if (tree_index_of_item(nh->hwndFrom, item) >= 0) {
+            SetCapture(dp->hwnd);
+            ctrl->handler(ctrl, dp, dp->data, EVENT_ACTION);
+            return true;
+        }
+        break;
+
+      case TVN_SELCHANGED:
+        ctrl->handler(ctrl, dp, dp->data, EVENT_SELCHANGE);
+        break;
+    }
+
+    return false;
+}
+
+/*
  * This function can be called to produce context help on a
  * control. Returns true if it has actually launched some help.
  */
@@ -2233,6 +2500,13 @@ void dlg_editbox_select_range(dlgcontrol *ctrl, dlgparam *dp,
 }
 
 /* The `listbox' functions can also apply to combo boxes. */
+
+/* True if this list box is implemented as a tree view. */
+static bool listbox_is_tree(struct winctrl *c)
+{
+    return c->ctrl->type == CTRL_LISTBOX && c->ctrl->listbox.tree;
+}
+
 void dlg_listbox_clear(dlgcontrol *ctrl, dlgparam *dp)
 {
     struct winctrl *c = dlg_findbyctrl(dp, ctrl);
@@ -2241,6 +2515,10 @@ void dlg_listbox_clear(dlgcontrol *ctrl, dlgparam *dp)
            (c->ctrl->type == CTRL_LISTBOX ||
             (c->ctrl->type == CTRL_EDITBOX &&
              c->ctrl->editbox.has_list)));
+    if (listbox_is_tree(c)) {
+        TreeView_DeleteAllItems(GetDlgItem(dp->hwnd, c->base_id+1));
+        return;
+    }
     msg = (c->ctrl->type==CTRL_LISTBOX && c->ctrl->listbox.height!=0 ?
            LB_RESETCONTENT : CB_RESETCONTENT);
     SendDlgItemMessage(dp->hwnd, c->base_id+1, msg, 0, 0);
@@ -2254,6 +2532,13 @@ void dlg_listbox_del(dlgcontrol *ctrl, dlgparam *dp, int index)
            (c->ctrl->type == CTRL_LISTBOX ||
             (c->ctrl->type == CTRL_EDITBOX &&
              c->ctrl->editbox.has_list)));
+    if (listbox_is_tree(c)) {
+        HWND tv = GetDlgItem(dp->hwnd, c->base_id+1);
+        HTREEITEM item = tree_item_by_index(tv, TVI_ROOT, index);
+        if (item)
+            TreeView_DeleteItem(tv, item);
+        return;
+    }
     msg = (c->ctrl->type==CTRL_LISTBOX && c->ctrl->listbox.height!=0 ?
            LB_DELETESTRING : CB_DELETESTRING);
     SendDlgItemMessage(dp->hwnd, c->base_id+1, msg, index, 0);
@@ -2267,6 +2552,11 @@ void dlg_listbox_add(dlgcontrol *ctrl, dlgparam *dp, char const *text)
            (c->ctrl->type == CTRL_LISTBOX ||
             (c->ctrl->type == CTRL_EDITBOX &&
              c->ctrl->editbox.has_list)));
+    if (listbox_is_tree(c)) {
+        HWND tv = GetDlgItem(dp->hwnd, c->base_id+1);
+        tree_add_item(tv, text, tree_count_items(tv, TVI_ROOT));
+        return;
+    }
     msg = (c->ctrl->type==CTRL_LISTBOX && c->ctrl->listbox.height!=0 ?
            LB_ADDSTRING : CB_ADDSTRING);
     SendDlgItemMessage(dp->hwnd, c->base_id+1, msg, 0, (LPARAM)text);
@@ -2288,6 +2578,10 @@ void dlg_listbox_addwithid(dlgcontrol *ctrl, dlgparam *dp,
            (c->ctrl->type == CTRL_LISTBOX ||
             (c->ctrl->type == CTRL_EDITBOX &&
              c->ctrl->editbox.has_list)));
+    if (listbox_is_tree(c)) {
+        tree_add_item(GetDlgItem(dp->hwnd, c->base_id+1), text, id);
+        return;
+    }
     msg = (c->ctrl->type==CTRL_LISTBOX && c->ctrl->listbox.height!=0 ?
            LB_ADDSTRING : CB_ADDSTRING);
     msg2 = (c->ctrl->type==CTRL_LISTBOX && c->ctrl->listbox.height!=0 ?
@@ -2301,6 +2595,11 @@ int dlg_listbox_getid(dlgcontrol *ctrl, dlgparam *dp, int index)
     struct winctrl *c = dlg_findbyctrl(dp, ctrl);
     int msg;
     assert(c && c->ctrl->type == CTRL_LISTBOX);
+    if (listbox_is_tree(c)) {
+        HWND tv = GetDlgItem(dp->hwnd, c->base_id+1);
+        HTREEITEM item = tree_item_by_index(tv, TVI_ROOT, index);
+        return item ? tree_index_of_item(tv, item) : -1;
+    }
     msg = (c->ctrl->listbox.height != 0 ? LB_GETITEMDATA : CB_GETITEMDATA);
     return
         SendDlgItemMessage(dp->hwnd, c->base_id+1, msg, index, 0);
@@ -2312,6 +2611,10 @@ int dlg_listbox_index(dlgcontrol *ctrl, dlgparam *dp)
     struct winctrl *c = dlg_findbyctrl(dp, ctrl);
     int msg, ret;
     assert(c && c->ctrl->type == CTRL_LISTBOX);
+    if (listbox_is_tree(c)) {
+        HWND tv = GetDlgItem(dp->hwnd, c->base_id+1);
+        return tree_index_of_item(tv, TreeView_GetSelection(tv));
+    }
     if (c->ctrl->listbox.multisel) {
         assert(c->ctrl->listbox.height != 0); /* not combo box */
         ret = SendDlgItemMessage(dp->hwnd, c->base_id+1, LB_GETSELCOUNT, 0, 0);
@@ -2342,6 +2645,13 @@ void dlg_listbox_select(dlgcontrol *ctrl, dlgparam *dp, int index)
     int msg;
     assert(c && c->ctrl->type == CTRL_LISTBOX &&
            !c->ctrl->listbox.multisel);
+    if (listbox_is_tree(c)) {
+        HWND tv = GetDlgItem(dp->hwnd, c->base_id+1);
+        HTREEITEM item = tree_item_by_index(tv, TVI_ROOT, index);
+        if (item)
+            TreeView_SelectItem(tv, item);
+        return;
+    }
     msg = (c->ctrl->listbox.height != 0 ? LB_SETCURSEL : CB_SETCURSEL);
     SendDlgItemMessage(dp->hwnd, c->base_id+1, msg, index, 0);
 }

@@ -145,3 +145,4 @@ Makefile
 /windows/*.wixobj
 /windows/*.wixpdb
 /build/
+/build2/

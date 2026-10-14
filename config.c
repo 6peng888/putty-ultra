@@ -1918,7 +1918,22 @@ void setup_config_box(struct controlbox *b, bool midsession,
                                 HELPCTX(session_saved),
                                 sessionsaver_handler, P(ssd));
     ssd->listbox->column = 0;
-    ssd->listbox->listbox.height = 7;
+    /*
+     * Show the sessions as a folder hierarchy (a session whose name
+     * contains '/' is inside the folder named before the slash), and
+     * make the list tall enough to show all of them, within reason -
+     * so that a large collection of sessions doesn't need endless
+     * scrolling.
+     */
+    ssd->listbox->listbox.tree = true;
+    {
+        int lines = ssd->sesslist.nsessions + 1;
+        if (lines < 10)
+            lines = 10;
+        if (lines > 13)
+            lines = 13;
+        ssd->listbox->listbox.height = lines;
+    }
     if (!midsession) {
         ssd->loadbutton = ctrl_pushbutton(s, "Load", 'l',
                                           HELPCTX(session_saved),
