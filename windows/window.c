@@ -125,6 +125,21 @@ static bool get_workingarea_rect(WinGuiSeat *wgs, RECT *ss);
 
 static void conf_cache_data(WinGuiSeat *wgs);
 
+/* Tabbed multi-session support (added modification) */
+static LRESULT CALLBACK FrameWndProc(HWND, UINT, WPARAM, LPARAM);
+static void new_session_finish(WinGuiSeat *wgs);
+static void new_session(Conf *conf);
+static void tab_add(WinGuiSeat *wgs);
+static void tab_activate(int idx);
+static void tab_relayout(void);
+static int tab_find(WinGuiSeat *wgs);
+static void frame_set_title(WinGuiSeat *wgs);
+static void frame_build_saved_menu(void);
+static void open_new_session_dialog(void);
+static void close_tab(int idx);
+static void frame_build_menu(void);
+static void wgs_cleanup(WinGuiSeat *wgs);
+
 static struct sesslist sesslist;       /* for saved-session menu */
 
 enum MONITOR_DPI_TYPE { MDT_EFFECTIVE_DPI, MDT_ANGULAR_DPI, MDT_RAW_DPI, MDT_DEFAULT };
@@ -140,6 +155,24 @@ static UINT wm_mousewheel = WM_MOUSEWHEEL;
 struct WinGuiSeatListNode wgslisthead = {
     .next = &wgslisthead, .prev = &wgslisthead,
 };
+
+/* Tabbed multi-session support.
+ * Each PuTTY session is a WinGuiSeat whose terminal window (term_hwnd)
+ * is a child of a single frame window. The frame owns the title bar,
+ * the system menu and a tab strip; it forwards most system-menu
+ * commands to the active tab, and intercepts New/Duplicate/Saved
+ * Session to open additional tabs. */
+#define TAB_H 26
+#define MAX_TABS 64
+static HWND tab_frame_hwnd = NULL;
+static WinGuiSeat **tab_list = NULL;
+static int tab_count = 0;
+static int tab_active = -1;
+static bool g_quitting = false;
+static HMENU frame_savedsess_menu = NULL;
+static RECT g_tabrects[MAX_TABS];
+static RECT g_plusrect;
+static int g_tabcount = 0;
 
 #define IS_HIGH_VARSEL(wch1, wch2) \
     ((wch1) == 0xDB40 && ((wch2) >= 0xDD00 && (wch2) <= 0xDDEF))
@@ -285,6 +318,7 @@ static void start_backend(WinGuiSeat *wgs)
     char *error, *realhost;
     int i;
 
+
     wgs->cmdline_get_passwd_state = cmdline_get_passwd_input_state_new;
 
     vt = backend_vt_from_conf(wgs->conf);
@@ -297,6 +331,7 @@ static void start_backend(WinGuiSeat *wgs)
                          conf_get_bool(wgs->conf, CONF_tcp_nodelay),
                          conf_get_bool(wgs->conf, CONF_tcp_keepalives));
     if (error) {
+
         char *str = dupprintf("%s Error", appname);
         char *msg;
         if (cmdline_tooltype & TOOLTYPE_NONNETWORK) {
@@ -443,6 +478,7 @@ HINSTANCE hinst;
 
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 {
+
     MSG msg;
     HRESULT hr;
     int guess_width, guess_height;
@@ -544,7 +580,33 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     }
 
     {
-        int winmode = WS_OVERLAPPEDWINDOW | WS_VSCROLL;
+    /*
+     * Create the tabbed frame window that hosts all sessions.
+     */
+    if (!tab_frame_hwnd) {
+        WNDCLASSW wcf;
+        memset(&wcf, 0, sizeof(wcf));
+        wcf.style = 0;
+        wcf.lpfnWndProc = FrameWndProc;
+        wcf.hInstance = hinst;
+        wcf.hIcon = LoadIcon(hinst, MAKEINTRESOURCE(IDI_MAINICON));
+        wcf.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wcf.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wcf.lpszClassName = L"PuTTYTabFrame";
+        RegisterClassW(&wcf);
+        tab_frame_hwnd = CreateWindowExW(
+            0, L"PuTTYTabFrame", L"PuTTY", WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT, CW_USEDEFAULT,
+            guess_width, guess_height + TAB_H,
+            NULL, NULL, inst, NULL);
+        if (!tab_frame_hwnd)
+            modalfatalbox("Unable to create frame window: %s",
+                          win_strerror(GetLastError()));
+        frame_build_menu();
+
+    }
+
+        int winmode = WS_CHILD | WS_VSCROLL;
         int exwinmode = 0;
         const struct BackendVtable *vt =
             backend_vt_from_proto(be_default_protocol);
@@ -576,8 +638,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
         sw_DefWindowProc = DefWindowProcW;
         wgs->term_hwnd = CreateWindowExW(
             exwinmode, terminal_window_class_w(), uappname,
-            winmode, CW_USEDEFAULT, CW_USEDEFAULT,
-            guess_width, guess_height, NULL, NULL, inst, NULL);
+            winmode, 0, 0,
+            guess_width, guess_height, tab_frame_hwnd, NULL, inst, (LPVOID)wgs);
 #endif
 
 #if defined LEGACY_WINDOWS || defined TEST_ANSI_WINDOW
@@ -590,8 +652,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
             sw_DefWindowProc = DefWindowProcA;
             wgs->term_hwnd = CreateWindowExA(
                 exwinmode, terminal_window_class_a(), appname,
-                winmode, CW_USEDEFAULT, CW_USEDEFAULT,
-                guess_width, guess_height, NULL, NULL, inst, NULL);
+                winmode, 0, 0,
+                guess_width, guess_height, tab_frame_hwnd, NULL, inst, (LPVOID)wgs);
         }
 #endif
 
@@ -599,6 +661,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
             modalfatalbox("Unable to create terminal window: %s",
                           win_strerror(GetLastError()));
         }
+
         memset(&wgs->dpi_info, 0, sizeof(struct _dpi_info));
         init_dpi_info(wgs);
         sfree(uappname);
@@ -784,6 +847,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     }
 
     winselgui_set_hwnd(wgs->term_hwnd);
+
     start_backend(wgs);
 
     /*
@@ -792,15 +856,16 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     set_input_locale(wgs, GetKeyboardLayout(0));
 
     /*
-     * Finally show the window!
+     * Add this session as a tab in the frame, then show the frame.
      */
-    ShowWindow(wgs->term_hwnd, show);
-    SetForegroundWindow(wgs->term_hwnd);
-
-    term_set_focus(wgs->term, GetForegroundWindow() == wgs->term_hwnd);
+    tab_add(wgs);
+    term_set_focus(wgs->term, true);
     UpdateWindow(wgs->term_hwnd);
 
     gui_terminal_ready(wgs->term_hwnd, &wgs->seat, wgs->backend);
+
+    ShowWindow(tab_frame_hwnd, show);
+    SetForegroundWindow(tab_frame_hwnd);
 
     while (1) {
         int n;
@@ -829,7 +894,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
         } else {
             timeout = INFINITE;
             /* The messages seem unreliable; especially if we're being tricky */
-            term_set_focus(wgs->term, GetForegroundWindow() == wgs->term_hwnd);
+            if (tab_active >= 0)
+                term_set_focus(tab_list[tab_active]->term,
+                               GetForegroundWindow() ==
+                               tab_list[tab_active]->term_hwnd);
         }
 
         HandleWaitList *hwl = get_handle_wait_list();
@@ -882,12 +950,619 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 
 static void wgs_cleanup(WinGuiSeat *wgs)
 {
+    if (wgs->ldisc) {
+        ldisc_free(wgs->ldisc);
+        wgs->ldisc = NULL;
+    }
+    if (wgs->backend) {
+        backend_free(wgs->backend);
+        wgs->backend = NULL;
+    }
+    if (wgs->logctx) {
+        log_free(wgs->logctx);
+        wgs->logctx = NULL;
+    }
+    if (wgs->term) {
+        term_free(wgs->term);
+        wgs->term = NULL;
+    }
     deinit_fonts(wgs);
     sfree(wgs->logpal);
     if (wgs->pal)
         DeleteObject(wgs->pal);
+    if (wgs->window_name)
+        sfree(wgs->window_name);
+    if (wgs->icon_name)
+        sfree(wgs->icon_name);
+    if (wgs->savedsess_menu)
+        DestroyMenu(wgs->savedsess_menu);
+    if (wgs->specials_menu)
+        DestroyMenu(wgs->specials_menu);
+    if (wgs->popup_menus[CTXMENU].menu)
+        DestroyMenu(wgs->popup_menus[CTXMENU].menu);
+    /* The SYSMENU is the window's own system menu; let Windows free it. */
+    if (wgs->conf)
+        conf_free(wgs->conf);
     wgs_unlink(wgs);
     sfree(wgs);
+}
+
+/* ===== Tabbed multi-session support (added modification) ===== */
+
+static POINT mpt(int x, int y)
+{
+    POINT p;
+    p.x = x; p.y = y;
+    return p;
+}
+
+static void frame_set_title(WinGuiSeat *wgs)
+{
+    if (!tab_frame_hwnd)
+        return;
+    if (tab_active >= 0 && tab_list[tab_active] == wgs)
+        sw_SetWindowText(tab_frame_hwnd, wgs->window_name);
+    InvalidateRect(tab_frame_hwnd, NULL, true);
+}
+
+static int tab_find(WinGuiSeat *wgs)
+{
+    for (int i = 0; i < tab_count; i++)
+        if (tab_list[i] == wgs)
+            return i;
+    return -1;
+}
+
+static void tab_relayout(void)
+{
+    if (!tab_frame_hwnd)
+        return;
+    RECT fr;
+    GetClientRect(tab_frame_hwnd, &fr);
+    int cw = fr.right - fr.left;
+    int ch = fr.bottom - fr.top - TAB_H;
+    for (int i = 0; i < tab_count; i++) {
+        WinGuiSeat *w = tab_list[i];
+        ShowWindow(w->term_hwnd, i == tab_active ? SW_SHOW : SW_HIDE);
+        SetWindowPos(w->term_hwnd, i == tab_active ? HWND_TOP : NULL,
+                     0, TAB_H, cw, ch,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+    }
+    InvalidateRect(tab_frame_hwnd, NULL, true);
+}
+
+static void tab_activate(int idx)
+{
+    if (idx < 0 || idx >= tab_count)
+        return;
+    tab_active = idx;
+    WinGuiSeat *w = tab_list[idx];
+    winselgui_set_hwnd(w->term_hwnd);
+    frame_set_title(w);
+    tab_relayout();
+    SetFocus(w->term_hwnd);
+}
+
+static void tab_add(WinGuiSeat *wgs)
+{
+
+    tab_list = sresize(tab_list, tab_count + 1, WinGuiSeat *);
+    tab_list[tab_count] = wgs;
+    tab_count++;
+    tab_activate(tab_count - 1);
+}
+
+static void open_new_session_dialog(void)
+{
+    Conf *c = conf_new();
+    load_open_settings(NULL, c);
+    if (do_config(c)) {
+        prepare_session(c);
+        new_session(c);
+    } else {
+        conf_free(c);
+    }
+}
+
+static void close_tab(int idx)
+{
+    if (idx < 0 || idx >= tab_count)
+        return;
+    WinGuiSeat *w = tab_list[idx];
+    if (w->backend && !w->session_closed &&
+        conf_get_bool(w->conf, CONF_warn_on_close)) {
+        if (MessageBox(tab_frame_hwnd,
+                       "Are you sure you want to close this session?",
+                       "PuTTY", MB_ICONWARNING | MB_OKCANCEL) == IDCANCEL)
+            return;
+    }
+    DestroyWindow(w->term_hwnd);
+}
+
+static void frame_build_saved_menu(void)
+{
+    if (!frame_savedsess_menu)
+        return;
+    while (DeleteMenu(frame_savedsess_menu, 0, MF_BYPOSITION))
+        continue;
+    get_sesslist(&sesslist, false);
+    get_sesslist(&sesslist, true);
+    if (sesslist.nsessions <= 1) {
+        AppendMenu(frame_savedsess_menu, MF_GRAYED, IDM_SAVED_MIN,
+                   "(No sessions)");
+    } else {
+        int limit = (sesslist.nsessions <= MENU_SAVED_MAX + 1)
+            ? sesslist.nsessions : MENU_SAVED_MAX + 1;
+        for (int p = 0; p + 1 < limit; p++)
+            AppendMenu(frame_savedsess_menu, MF_ENABLED,
+                       IDM_SAVED_MIN + p * MENU_SAVED_STEP,
+                       sesslist.sessions[p + 1]);
+    }
+}
+
+static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
+                                     WPARAM wParam, LPARAM lParam)
+{
+    switch (message) {
+      case WM_CREATE:
+        break;
+
+      case WM_SIZE:
+        tab_relayout();
+        return DefWindowProc(hwnd, message, wParam, lParam);
+
+      case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT fr, strip;
+        GetClientRect(hwnd, &fr);
+        strip.left = 0; strip.top = 0;
+        strip.right = fr.right; strip.bottom = TAB_H;
+        FillRect(hdc, &strip, GetSysColorBrush(COLOR_BTNFACE));
+
+        HFONT hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        HFONT oldf = SelectObject(hdc, hf);
+        SetBkMode(hdc, TRANSPARENT);
+
+        int x = 2, y = 2;
+        g_tabcount = (tab_count < MAX_TABS) ? tab_count : MAX_TABS;
+        for (int i = 0; i < g_tabcount; i++) {
+            WinGuiSeat *w = tab_list[i];
+            wchar_t *name = w->window_name ? w->window_name : L"";
+            SIZE sz;
+            GetTextExtentPoint32W(hdc, name, (int)wcslen(name), &sz);
+            int tw = (sz.cx + 34 < 120) ? 120 : sz.cx + 34;
+            RECT tr;
+            tr.left = x; tr.top = y;
+            tr.right = x + tw; tr.bottom = TAB_H - 2;
+            g_tabrects[i] = tr;
+
+            HBRUSH fill = GetSysColorBrush(
+                i == tab_active ? COLOR_WINDOW : COLOR_BTNFACE);
+            FillRect(hdc, &tr, fill);
+            DrawEdge(hdc, &tr,
+                     i == tab_active ? EDGE_RAISED : EDGE_ETCHED, BF_RECT);
+
+            RECT trtext = tr;
+            trtext.left += 4;
+            DrawTextW(hdc, name, -1, &trtext,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+            RECT cr = tr;
+            cr.left = cr.right - 16;
+            DrawTextW(hdc, L"x", -1, &cr,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            x += tw + 2;
+        }
+
+        RECT pr;
+        pr.left = x; pr.top = y;
+        pr.right = x + 24; pr.bottom = TAB_H - 2;
+        g_plusrect = pr;
+        DrawEdge(hdc, &pr, EDGE_RAISED, BF_RECT);
+        DrawTextW(hdc, L"+", -1, &pr,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        SelectObject(hdc, oldf);
+        EndPaint(hwnd, &ps);
+        return 0;
+      }
+
+      case WM_LBUTTONDOWN: {
+        int mx = (int)(short)LOWORD(lParam);
+        int my = (int)(short)HIWORD(lParam);
+        if (my < TAB_H) {
+            if (PtInRect(&g_plusrect, mpt(mx, my))) {
+                open_new_session_dialog();
+                return 0;
+            }
+            for (int i = 0; i < g_tabcount; i++) {
+                if (PtInRect(&g_tabrects[i], mpt(mx, my))) {
+                    RECT cr = g_tabrects[i];
+                    cr.left = cr.right - 16;
+                    if (PtInRect(&cr, mpt(mx, my)))
+                        close_tab(i);
+                    else
+                        tab_activate(i);
+                    return 0;
+                }
+            }
+            return 0;
+        }
+        return DefWindowProc(hwnd, message, wParam, lParam);
+      }
+
+      case WM_INITMENUPOPUP:
+        if ((HMENU)wParam == frame_savedsess_menu)
+            frame_build_saved_menu();
+        break;
+
+      case WM_SYSCOMMAND: {
+        UINT sc = wParam & 0xFFF0;
+        /* Let the OS handle standard frame system commands. */
+        if (sc == SC_CLOSE || sc == SC_MINIMIZE || sc == SC_MAXIMIZE ||
+            sc == SC_RESTORE || sc == SC_MOUSEMENU || sc == SC_KEYMENU ||
+            sc == SC_TASKLIST || sc == SC_NEXTWINDOW || sc == SC_PREVWINDOW)
+            return DefWindowProc(hwnd, message, wParam, lParam);
+
+        if ((wParam & ~0xF) == IDM_NEWSESS) {
+            open_new_session_dialog();
+            return 0;
+        }
+        if ((wParam & ~0xF) == IDM_DUPSESS) {
+            if (tab_active >= 0) {
+                Conf *c = conf_copy(tab_list[tab_active]->conf);
+                new_session(c);
+            }
+            return 0;
+        }
+        if ((wParam & ~0xF) == IDM_SAVEDSESS)
+            return 0;   /* submenu header */
+        if (wParam >= IDM_SAVED_MIN && wParam < IDM_SAVED_MAX) {
+            int p = (int)((wParam - IDM_SAVED_MIN) / MENU_SAVED_STEP);
+            if (p + 1 < sesslist.nsessions) {
+                Conf *c = conf_new();
+                if (load_settings(sesslist.sessions[p + 1], c)) {
+                    prepare_session(c);
+                    new_session(c);
+                }
+                else
+                    conf_free(c);
+            }
+            return 0;
+        }
+        /* Forward any other custom command to the active tab. */
+        if (tab_active >= 0)
+            SendMessage(tab_list[tab_active]->term_hwnd,
+                        WM_SYSCOMMAND, wParam, lParam);
+        return 0;
+      }
+
+      case WM_CLOSE:
+        if (MessageBox(tab_frame_hwnd,
+                       "Close all PuTTY sessions and exit?",
+                       "PuTTY", MB_ICONWARNING | MB_OKCANCEL) == IDOK)
+            DestroyWindow(hwnd);
+        return 0;
+
+      case WM_DESTROY:
+
+        if (!g_quitting) {
+            g_quitting = true;
+            PostQuitMessage(0);
+        }
+        return 0;
+
+      default:
+        return DefWindowProc(hwnd, message, wParam, lParam);
+    }
+    return 0;
+}
+
+static void frame_build_menu(void)
+{
+    HMENU sm = GetSystemMenu(tab_frame_hwnd, false);
+    char *str;
+
+    frame_savedsess_menu = CreateMenu();
+    AppendMenu(sm, MF_SEPARATOR, 0, 0);
+    AppendMenu(sm, MF_ENABLED, IDM_NEWSESS, "Ne&w Session...");
+    AppendMenu(sm, MF_ENABLED, IDM_DUPSESS, "&Duplicate Session");
+    AppendMenu(sm, MF_POPUP | MF_ENABLED, (UINT_PTR)frame_savedsess_menu,
+               "Sa&ved Sessions");
+    AppendMenu(sm, MF_SEPARATOR, 0, 0);
+    AppendMenu(sm, MF_ENABLED, IDM_COPY, "&Copy");
+    AppendMenu(sm, MF_ENABLED, IDM_PASTE, "&Paste");
+    AppendMenu(sm, MF_SEPARATOR, 0, 0);
+    AppendMenu(sm, MF_ENABLED, IDM_RECONF, "Chan&ge Settings...");
+    AppendMenu(sm, MF_ENABLED, IDM_SHOWLOG, "&Event Log");
+    AppendMenu(sm, MF_ENABLED, IDM_CLRSB, "C&lear Scrollback");
+    AppendMenu(sm, MF_ENABLED, IDM_RESET, "Rese&t Terminal");
+    AppendMenu(sm, MF_SEPARATOR, 0, 0);
+    AppendMenu(sm, MF_ENABLED, IDM_FULLSCREEN, "&Full Screen");
+    AppendMenu(sm, MF_SEPARATOR, 0, 0);
+    if (has_help())
+        AppendMenu(sm, MF_ENABLED, IDM_HELP, "&Help");
+    str = dupprintf("&About %s", appname);
+    AppendMenu(sm, MF_ENABLED, IDM_ABOUT, str);
+    sfree(str);
+
+    frame_build_saved_menu();
+}
+
+/*
+ * Finish setting up a session: create its terminal child window inside
+ * the frame, start the backend, and register it as a tab. Used both for
+ * the initial session (from WinMain) and for sessions opened in new tabs.
+ */
+static void new_session_finish(WinGuiSeat *wgs)
+{
+    int guess_width, guess_height;
+
+    memset(&wgs->ucsdata, 0, sizeof(wgs->ucsdata));
+
+    conf_cache_data(wgs);
+
+    wgs->font_width = 10;
+    wgs->font_height = 20;
+    wgs->extra_width = 25;
+    wgs->extra_height = 28;
+    guess_width = wgs->extra_width + wgs->font_width * conf_get_int(
+        wgs->conf, CONF_width);
+    guess_height = wgs->extra_height + wgs->font_height * conf_get_int(
+        wgs->conf, CONF_height);
+    {
+        RECT r;
+        get_fullscreen_rect(wgs, &r);
+        if (guess_width > r.right - r.left)
+            guess_width = r.right - r.left;
+        if (guess_height > r.bottom - r.top)
+            guess_height = r.bottom - r.top;
+    }
+
+    {
+    /*
+     * Create the tabbed frame window that hosts all sessions.
+     */
+    if (!tab_frame_hwnd) {
+        WNDCLASSW wcf;
+        memset(&wcf, 0, sizeof(wcf));
+        wcf.style = 0;
+        wcf.lpfnWndProc = FrameWndProc;
+        wcf.hInstance = hinst;
+        wcf.hIcon = LoadIcon(hinst, MAKEINTRESOURCE(IDI_MAINICON));
+        wcf.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wcf.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wcf.lpszClassName = L"PuTTYTabFrame";
+        RegisterClassW(&wcf);
+        tab_frame_hwnd = CreateWindowExW(
+            0, L"PuTTYTabFrame", L"PuTTY", WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT, CW_USEDEFAULT,
+            guess_width, guess_height + TAB_H,
+            NULL, NULL, hinst, NULL);
+        if (!tab_frame_hwnd)
+            modalfatalbox("Unable to create frame window: %s",
+                          win_strerror(GetLastError()));
+        frame_build_menu();
+
+    }
+
+        int winmode = WS_CHILD | WS_VSCROLL;
+        int exwinmode = 0;
+        const struct BackendVtable *vt =
+            backend_vt_from_proto(be_default_protocol);
+        bool resize_forbidden = false;
+        if (vt && vt->flags & BACKEND_RESIZE_FORBIDDEN)
+            resize_forbidden = true;
+        wchar_t *uappname = dup_mb_to_wc(DEFAULT_CODEPAGE, appname);
+        wgs->window_name = dup_mb_to_wc(DEFAULT_CODEPAGE, appname);
+        wgs->icon_name = dup_mb_to_wc(DEFAULT_CODEPAGE, appname);
+        if (!conf_get_bool(wgs->conf, CONF_scrollbar))
+            winmode &= ~(WS_VSCROLL);
+        if (conf_get_int(wgs->conf, CONF_resize_action) == RESIZE_DISABLED ||
+            resize_forbidden)
+            winmode &= ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
+        if (conf_get_bool(wgs->conf, CONF_alwaysontop))
+            exwinmode |= WS_EX_TOPMOST;
+        if (conf_get_bool(wgs->conf, CONF_sunken_edge))
+            exwinmode |= WS_EX_CLIENTEDGE;
+
+#ifdef TEST_ANSI_WINDOW
+        wgs->term_hwnd = NULL;
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+#else
+        unicode_window = true;
+        sw_PeekMessage = PeekMessageW;
+        sw_DispatchMessage = DispatchMessageW;
+        sw_DefWindowProc = DefWindowProcW;
+        wgs->term_hwnd = CreateWindowExW(
+            exwinmode, terminal_window_class_w(), uappname,
+            winmode, 0, 0,
+            guess_width, guess_height, tab_frame_hwnd, NULL, hinst, (LPVOID)wgs);
+#endif
+
+#if defined LEGACY_WINDOWS || defined TEST_ANSI_WINDOW
+        if (!wgs->term_hwnd && GetLastError() == ERROR_CALL_NOT_IMPLEMENTED) {
+            unicode_window = false;
+            sw_PeekMessage = PeekMessageA;
+            sw_DispatchMessage = DispatchMessageA;
+            sw_DefWindowProc = DefWindowProcA;
+            wgs->term_hwnd = CreateWindowExA(
+                exwinmode, terminal_window_class_a(), appname,
+                winmode, 0, 0,
+                guess_width, guess_height, tab_frame_hwnd, NULL, hinst, (LPVOID)wgs);
+        }
+#endif
+
+        if (!wgs->term_hwnd) {
+            modalfatalbox("Unable to create terminal window: %s",
+                          win_strerror(GetLastError()));
+        }
+
+        memset(&wgs->dpi_info, 0, sizeof(struct _dpi_info));
+        init_dpi_info(wgs);
+        sfree(uappname);
+    }
+
+    SetWindowLongPtr(wgs->term_hwnd, GWLP_USERDATA, (LONG_PTR)wgs);
+
+    init_fonts(wgs, 0, 0);
+
+    init_palette(wgs);
+
+    wgs->term = term_init(wgs->conf, &wgs->ucsdata, &wgs->termwin);
+    setup_clipboards(wgs->term, wgs->conf);
+    wgs->logctx = log_init(&wgs->logpolicy, wgs->conf);
+    term_provide_logctx(wgs->term, wgs->logctx);
+    term_size(wgs->term, conf_get_int(wgs->conf, CONF_height),
+              conf_get_int(wgs->conf, CONF_width),
+              conf_get_int(wgs->conf, CONF_savelines));
+
+    {
+        RECT cr, wr;
+        GetWindowRect(wgs->term_hwnd, &wr);
+        GetClientRect(wgs->term_hwnd, &cr);
+        wgs->offset_width = wgs->offset_height =
+            conf_get_int(wgs->conf, CONF_window_border);
+        wgs->extra_width =
+            wr.right - wr.left - cr.right + cr.left + wgs->offset_width*2;
+        wgs->extra_height =
+            wr.bottom - wr.top - cr.bottom + cr.top + wgs->offset_height*2;
+    }
+
+    guess_width = wgs->extra_width + wgs->font_width * wgs->term->cols;
+    guess_height = wgs->extra_height + wgs->font_height * wgs->term->rows;
+
+    {
+        RECT winr;
+        GetWindowRect(wgs->term_hwnd, &winr);
+
+        int x = winr.left;
+        int y = winr.top;
+
+        RECT war;
+        if (get_workingarea_rect(wgs, &war)) {
+            if (x + guess_width > war.right)
+                x = war.right - guess_width;
+            if (x < war.left)
+                x = war.left;
+            if (y + guess_height > war.bottom)
+                y = war.bottom - guess_height;
+            if (y < war.top)
+                y = war.top;
+        }
+
+        SetWindowPos(wgs->term_hwnd, NULL, x, y, guess_width, guess_height,
+                     SWP_NOREDRAW | SWP_NOZORDER);
+    }
+
+    {
+        char *bits;
+        int size = (wgs->font_width + 15) / 16 * 2 * wgs->font_height;
+        bits = snewn(size, char);
+        memset(bits, 0, size);
+        wgs->caretbm = CreateBitmap(wgs->font_width, wgs->font_height,
+                                    1, 1, bits);
+        sfree(bits);
+    }
+    CreateCaret(wgs->term_hwnd, wgs->caretbm,
+                wgs->font_width, wgs->font_height);
+
+    {
+        SCROLLINFO si;
+
+        si.cbSize = sizeof(si);
+        si.fMask = SIF_ALL | SIF_DISABLENOSCROLL;
+        si.nMin = 0;
+        si.nMax = wgs->term->rows - 1;
+        si.nPage = wgs->term->rows;
+        si.nPos = 0;
+        SetScrollInfo(wgs->term_hwnd, SB_VERT, &si, false);
+    }
+
+    wgs->lastact = MA_NOTHING;
+    wgs->lastbtn = MBT_NOTHING;
+    wgs->dbltime = GetDoubleClickTime();
+
+    {
+        HMENU m;
+        int j;
+        char *str;
+
+        wgs->popup_menus[SYSMENU].menu = GetSystemMenu(wgs->term_hwnd, false);
+        wgs->popup_menus[CTXMENU].menu = CreatePopupMenu();
+
+        for (j = 0; j < lenof(wgs->popup_menus); j++) {
+            m = wgs->popup_menus[j].menu;
+            AppendMenu(m, MF_ENABLED, IDM_COPY, "&Copy");
+            AppendMenu(m, MF_ENABLED, IDM_PASTE, "&Paste");
+        }
+
+        wgs->savedsess_menu = CreateMenu();
+        get_sesslist(&sesslist, true);
+        update_savedsess_menu(wgs);
+
+        for (j = 0; j < lenof(wgs->popup_menus); j++) {
+            m = wgs->popup_menus[j].menu;
+
+            AppendMenu(m, MF_SEPARATOR, 0, 0);
+            AppendMenu(m, MF_ENABLED, IDM_SHOWLOG, "&Event Log");
+            AppendMenu(m, MF_SEPARATOR, 0, 0);
+            AppendMenu(m, MF_ENABLED, IDM_NEWSESS, "Ne&w Session...");
+            AppendMenu(m, MF_ENABLED, IDM_DUPSESS, "&Duplicate Session");
+            AppendMenu(m, MF_POPUP | MF_ENABLED, (UINT_PTR)wgs->savedsess_menu,
+                       "Sa&ved Sessions");
+            AppendMenu(m, MF_ENABLED, IDM_RECONF, "Chan&ge Settings...");
+            AppendMenu(m, MF_SEPARATOR, 0, 0);
+            AppendMenu(m, MF_ENABLED, IDM_COPYALL, "C&opy All to Clipboard");
+            AppendMenu(m, MF_ENABLED, IDM_CLRSB, "C&lear Scrollback");
+            AppendMenu(m, MF_ENABLED, IDM_RESET, "Rese&t Terminal");
+            AppendMenu(m, MF_SEPARATOR, 0, 0);
+            AppendMenu(m, (conf_get_int(wgs->conf, CONF_resize_action)
+                           == RESIZE_DISABLED) ? MF_GRAYED : MF_ENABLED,
+                       IDM_FULLSCREEN, "&Full Screen");
+            AppendMenu(m, MF_SEPARATOR, 0, 0);
+            if (has_help())
+                AppendMenu(m, MF_ENABLED, IDM_HELP, "&Help");
+            str = dupprintf("&About %s", appname);
+            AppendMenu(m, MF_ENABLED, IDM_ABOUT, str);
+            sfree(str);
+        }
+    }
+
+    if (restricted_acl()) {
+        lp_eventlog(&wgs->logpolicy, "Running with restricted process ACL");
+    }
+
+    winselgui_set_hwnd(wgs->term_hwnd);
+
+    start_backend(wgs);
+
+    set_input_locale(wgs, GetKeyboardLayout(0));
+
+    tab_add(wgs);
+    term_set_focus(wgs->term, true);
+    UpdateWindow(wgs->term_hwnd);
+
+    gui_terminal_ready(wgs->term_hwnd, &wgs->seat, wgs->backend);
+
+    ShowWindow(tab_frame_hwnd, SW_SHOW);
+    SetForegroundWindow(tab_frame_hwnd);
+}
+
+static void new_session(Conf *conf)
+{
+    WinGuiSeat *wgs = snew(WinGuiSeat);
+    memset(wgs, 0, sizeof(*wgs));
+    wgs_link(wgs);
+    wgs->seat.vt = &win_seat_vt;
+    wgs->logpolicy.vt = &win_gui_logpolicy_vt;
+    wgs->termwin.vt = &windows_termwin_vt;
+    wgs->caret_x = wgs->caret_y = -1;
+    wgs->busy_status = BUSY_NOT;
+    wgs->conf = conf;
+    new_session_finish(wgs);
 }
 
 char *handle_restrict_acl_cmdline_prefix(char *p)
@@ -1001,6 +1676,7 @@ static void setup_clipboards(Terminal *term, Conf *conf)
  */
 void cleanup_exit(int code)
 {
+
     /*
      * Clean up.
      */
@@ -2201,6 +2877,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
     int resize_action;
     WinGuiSeat *wgs = (WinGuiSeat *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
 
+    if (message == WM_NCCREATE) {
+        /*
+         * The terminal is a child window created while the frame is alive,
+         * so Windows dispatches creation-time messages (WM_MOVE, WM_SIZE,
+         * WM_PAINT, ...) to this procedure before term_init has run and
+         * while GWLP_USERDATA is not yet set. Stash the WinGuiSeat pointer
+         * passed as the creation parameter, then let DefWindowProc apply
+         * the default handling.
+         */
+        SetWindowLongPtr(hwnd, GWLP_USERDATA,
+                         (LONG_PTR)((CREATESTRUCT *)lParam)->lpCreateParams);
+        return DefWindowProc(hwnd, message, wParam, lParam);
+    }
+    if (!wgs || !wgs->term)
+        /*
+         * During window creation (before term_init) we must not run the
+         * terminal-specific handlers, which dereference wgs->term. Route
+         * these early messages to the system default so creation succeeds;
+         * afterwards wgs->term is valid and normal handling applies.
+         */
+        return DefWindowProc(hwnd, message, wParam, lParam);
+
     switch (message) {
       case WM_CREATE:
         break;
@@ -2226,8 +2924,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
         return 0;
       }
       case WM_DESTROY:
+
         show_mouseptr(wgs, true);
-        PostQuitMessage(0);
+        {
+            int idx = tab_find(wgs);
+            if (idx >= 0) {
+                for (int i = idx; i < tab_count - 1; i++)
+                    tab_list[i] = tab_list[i + 1];
+                tab_count--;
+                if (tab_count > 0) {
+                    if (idx == tab_active)
+                        tab_active = (idx > 0) ? idx - 1 : 0;
+                    else if (idx < tab_active)
+                        tab_active--;
+                    tab_activate(tab_active);
+                }
+            }
+            wgs_cleanup(wgs);
+            if (tab_count == 0 && !g_quitting) {
+                g_quitting = true;
+                PostQuitMessage(0);
+            }
+        }
         return 0;
       case WM_INITMENUPOPUP:
         if ((HMENU)wParam == wgs->savedsess_menu) {
@@ -2262,93 +2980,32 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             showeventlog(hwnd);
             break;
           case IDM_NEWSESS:
+            open_new_session_dialog();
+            break;
           case IDM_DUPSESS:
+            if (wgs->conf)
+                new_session(conf_copy(wgs->conf));
+            break;
           case IDM_SAVEDSESS: {
-            char b[2048];
-            char *cl;
-            const char *argprefix;
-            bool inherit_handles;
-            STARTUPINFO si;
-            PROCESS_INFORMATION pi;
-            HANDLE filemap = NULL;
-
-            if (restricted_acl())
-                argprefix = "&R";
-            else
-                argprefix = "";
-
-            if (wParam == IDM_DUPSESS) {
-                /*
-                 * Allocate a file-mapping memory chunk for the
-                 * config structure.
-                 */
-                SECURITY_ATTRIBUTES sa;
-                strbuf *serbuf;
-                void *p;
-                int size;
-
-                serbuf = strbuf_new();
-                conf_serialise(BinarySink_UPCAST(serbuf), wgs->conf);
-                size = serbuf->len;
-
-                sa.nLength = sizeof(sa);
-                sa.lpSecurityDescriptor = NULL;
-                sa.bInheritHandle = true;
-                filemap = CreateFileMapping(INVALID_HANDLE_VALUE,
-                                            &sa,
-                                            PAGE_READWRITE,
-                                            0, size, NULL);
-                if (filemap && filemap != INVALID_HANDLE_VALUE) {
-                    p = MapViewOfFile(filemap, FILE_MAP_WRITE, 0, 0, size);
-                    if (p) {
-                        memcpy(p, serbuf->s, size);
-                        UnmapViewOfFile(p);
-                    }
+            unsigned int sessno = ((lParam - IDM_SAVED_MIN)
+                                   / MENU_SAVED_STEP) + 1;
+            if (sessno < (unsigned)sesslist.nsessions) {
+                Conf *c = conf_new();
+                if (load_settings(sesslist.sessions[sessno], c)) {
+                    prepare_session(c);
+                    new_session(c);
                 }
-
-                strbuf_free(serbuf);
-                inherit_handles = true;
-                cl = dupprintf("putty %s&%p:%u", argprefix,
-                               filemap, (unsigned)size);
-            } else if (wParam == IDM_SAVEDSESS) {
-                unsigned int sessno = ((lParam - IDM_SAVED_MIN)
-                                       / MENU_SAVED_STEP) + 1;
-                if (sessno < (unsigned)sesslist.nsessions) {
-                    const char *session = sesslist.sessions[sessno];
-                    cl = dupprintf("putty %s@%s", argprefix, session);
-                    inherit_handles = false;
-                } else
-                    break;
-            } else /* IDM_NEWSESS */ {
-                cl = dupprintf("putty%s%s",
-                               *argprefix ? " " : "",
-                               argprefix);
-                inherit_handles = false;
+                else
+                    conf_free(c);
             }
-
-            GetModuleFileName(NULL, b, sizeof(b) - 1);
-            si.cb = sizeof(si);
-            si.lpReserved = NULL;
-            si.lpDesktop = NULL;
-            si.lpTitle = NULL;
-            si.dwFlags = 0;
-            si.cbReserved2 = 0;
-            si.lpReserved2 = NULL;
-            CreateProcess(b, cl, NULL, NULL, inherit_handles,
-                          NORMAL_PRIORITY_CLASS, NULL, NULL, &si, &pi);
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-
-            if (filemap)
-                CloseHandle(filemap);
-            sfree(cl);
             break;
           }
           case IDM_RESTART:
             if (!wgs->backend) {
                 lp_eventlog(&wgs->logpolicy, "----- Session restarted -----");
                 term_pwron(wgs->term, false);
-                start_backend(wgs);
+            
+    start_backend(wgs);
             }
 
             break;
@@ -3019,6 +3676,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
         sys_cursor_update(wgs);
         break;
       case WM_SIZE:
+        if (!wgs || !wgs->term)
+            return DefWindowProc(hwnd, message, wParam, lParam);
         resize_action = conf_get_int(wgs->conf, CONF_resize_action);
         term_notify_minimised(wgs->term, wParam == SIZE_MINIMIZED);
         {
@@ -4831,8 +5490,8 @@ static void wintw_set_title(TermWin *tw, const char *title, int codepage)
     sfree(wgs->window_name);
     wgs->window_name = new_window_name;
     if (conf_get_bool(wgs->conf, CONF_win_name_always) ||
-        !IsIconic(wgs->term_hwnd))
-        sw_SetWindowText(wgs->term_hwnd, wgs->window_name);
+        !IsIconic(tab_frame_hwnd))
+        frame_set_title(wgs);
 }
 
 static void wintw_set_icon_title(TermWin *tw, const char *title, int codepage)
@@ -4846,8 +5505,8 @@ static void wintw_set_icon_title(TermWin *tw, const char *title, int codepage)
     sfree(wgs->icon_name);
     wgs->icon_name = new_icon_name;
     if (!conf_get_bool(wgs->conf, CONF_win_name_always) &&
-        IsIconic(wgs->term_hwnd))
-        sw_SetWindowText(wgs->term_hwnd, wgs->icon_name);
+        IsIconic(tab_frame_hwnd))
+        frame_set_title(wgs);
 }
 
 static void wintw_set_scrollbar(TermWin *tw, int total, int start, int page)

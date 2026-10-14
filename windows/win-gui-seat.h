@@ -58,6 +58,7 @@ struct WinGuiSeat {
     LogPolicy logpolicy;
 
     HWND term_hwnd;
+    HWND frame_hwnd;            /* the tabbed frame window hosting this tab */
 
     int extra_width, extra_height;
     int font_width, font_height;
