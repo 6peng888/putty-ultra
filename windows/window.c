@@ -1107,6 +1107,16 @@ static void frame_build_saved_menu(void)
 static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
                                      WPARAM wParam, LPARAM lParam)
 {
+    /*
+     * The frame class is registered with RegisterClassW and the frame
+     * window is created with CreateWindowExW, so this window is always a
+     * Unicode window and must be given the Unicode default procedure.
+     * The bare DefWindowProc macro expands to DefWindowProcA in this
+     * build (UNICODE is deliberately not defined), and DefWindowProcA
+     * would misinterpret the wide string in WM_SETTEXT as an ANSI string:
+     * any caption set via SetWindowTextW was truncated at the first
+     * embedded NUL byte, leaving just its first character.
+     */
     switch (message) {
       case WM_CREATE:
         break;
@@ -1118,7 +1128,7 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
          * pinned child terminal) from the tab bar. Actual tabs and
          * the "+" button remain clickable (HTCLIENT).
          */
-        LRESULT hit = DefWindowProc(hwnd, message, wParam, lParam);
+        LRESULT hit = DefWindowProcW(hwnd, message, wParam, lParam);
         if (hit == HTCLIENT) {
             POINT p = { (int)(short)LOWORD(lParam),
                         (int)(short)HIWORD(lParam) };
@@ -1159,7 +1169,7 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
       case WM_SIZE:
       case WM_WINDOWPOSCHANGED:
         tab_relayout();
-        return DefWindowProc(hwnd, message, wParam, lParam);
+        return DefWindowProcW(hwnd, message, wParam, lParam);
 
       case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -1251,7 +1261,7 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
             }
             return 0;
         }
-        return DefWindowProc(hwnd, message, wParam, lParam);
+        return DefWindowProcW(hwnd, message, wParam, lParam);
       }
 
       case WM_INITMENUPOPUP:
@@ -1269,7 +1279,7 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
          * anything in the reserved 0xF000-0xF0FF range is the OS's.
          */
         if (sc >= 0xF000)
-            return DefWindowProc(hwnd, message, wParam, lParam);
+            return DefWindowProcW(hwnd, message, wParam, lParam);
 
         if ((wParam & ~0xF) == IDM_NEWSESS) {
             open_new_session_dialog();
@@ -1340,7 +1350,7 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
         return 0;
 
       default:
-        return DefWindowProc(hwnd, message, wParam, lParam);
+        return DefWindowProcW(hwnd, message, wParam, lParam);
     }
     return 0;
 }
