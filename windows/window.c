@@ -62,7 +62,6 @@
 #define MENU_SAVED_MAX ((IDM_SAVED_MAX-IDM_SAVED_MIN) / MENU_SAVED_STEP)
 
 #define WM_IGNORE_CLIP (WM_APP + 2)
-#define WM_FULLSCR_ON_MAX (WM_APP + 3)
 #define WM_GOT_CLIPDATA (WM_APP + 4)
 #define WM_TAB_RELAYOUT (WM_APP + 9)   /* posted by frame_set_title, see below */
 
@@ -141,6 +140,8 @@ static void frame_build_saved_menu(void);
 static void open_new_session_dialog(void);
 static void close_tab(int idx);
 static void frame_build_menu(void);
+static WinGuiSeat *frame_current_seat(void);
+static void frame_sync_scrollbars(void);
 static void wgs_cleanup(WinGuiSeat *wgs);
 
 static struct sesslist sesslist;       /* for saved-session menu */
@@ -192,6 +193,17 @@ static int g_strip_h = 0;            /* height of the whole tab strip */
 static bool g_relayout_pending = false;  /* WM_TAB_RELAYOUT already posted */
 static HFONT g_tab_font = NULL;      /* label font, scaled to the DPI */
 static int g_tab_font_dpi = 0;       /* DPI g_tab_font was built for */
+
+/*
+ * Full screen is a property of the frame, because the frame is the
+ * window that owns the title bar, the borders and the on-screen
+ * geometry; the terminal children simply fill it. Every tab therefore
+ * shares the mode. These remember what the frame looked like before it
+ * went full screen, so that coming back out puts it back exactly.
+ */
+static bool g_is_full_screen = false;
+static DWORD g_saved_frame_style = 0;
+static WINDOWPLACEMENT g_saved_placement;
 
 #define IS_HIGH_VARSEL(wch1, wch2) \
     ((wch1) == 0xDB40 && ((wch2) >= 0xDD00 && (wch2) <= 0xDDEF))
@@ -1321,6 +1333,12 @@ static void tab_add(WinGuiSeat *wgs)
     tab_list[tab_count] = wgs;
     tab_count++;
     tab_activate(tab_count - 1);
+
+    /*
+     * A session opened while we are already full screen has to pick up
+     * the full-screen scroll-bar setting rather than its own.
+     */
+    frame_sync_scrollbars();
 }
 
 static void open_new_session_dialog(void)
@@ -1465,7 +1483,12 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
             POINT p = { (int)(short)LOWORD(lParam),
                         (int)(short)HIWORD(lParam) };
             ScreenToClient(hwnd, &p);
-            if (p.y >= 0 && p.y < tab_strip_height()) {
+            if (!g_is_full_screen && p.y >= 0 && p.y < tab_strip_height()) {
+                /*
+                 * In full screen the empty strip must not act as a
+                 * caption, or the user could drag the window off the
+                 * monitor with no title bar to drag it back by.
+                 */
                 bool on_control = PtInRect(&g_plusrect, p);
                 for (int i = 0; i < g_tabcount && !on_control; i++)
                     if (PtInRect(&g_tabrects[i], p))
@@ -1541,15 +1564,28 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
             }
         }
 
-        /* Move the frame onto the rectangle Windows suggests; it has
-         * been scaled to the new DPI, so the window keeps its logical
-         * position and size. Don't do this while maximised or
-         * minimised, where the size is not ours to choose. */
-        if (!IsZoomed(hwnd) && !IsIconic(hwnd))
+        if (g_is_full_screen) {
+            /*
+             * In full screen the geometry is ours rather than the window
+             * manager's: if we have ended up on a different monitor (the
+             * window can be moved there from the system menu), cover
+             * that one instead of the suggested rectangle.
+             */
+            RECT ss;
+            get_fullscreen_rect(frame_current_seat(), &ss);
+            SetWindowPos(hwnd, HWND_TOP, ss.left, ss.top,
+                         ss.right - ss.left, ss.bottom - ss.top,
+                         SWP_FRAMECHANGED | SWP_NOACTIVATE);
+        } else if (!IsZoomed(hwnd) && !IsIconic(hwnd)) {
+            /* Move the frame onto the rectangle Windows suggests; it has
+             * been scaled to the new DPI, so the window keeps its logical
+             * position and size. Don't do this while maximised or
+             * minimised, where the size is not ours to choose. */
             SetWindowPos(hwnd, NULL, suggested->left, suggested->top,
                          suggested->right - suggested->left,
                          suggested->bottom - suggested->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
+        }
 
         tab_relayout();
 
@@ -1675,6 +1711,22 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
 
       case WM_SYSCOMMAND: {
         UINT sc = wParam & 0xFFF0;
+
+        /*
+         * Full screen is a property of the frame, so it is toggled
+         * here and not forwarded to a tab. With the title bar gone the
+         * Full Screen item (from the frame's system menu or a tab's
+         * context menu) is the way in and out; treat a request to
+         * restore the window as leaving full screen too.
+         */
+        if ((wParam & ~0xF) == IDM_FULLSCREEN ||
+            (sc == SC_RESTORE && g_is_full_screen)) {
+            WinGuiSeat *w = frame_current_seat();
+            if (w)
+                flip_full_screen(w);
+            return 0;
+        }
+
         /*
          * Let the OS handle ALL standard frame system commands. This
          * crucially includes SC_MOVE (so the window can be dragged by
@@ -3573,9 +3625,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                                    MF_BYCOMMAND |
                                    (resize_action == RESIZE_DISABLED
                                     ? MF_GRAYED : MF_ENABLED));
-                /* Gracefully unzoom if necessary */
-                if (IsZoomed(hwnd) && (resize_action == RESIZE_DISABLED))
-                    ShowWindow(hwnd, SW_RESTORE);
+                /*
+                 * Gracefully leave full screen if the user has just
+                 * forbidden resizing: full screen means the frame has
+                 * been stretched over the monitor.
+                 */
+                if (resize_action == RESIZE_DISABLED && is_full_screen(wgs))
+                    flip_full_screen(wgs);
             }
 
             /* Pass new config data to the logging module */
@@ -3890,7 +3946,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                 }
                 if (is_full_screen(wgs) && press &&
                     button == MBT_LEFT && mouse_on_hotspot) {
-                    SendMessage(hwnd, WM_SYSCOMMAND, SC_MOUSEMENU,
+                    /* In full screen the frame has no title bar, so the
+                     * top left corner of the monitor pops up the
+                     * frame's system menu. */
+                    SendMessage(tab_frame_hwnd, WM_SYSCOMMAND, SC_MOUSEMENU,
                                 MAKELPARAM(pt.x, pt.y));
                     return 0;
                 }
@@ -4201,9 +4260,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             return rv;
         }
         /* break;  (never reached) */
-      case WM_FULLSCR_ON_MAX:
-        wgs->fullscr_on_max = true;
-        break;
       case WM_MOVE:
         term_notify_window_pos(wgs->term, LOWORD(lParam), HIWORD(lParam));
         sys_cursor_update(wgs);
@@ -4242,36 +4298,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                              wgs->window_name : wgs->icon_name);
         if (wParam == SIZE_RESTORED || wParam == SIZE_MAXIMIZED)
             sw_SetWindowText(hwnd, wgs->window_name);
-        if (wParam == SIZE_RESTORED) {
-            wgs->processed_resize = false;
-            clear_full_screen(wgs);
-            if (wgs->processed_resize) {
-                /*
-                 * Inhibit normal processing of this WM_SIZE; a
-                 * secondary one was triggered just now by
-                 * clear_full_screen which contained the correct
-                 * client area size.
-                 */
-                return 0;
-            }
-        }
-        if (wParam == SIZE_MAXIMIZED && wgs->fullscr_on_max) {
-            wgs->fullscr_on_max = false;
-            wgs->processed_resize = false;
-            make_full_screen(wgs);
-            if (wgs->processed_resize) {
-                /*
-                 * Inhibit normal processing of this WM_SIZE; a
-                 * secondary one was triggered just now by
-                 * make_full_screen which contained the correct client
-                 * area size.
-                 */
-                return 0;
-            }
-        }
 
-        wgs->processed_resize = true;
-
+        /*
+         * Note that full screen is handled at the frame level (see
+         * make_full_screen): this window is a tab child which the frame
+         * sizes, so the OS never maximises or restores it, and it will
+         * only ever see SIZE_RESTORED here.
+         */
         if (resize_action == RESIZE_DISABLED) {
             /* A resize, well it better be a minimize. */
             reset_window(wgs, -1);
@@ -6937,15 +6970,13 @@ static void wintw_set_maximised(TermWin *tw, bool maximised)
 }
 
 /*
- * See if we're in full-screen mode.
+ * See if we're in full-screen mode. Full screen is a property of the
+ * frame (the terminal windows are children of it and fill it), so every
+ * tab is in or out of full screen together.
  */
 static bool is_full_screen(WinGuiSeat *wgs)
 {
-    if (!IsZoomed(wgs->term_hwnd))
-        return false;
-    if (GetWindowLongPtr(wgs->term_hwnd, GWL_STYLE) & WS_CAPTION)
-        return false;
-    return true;
+    return g_is_full_screen;
 }
 
 /* Get a MONITORINFO structure for the nearest available monitor, if the
@@ -6956,7 +6987,13 @@ static bool get_monitor_info(WinGuiSeat *wgs, MONITORINFO *mi)
 #if defined(MONITOR_DEFAULTTONEAREST) && !defined(NO_MULTIMON)
     if (p_GetMonitorInfoA && p_MonitorFromWindow) {
         HMONITOR mon;
-        mon = p_MonitorFromWindow(wgs->term_hwnd, MONITOR_DEFAULTTONEAREST);
+        /*
+         * Once the frame exists it is the window that is actually
+         * placed on a monitor, so use it in preference to the terminal
+         * child (which is sized to the frame's client area).
+         */
+        HWND hwnd = tab_frame_hwnd ? tab_frame_hwnd : wgs->term_hwnd;
+        mon = p_MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         mi->cbSize = sizeof(*mi);
         p_GetMonitorInfoA(mon, mi);
         return true;
@@ -7007,80 +7044,156 @@ static bool get_workingarea_rect(WinGuiSeat *wgs, RECT *ss)
 
 
 /*
- * Go full-screen. This should only be called when we are already
- * maximised.
+ * The seat whose configuration a frame-level operation should read: the
+ * active tab's, falling back to the first one.
+ */
+static WinGuiSeat *frame_current_seat(void)
+{
+    if (!tab_list)
+        return NULL;
+    if (tab_active >= 0 && tab_active < tab_count)
+        return tab_list[tab_active];
+    if (tab_count > 0)
+        return tab_list[0];
+    return NULL;
+}
+
+/*
+ * Tick or untick the Full Screen item in the frame's system menu and in
+ * every tab's system and context menus.
+ */
+static void frame_check_fullscreen_item(bool checked)
+{
+    HMENU sm;
+    DWORD flags = checked ? MF_CHECKED : MF_UNCHECKED;
+    int i, j;
+
+    if (tab_frame_hwnd) {
+        sm = GetSystemMenu(tab_frame_hwnd, false);
+        if (sm)
+            CheckMenuItem(sm, IDM_FULLSCREEN, flags);
+    }
+
+    for (i = 0; i < tab_count; i++)
+        for (j = 0; j < lenof(tab_list[i]->popup_menus); j++)
+            if (tab_list[i]->popup_menus[j].menu)
+                CheckMenuItem(tab_list[i]->popup_menus[j].menu,
+                              IDM_FULLSCREEN, flags);
+}
+
+/*
+ * (Re)apply the scroll-bar setting to every terminal. Going full screen
+ * switches the terminals over to the "scrollbar in fullscreen" option,
+ * so this has to be redone whenever that mode changes.
+ */
+static void frame_sync_scrollbars(void)
+{
+    for (int i = 0; i < tab_count; i++) {
+        WinGuiSeat *w = tab_list[i];
+        LONG oldstyle, style;
+
+        oldstyle = style = GetWindowLongPtr(w->term_hwnd, GWL_STYLE);
+        if (conf_get_bool(w->conf, g_is_full_screen ?
+                          CONF_scrollbar_in_fullscreen : CONF_scrollbar))
+            style |= WS_VSCROLL;
+        else
+            style &= ~WS_VSCROLL;
+
+        if (style != oldstyle) {
+            SetWindowLongPtr(w->term_hwnd, GWL_STYLE, style);
+            SetWindowPos(w->term_hwnd, NULL, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                         SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+
+        /*
+         * Adding or removing the scroll bar changes this window's client
+         * area without changing the window itself, so no WM_SIZE
+         * arrives to re-fit the terminal to it; do that here. (term_size
+         * ignores a call that doesn't actually change the size, so this
+         * is cheap when the setting did not change.)
+         */
+        {
+            RECT cr;
+            GetClientRect(w->term_hwnd, &cr);
+            wm_size_resize_term(w, MAKELPARAM(cr.right - cr.left,
+                                              cr.bottom - cr.top));
+            recompute_window_offset(w);
+        }
+    }
+}
+
+/*
+ * Go full screen: take the frame's window furniture off and stretch it
+ * over the whole monitor, taskbar and all, leaving the terminals to fill
+ * what is left. The frame's old style and placement are remembered so
+ * that clear_full_screen can restore them.
  */
 static void make_full_screen(WinGuiSeat *wgs)
 {
     DWORD style;
     RECT ss;
 
-    assert(IsZoomed(wgs->term_hwnd));
-
-    if (is_full_screen(wgs))
+    if (g_is_full_screen)
         return;
 
-    /* Remove the window furniture. */
-    style = GetWindowLongPtr(wgs->term_hwnd, GWL_STYLE);
-    style &= ~(WS_CAPTION | WS_BORDER | WS_THICKFRAME);
-    if (conf_get_bool(wgs->conf, CONF_scrollbar_in_fullscreen))
-        style |= WS_VSCROLL;
-    else
-        style &= ~WS_VSCROLL;
-    SetWindowLongPtr(wgs->term_hwnd, GWL_STYLE, style);
+    /* Remember how the frame was before any of this. */
+    g_saved_frame_style = GetWindowLongPtr(tab_frame_hwnd, GWL_STYLE);
+    g_saved_placement.length = sizeof(g_saved_placement);
+    GetWindowPlacement(tab_frame_hwnd, &g_saved_placement);
+    g_is_full_screen = true;
 
-    /* Resize ourselves to exactly cover the nearest monitor. */
+    /*
+     * Remove the window furniture. WS_MAXIMIZEBOX goes too, so that the
+     * system menu cannot offer to "maximise" a window that is already
+     * using the whole screen.
+     */
+    style = g_saved_frame_style &
+        ~(WS_CAPTION | WS_BORDER | WS_THICKFRAME | WS_MAXIMIZEBOX);
+    SetWindowLongPtr(tab_frame_hwnd, GWL_STYLE, style);
+
+    /*
+     * A maximised window ignores explicit sizes, so drop out of the
+     * maximised state first. The saved placement records that it was
+     * maximised, so leaving full screen puts it back that way.
+     */
+    if (IsZoomed(tab_frame_hwnd))
+        ShowWindow(tab_frame_hwnd, SW_RESTORE);
+
+    /* Cover the monitor itself, not just the working area. */
     get_fullscreen_rect(wgs, &ss);
-    SetWindowPos(wgs->term_hwnd, HWND_TOP, ss.left, ss.top,
-                 ss.right - ss.left, ss.bottom - ss.top, SWP_FRAMECHANGED);
+    SetWindowPos(tab_frame_hwnd, HWND_TOP, ss.left, ss.top,
+                 ss.right - ss.left, ss.bottom - ss.top,
+                 SWP_FRAMECHANGED | SWP_NOACTIVATE);
 
-    /* We may have changed size as a result */
-
-    reset_window(wgs, 0);
-
-    /* Tick the menu item in the System and context menus. */
-    {
-        int i;
-        for (i = 0; i < lenof(wgs->popup_menus); i++)
-            CheckMenuItem(wgs->popup_menus[i].menu,
-                          IDM_FULLSCREEN, MF_CHECKED);
-    }
+    frame_sync_scrollbars();
+    tab_relayout();
+    frame_check_fullscreen_item(true);
 }
 
 /*
- * Clear the full-screen attributes.
+ * Clear the full-screen attributes, putting the frame back where and
+ * how it was.
  */
 static void clear_full_screen(WinGuiSeat *wgs)
 {
-    DWORD oldstyle, style;
+    if (!g_is_full_screen)
+        return;
+
+    g_is_full_screen = false;
 
     /* Reinstate the window furniture. */
-    style = oldstyle = GetWindowLongPtr(wgs->term_hwnd, GWL_STYLE);
-    if (!(style & WS_CHILD)) {
-        style |= WS_CAPTION | WS_BORDER;
-        if (conf_get_int(wgs->conf, CONF_resize_action) == RESIZE_DISABLED)
-            style &= ~WS_THICKFRAME;
-        else
-            style |= WS_THICKFRAME;
-    }
-    if (conf_get_bool(wgs->conf, CONF_scrollbar))
-        style |= WS_VSCROLL;
-    else
-        style &= ~WS_VSCROLL;
-    if (style != oldstyle) {
-        SetWindowLongPtr(wgs->term_hwnd, GWL_STYLE, style);
-        SetWindowPos(wgs->term_hwnd, NULL, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
-                     SWP_FRAMECHANGED);
-    }
+    SetWindowLongPtr(tab_frame_hwnd, GWL_STYLE, g_saved_frame_style);
+    SetWindowPos(tab_frame_hwnd, NULL, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                 SWP_NOACTIVATE | SWP_FRAMECHANGED);
 
-    /* Untick the menu item in the System and context menus. */
-    {
-        int i;
-        for (i = 0; i < lenof(wgs->popup_menus); i++)
-            CheckMenuItem(wgs->popup_menus[i].menu,
-                          IDM_FULLSCREEN, MF_UNCHECKED);
-    }
+    /* And put it back where it was, maximised or not as before. */
+    SetWindowPlacement(tab_frame_hwnd, &g_saved_placement);
+
+    frame_sync_scrollbars();
+    tab_relayout();
+    frame_check_fullscreen_item(false);
 }
 
 /*
@@ -7088,14 +7201,10 @@ static void clear_full_screen(WinGuiSeat *wgs)
  */
 static void flip_full_screen(WinGuiSeat *wgs)
 {
-    if (is_full_screen(wgs)) {
-        ShowWindow(wgs->term_hwnd, SW_RESTORE);
-    } else if (IsZoomed(wgs->term_hwnd)) {
+    if (g_is_full_screen)
+        clear_full_screen(wgs);
+    else
         make_full_screen(wgs);
-    } else {
-        SendMessage(wgs->term_hwnd, WM_FULLSCR_ON_MAX, 0, 0);
-        ShowWindow(wgs->term_hwnd, SW_MAXIMIZE);
-    }
 }
 
 static size_t win_seat_output(Seat *seat, SeatOutputType type,
