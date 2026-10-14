@@ -117,6 +117,8 @@ static void setup_clipboards(Terminal *, Conf *);
 
 /* Window layout information */
 static void reset_window(WinGuiSeat *wgs, int reinit);
+static void recompute_window_offset(WinGuiSeat *wgs);
+static void wm_size_resize_term(WinGuiSeat *wgs, LPARAM lParam);
 
 static void flash_window(WinGuiSeat *wgs, int mode);
 static void sys_cursor_update(WinGuiSeat *wgs);
@@ -1026,6 +1028,16 @@ static void tab_relayout(void)
     GetClientRect(tab_frame_hwnd, &fr);
     int cw = fr.right - fr.left;
     int ch = fr.bottom - fr.top - TAB_H;
+    /*
+     * While the frame is minimised its client area collapses to
+     * nothing. Sizing the terminal children to that would make them
+     * reflow their contents into a single column (which the terminal
+     * cannot reliably undo afterwards), so leave the tabs alone until
+     * the frame has a usable client area again. The same goes for a
+     * frame too small to hold even the tab strip.
+     */
+    if (IsIconic(tab_frame_hwnd) || cw <= 0 || ch <= 0)
+        return;
     for (int i = 0; i < tab_count; i++) {
         WinGuiSeat *w = tab_list[i];
         ShowWindow(w->term_hwnd, i == tab_active ? SW_SHOW : SW_HIDE);
@@ -1236,6 +1248,70 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
       case WM_WINDOWPOSCHANGED:
         tab_relayout();
         return DefWindowProcW(hwnd, message, wParam, lParam);
+
+      case WM_DPICHANGED: {
+        /*
+         * The frame is the only top-level window, so it is the only one
+         * Windows tells about a DPI change: the terminal children are
+         * only sent WM_DPICHANGED_BEFOREPARENT/AFTERPARENT, which we
+         * ignore. Pick up the new DPI here and propagate it to every
+         * tab, so the terminals keep the same size in logical units
+         * (and hence roughly the same number of rows and columns) as
+         * the window moves between monitors of different scale.
+         */
+        RECT *suggested = (RECT *)lParam;
+
+        /*
+         * Rebuild the fonts first, while the windows still have their
+         * old size. Then, when the frame is resized below, the
+         * terminals are re-fitted in one step, using metrics that
+         * already match the new monitor, instead of being resized
+         * twice with a font that is momentarily the wrong size.
+         */
+        for (int i = 0; i < tab_count; i++) {
+            WinGuiSeat *w = tab_list[i];
+            w->dpi_info.cur_dpi.x = LOWORD(wParam);
+            w->dpi_info.cur_dpi.y = HIWORD(wParam);
+            w->dpi_info.new_wnd_rect = *suggested;
+            if (w->term) {
+                deinit_fonts(w);
+                init_fonts(w, 0, 0);
+            }
+        }
+
+        /* Move the frame onto the rectangle Windows suggests; it has
+         * been scaled to the new DPI, so the window keeps its logical
+         * position and size. Don't do this while maximised or
+         * minimised, where the size is not ours to choose. */
+        if (!IsZoomed(hwnd) && !IsIconic(hwnd))
+            SetWindowPos(hwnd, NULL, suggested->left, suggested->top,
+                         suggested->right - suggested->left,
+                         suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+
+        tab_relayout();
+
+        /*
+         * The frame's client area may end up exactly the same size, in
+         * which case the relayout above sends no WM_SIZE to the
+         * terminals - but their font metrics have changed, so they
+         * still have to be re-fitted to their window. (term_size is a
+         * no-op if the terminal ends up the same size, so this is
+         * harmless if the WM_SIZE did happen.)
+         */
+        for (int i = 0; i < tab_count; i++) {
+            WinGuiSeat *w = tab_list[i];
+            RECT cr;
+
+            if (!w->term || !w->term_hwnd)
+                continue;
+            GetClientRect(w->term_hwnd, &cr);
+            wm_size_resize_term(w, MAKELPARAM(cr.right - cr.left,
+                                              cr.bottom - cr.top));
+            recompute_window_offset(w);
+        }
+        return 0;
+      }
 
       case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -3863,6 +3939,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             return DefWindowProc(hwnd, message, wParam, lParam);
         resize_action = conf_get_int(wgs->conf, CONF_resize_action);
         term_notify_minimised(wgs->term, wParam == SIZE_MINIMIZED);
+        /*
+         * The terminal is a child filling the frame's client area, so a
+         * zero-sized client area means the frame is minimised (or has
+         * been shrunk below the tab strip), not that the terminal
+         * should become a single column wide. Fitting it to a
+         * degenerate size would re-wrap the whole screenful of text
+         * into one character per line, and the terminal cannot reliably
+         * undo that when the real size comes back, so keep the existing
+         * geometry and wait for a usable size.
+         */
+        if (LOWORD(lParam) == 0 || HIWORD(lParam) == 0)
+            return 0;
         {
             /*
              * WM_SIZE's lParam tells us the size of the client area.
