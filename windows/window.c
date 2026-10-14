@@ -608,19 +608,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 
         int winmode = WS_CHILD | WS_VSCROLL;
         int exwinmode = 0;
-        const struct BackendVtable *vt =
-            backend_vt_from_proto(be_default_protocol);
-        bool resize_forbidden = false;
-        if (vt && vt->flags & BACKEND_RESIZE_FORBIDDEN)
-            resize_forbidden = true;
+        /* Tab child windows must be borderless: no caption, border,
+         * resize frame or system-menu buttons, so they cannot be dragged
+         * or resized independently within the frame. */
+        winmode &= ~(WS_CAPTION | WS_BORDER | WS_THICKFRAME |
+                     WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU |
+                     WS_DLGFRAME);
         wchar_t *uappname = dup_mb_to_wc(DEFAULT_CODEPAGE, appname);
         wgs->window_name = dup_mb_to_wc(DEFAULT_CODEPAGE, appname);
         wgs->icon_name = dup_mb_to_wc(DEFAULT_CODEPAGE, appname);
         if (!conf_get_bool(wgs->conf, CONF_scrollbar))
             winmode &= ~(WS_VSCROLL);
-        if (conf_get_int(wgs->conf, CONF_resize_action) == RESIZE_DISABLED ||
-            resize_forbidden)
-            winmode &= ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
         if (conf_get_bool(wgs->conf, CONF_alwaysontop))
             exwinmode |= WS_EX_TOPMOST;
         if (conf_get_bool(wgs->conf, CONF_sunken_edge))
@@ -1350,19 +1348,17 @@ static void new_session_finish(WinGuiSeat *wgs)
 
         int winmode = WS_CHILD | WS_VSCROLL;
         int exwinmode = 0;
-        const struct BackendVtable *vt =
-            backend_vt_from_proto(be_default_protocol);
-        bool resize_forbidden = false;
-        if (vt && vt->flags & BACKEND_RESIZE_FORBIDDEN)
-            resize_forbidden = true;
+        /* Tab child windows must be borderless: no caption, border,
+         * resize frame or system-menu buttons, so they cannot be dragged
+         * or resized independently within the frame. */
+        winmode &= ~(WS_CAPTION | WS_BORDER | WS_THICKFRAME |
+                     WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU |
+                     WS_DLGFRAME);
         wchar_t *uappname = dup_mb_to_wc(DEFAULT_CODEPAGE, appname);
         wgs->window_name = dup_mb_to_wc(DEFAULT_CODEPAGE, appname);
         wgs->icon_name = dup_mb_to_wc(DEFAULT_CODEPAGE, appname);
         if (!conf_get_bool(wgs->conf, CONF_scrollbar))
             winmode &= ~(WS_VSCROLL);
-        if (conf_get_int(wgs->conf, CONF_resize_action) == RESIZE_DISABLED ||
-            resize_forbidden)
-            winmode &= ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
         if (conf_get_bool(wgs->conf, CONF_alwaysontop))
             exwinmode |= WS_EX_TOPMOST;
         if (conf_get_bool(wgs->conf, CONF_sunken_edge))
@@ -3126,16 +3122,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                 else
                     nflg &= ~WS_VSCROLL;
 
-                if (resize_action == RESIZE_DISABLED ||
-                    is_full_screen(wgs))
-                    nflg &= ~WS_THICKFRAME;
-                else
-                    nflg |= WS_THICKFRAME;
+                if (!(nflg & WS_CHILD)) {
+                    if (resize_action == RESIZE_DISABLED ||
+                        is_full_screen(wgs))
+                        nflg &= ~WS_THICKFRAME;
+                    else
+                        nflg |= WS_THICKFRAME;
 
-                if (resize_action == RESIZE_DISABLED)
-                    nflg &= ~WS_MAXIMIZEBOX;
-                else
-                    nflg |= WS_MAXIMIZEBOX;
+                    if (resize_action == RESIZE_DISABLED)
+                        nflg &= ~WS_MAXIMIZEBOX;
+                    else
+                        nflg |= WS_MAXIMIZEBOX;
+                }
 
                 if (nflg != flag || nexflag != exflag) {
                     if (nflg != flag)
@@ -6511,11 +6509,13 @@ static void clear_full_screen(WinGuiSeat *wgs)
 
     /* Reinstate the window furniture. */
     style = oldstyle = GetWindowLongPtr(wgs->term_hwnd, GWL_STYLE);
-    style |= WS_CAPTION | WS_BORDER;
-    if (conf_get_int(wgs->conf, CONF_resize_action) == RESIZE_DISABLED)
-        style &= ~WS_THICKFRAME;
-    else
-        style |= WS_THICKFRAME;
+    if (!(style & WS_CHILD)) {
+        style |= WS_CAPTION | WS_BORDER;
+        if (conf_get_int(wgs->conf, CONF_resize_action) == RESIZE_DISABLED)
+            style &= ~WS_THICKFRAME;
+        else
+            style |= WS_THICKFRAME;
+    }
     if (conf_get_bool(wgs->conf, CONF_scrollbar))
         style |= WS_VSCROLL;
     else
