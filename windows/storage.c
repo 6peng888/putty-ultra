@@ -484,6 +484,71 @@ struct settings_r {
     char *body;                        /* contents of the session file */
 };
 
+/*
+ * Read a session out of the Registry, in the same `keyword=value' text
+ * format that session files use, and return it - or NULL if there is no
+ * such session in the Registry.
+ *
+ * Saved sessions now live in files, and are only ever written there.
+ * But we still read the Registry as a fallback, because other programs
+ * create a session there and then run us with -load: WinSCP, for
+ * example, writes a temporary session to the Registry and then runs
+ *
+ *     putty -load "WinSCP temporary session" -pwfile ...
+ *
+ * expecting PuTTY to pick the session up from there.
+ */
+static char *registry_session_body(const char *sessionname)
+{
+    HKEY rkey = open_regkey_ro(HKEY_CURRENT_USER, reg_sessions_key);
+    HKEY key;
+    strbuf *escaped, *body;
+    int i;
+
+    if (!rkey)
+        return NULL;
+
+    escaped = strbuf_new();
+    escape_registry_key(sessionname, escaped);
+    key = open_regkey_ro(rkey, escaped->s);
+    strbuf_free(escaped);
+    close_regkey(rkey);
+
+    if (!key)
+        return NULL;                   /* no such session */
+
+    body = strbuf_new();
+
+    for (i = 0; ; i++) {
+        strbuf *vname = strbuf_new(), *vdata = strbuf_new();
+        DWORD type;
+
+        if (!enum_regvalue(key, i, vname, &type, vdata)) {
+            strbuf_free(vname);
+            strbuf_free(vdata);
+            break;
+        }
+
+        if (type == REG_SZ) {
+            put_setting_line(body, vname->s, vdata->s);
+        } else if (type == REG_DWORD && vdata->len >= 4) {
+            DWORD value;
+            char *valstr;
+
+            memcpy(&value, vdata->s, 4);
+            valstr = dupprintf("%d", (int)value);
+            put_setting_line(body, vname->s, valstr);
+            sfree(valstr);
+        }
+
+        strbuf_free(vname);
+        strbuf_free(vdata);
+    }
+
+    close_regkey(key);
+    return strbuf_to_str(body);
+}
+
 settings_r *open_settings_r(const char *sessionname)
 {
     char *path;
@@ -497,25 +562,41 @@ settings_r *open_settings_r(const char *sessionname)
         sessionname = "Default Settings";
 
     path = session_name_to_path(sessionname, NULL);
-    if (!path)
-        return NULL;
+    if (path) {
+        f = CreateFile(path, GENERIC_READ,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE |
+                       FILE_SHARE_DELETE,
+                       NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        sfree(path);
 
-    f = CreateFile(path, GENERIC_READ,
-                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                   NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    sfree(path);
+        if (f != INVALID_HANDLE_VALUE) {
+            sb = strbuf_new();
+            while (ReadFile(f, buf, sizeof(buf), &len, NULL) && len > 0)
+                put_data(sb, buf, len);
+            CloseHandle(f);
 
-    if (f == INVALID_HANDLE_VALUE)
-        return NULL;                   /* no such session */
+            handle = snew(settings_r);
+            handle->body = strbuf_to_str(sb);
+            return handle;
+        }
+    }
 
-    sb = strbuf_new();
-    while (ReadFile(f, buf, sizeof(buf), &len, NULL) && len > 0)
-        put_data(sb, buf, len);
-    CloseHandle(f);
+    /*
+     * There's no file of that name, so look in the Registry. This can
+     * only find a session which something else put there, since we
+     * never save sessions to the Registry any more; see the comment on
+     * registry_session_body() above.
+     */
+    {
+        char *body = registry_session_body(sessionname);
+        if (body) {
+            handle = snew(settings_r);
+            handle->body = body;
+            return handle;
+        }
+    }
 
-    handle = snew(settings_r);
-    handle->body = strbuf_to_str(sb);
-    return handle;
+    return NULL;
 }
 
 char *read_setting_s(settings_r *handle, const char *key)
