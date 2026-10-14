@@ -595,7 +595,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
         wcf.lpszClassName = L"PuTTYTabFrame";
         RegisterClassW(&wcf);
         tab_frame_hwnd = CreateWindowExW(
-            0, L"PuTTYTabFrame", L"PuTTY", WS_OVERLAPPEDWINDOW,
+            0, L"PuTTYTabFrame", L"PuTTY",
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT, CW_USEDEFAULT,
             guess_width, guess_height + TAB_H,
             NULL, NULL, inst, NULL);
@@ -716,8 +717,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     /*
      * Resize the window to that size, also repositioning it if it's extended
      * off the edge of a monitor.
+     *
+     * For tabbed child windows, the frame owns position and size; do not
+     * use screen coordinates (which SetWindowPos interprets as relative to
+     * the parent for a WS_CHILD window) to move the child.
      */
-    {
+    if (!(GetWindowLongPtr(wgs->term_hwnd, GWL_STYLE) & WS_CHILD)) {
         /* Find the previous coordinates of the window */
         RECT winr;
         GetWindowRect(wgs->term_hwnd, &winr);
@@ -1105,7 +1110,32 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
       case WM_CREATE:
         break;
 
+      case WM_NCHITTEST: {
+        /*
+         * Make the empty part of the tab strip act like the window
+         * caption, so the user can drag the whole frame (and its
+         * pinned child terminal) from the tab bar. Actual tabs and
+         * the "+" button remain clickable (HTCLIENT).
+         */
+        LRESULT hit = DefWindowProc(hwnd, message, wParam, lParam);
+        if (hit == HTCLIENT) {
+            POINT p = { (int)(short)LOWORD(lParam),
+                        (int)(short)HIWORD(lParam) };
+            ScreenToClient(hwnd, &p);
+            if (p.y >= 0 && p.y < TAB_H) {
+                bool on_control = PtInRect(&g_plusrect, p);
+                for (int i = 0; i < g_tabcount && !on_control; i++)
+                    if (PtInRect(&g_tabrects[i], p))
+                        on_control = true;
+                if (!on_control)
+                    return HTCAPTION;
+            }
+        }
+        return hit;
+      }
+
       case WM_SIZE:
+      case WM_WINDOWPOSCHANGED:
         tab_relayout();
         return DefWindowProc(hwnd, message, wParam, lParam);
 
@@ -1198,10 +1228,14 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
 
       case WM_SYSCOMMAND: {
         UINT sc = wParam & 0xFFF0;
-        /* Let the OS handle standard frame system commands. */
-        if (sc == SC_CLOSE || sc == SC_MINIMIZE || sc == SC_MAXIMIZE ||
-            sc == SC_RESTORE || sc == SC_MOUSEMENU || sc == SC_KEYMENU ||
-            sc == SC_TASKLIST || sc == SC_NEXTWINDOW || sc == SC_PREVWINDOW)
+        /*
+         * Let the OS handle ALL standard frame system commands. This
+         * crucially includes SC_MOVE (so the window can be dragged by
+         * its caption or the tab strip) and SC_SIZE (border resize).
+         * Our custom menu commands (IDM_*) all live below 0xF000, so
+         * anything in the reserved 0xF000-0xF0FF range is the OS's.
+         */
+        if (sc >= 0xF000)
             return DefWindowProc(hwnd, message, wParam, lParam);
 
         if ((wParam & ~0xF) == IDM_NEWSESS) {
@@ -1335,7 +1369,8 @@ static void new_session_finish(WinGuiSeat *wgs)
         wcf.lpszClassName = L"PuTTYTabFrame";
         RegisterClassW(&wcf);
         tab_frame_hwnd = CreateWindowExW(
-            0, L"PuTTYTabFrame", L"PuTTY", WS_OVERLAPPEDWINDOW,
+            0, L"PuTTYTabFrame", L"PuTTY",
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT, CW_USEDEFAULT,
             guess_width, guess_height + TAB_H,
             NULL, NULL, hinst, NULL);
@@ -1430,7 +1465,7 @@ static void new_session_finish(WinGuiSeat *wgs)
     guess_width = wgs->extra_width + wgs->font_width * wgs->term->cols;
     guess_height = wgs->extra_height + wgs->font_height * wgs->term->rows;
 
-    {
+    if (!(GetWindowLongPtr(wgs->term_hwnd, GWL_STYLE) & WS_CHILD)) {
         RECT winr;
         GetWindowRect(wgs->term_hwnd, &winr);
 
@@ -2558,9 +2593,15 @@ static void reset_window(WinGuiSeat *wgs, int reinit)
                    ((wgs->dpi_info.new_wnd_rect.bottom -
                      wgs->dpi_info.new_wnd_rect.top) -
                     (rect.bottom - rect.top)) / 2);
-        SetWindowPos(wgs->term_hwnd, NULL,
-                     wgs->dpi_info.new_wnd_rect.left,
-                     wgs->dpi_info.new_wnd_rect.top,
+        int x = wgs->dpi_info.new_wnd_rect.left;
+        int y = wgs->dpi_info.new_wnd_rect.top;
+        if (GetWindowLongPtr(wgs->term_hwnd, GWL_STYLE) & WS_CHILD) {
+            POINT pt = {x, y};
+            ScreenToClient(GetParent(wgs->term_hwnd), &pt);
+            x = pt.x;
+            y = pt.y;
+        }
+        SetWindowPos(wgs->term_hwnd, NULL, x, y,
                      rect.right - rect.left, rect.bottom - rect.top,
                      SWP_NOZORDER);
 
@@ -2898,6 +2939,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
     switch (message) {
       case WM_CREATE:
         break;
+      case WM_WINDOWPOSCHANGING: {
+        /*
+         * Tab child windows must always stay pinned to the area below
+         * the tab strip and fill the frame's client area. Ignore any
+         * (programmatic or system) attempt to move or resize them
+         * independently of the frame, so they can never drift away
+         * from the tab panel.
+         */
+        WINDOWPOS *wp = (WINDOWPOS *)lParam;
+        if (GetWindowLongPtr(hwnd, GWL_STYLE) & WS_CHILD) {
+            RECT fr;
+            GetClientRect(tab_frame_hwnd, &fr);
+            wp->x = 0;
+            wp->y = TAB_H;
+            wp->cx = fr.right - fr.left;
+            wp->cy = fr.bottom - fr.top - TAB_H;
+            wp->flags &= ~(SWP_NOMOVE | SWP_NOSIZE);
+        }
+        break;
+      }
       case WM_CLOSE: {
         char *title, *msg, *additional = NULL;
         show_mouseptr(wgs, true);
