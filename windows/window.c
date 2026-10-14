@@ -64,6 +64,7 @@
 #define WM_IGNORE_CLIP (WM_APP + 2)
 #define WM_FULLSCR_ON_MAX (WM_APP + 3)
 #define WM_GOT_CLIPDATA (WM_APP + 4)
+#define WM_TAB_RELAYOUT (WM_APP + 9)   /* posted by frame_set_title, see below */
 
 /* Needed for Chinese support and apparently not always defined. */
 #ifndef VK_PROCESSKEY
@@ -164,7 +165,18 @@ struct WinGuiSeatListNode wgslisthead = {
  * the system menu and a tab strip; it forwards most system-menu
  * commands to the active tab, and intercepts New/Duplicate/Saved
  * Session to open additional tabs. */
-#define TAB_H 26
+/*
+ * Tab strip metrics. All of them are given in 96-dpi pixels and scaled
+ * to the frame's actual DPI when they are used, so the strip keeps in
+ * step with the terminal when the window moves to a monitor with a
+ * different scale.
+ */
+#define TAB_H 26            /* height of one row of tabs */
+#define TAB_MIN_W 120       /* minimum width of a tab */
+#define TAB_PAD_W 34        /* width added to the label text in a tab */
+#define TAB_CLOSE_W 16      /* width of a tab's close box */
+#define TAB_PLUS_W 24       /* width of the "+" (new session) button */
+#define TAB_GAP 2           /* gap around tabs and rows */
 #define MAX_TABS 64
 static HWND tab_frame_hwnd = NULL;
 static WinGuiSeat **tab_list = NULL;
@@ -176,6 +188,10 @@ static HMENU frame_savedsess_menu = NULL;
 static RECT g_tabrects[MAX_TABS];
 static RECT g_plusrect;
 static int g_tabcount = 0;
+static int g_strip_h = 0;            /* height of the whole tab strip */
+static bool g_relayout_pending = false;  /* WM_TAB_RELAYOUT already posted */
+static HFONT g_tab_font = NULL;      /* label font, scaled to the DPI */
+static int g_tab_font_dpi = 0;       /* DPI g_tab_font was built for */
 
 #define IS_HIGH_VARSEL(wch1, wch2) \
     ((wch1) == 0xDB40 && ((wch2) >= 0xDD00 && (wch2) <= 0xDDEF))
@@ -1003,6 +1019,215 @@ static POINT mpt(int x, int y)
     return p;
 }
 
+/*
+ * The DPI the tab strip is drawn at: that of the active session's
+ * monitor, since the frame always sits on the same monitor as its
+ * active terminal.
+ */
+static int tab_dpi(void)
+{
+    int dpi = 0;
+
+    if (tab_active >= 0 && tab_active < tab_count &&
+        tab_list && tab_list[tab_active])
+        dpi = tab_list[tab_active]->dpi_info.cur_dpi.y;
+
+    if (dpi <= 0) {
+        HDC hdc = GetDC(tab_frame_hwnd);
+        dpi = GetDeviceCaps(hdc, LOGPIXELSY);
+        ReleaseDC(tab_frame_hwnd, hdc);
+    }
+
+    return dpi > 0 ? dpi : 96;
+}
+
+/* Convert one of the 96-dpi tab metrics above into real pixels */
+static int tab_scale(int px)
+{
+    return MulDiv(px, tab_dpi(), 96);
+}
+
+static int tab_row_height(void)
+{
+    return tab_scale(TAB_H);
+}
+
+/*
+ * The font used for the tab labels and the "+" button, scaled to the
+ * current DPI. Cached, and rebuilt whenever the DPI changes.
+ */
+static HFONT tab_label_font(void)
+{
+    int dpi = tab_dpi();
+
+    if (!g_tab_font || g_tab_font_dpi != dpi) {
+        LOGFONTW lf;
+        HFONT newfont;
+
+        if (GetObjectW(GetStockObject(DEFAULT_GUI_FONT), sizeof(lf), &lf)) {
+            lf.lfHeight = (lf.lfHeight < 0) ?
+                -MulDiv(-lf.lfHeight, dpi, 96) :
+                MulDiv(lf.lfHeight, dpi, 96);
+            lf.lfWidth = 0;
+        } else {
+            memset(&lf, 0, sizeof(lf));
+            lf.lfHeight = -MulDiv(9, dpi, 72);
+            lf.lfCharSet = DEFAULT_CHARSET;
+            wcscpy(lf.lfFaceName, L"Segoe UI");
+        }
+
+        newfont = CreateFontIndirectW(&lf);
+        if (newfont) {
+            if (g_tab_font)
+                DeleteObject(g_tab_font);
+            g_tab_font = newfont;
+            g_tab_font_dpi = dpi;
+        }
+    }
+
+    return g_tab_font ? g_tab_font : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+}
+
+/*
+ * Compose the caption of tab idx: its 1-based number (so the tabs can
+ * be told apart at a glance) and the session title, with a leading '*'
+ * on the active tab.
+ */
+static void tab_label(int idx, wchar_t *buf, size_t buflen)
+{
+    const wchar_t *name = tab_list[idx]->window_name ?
+        tab_list[idx]->window_name : L"";
+
+    _snwprintf(buf, buflen, L"%s%d: %s", idx == tab_active ? L"* " : L"",
+               idx + 1, name);
+    buf[buflen - 1] = L'\0';
+}
+
+static int tab_strip_height(void)
+{
+    return g_strip_h > 0 ? g_strip_h : tab_row_height();
+}
+
+/*
+ * Work out where every tab and the "+" button go. Tabs are laid out
+ * left to right and wrapped onto further rows when they no longer fit
+ * across the frame, so the strip grows downwards as sessions are
+ * added, or as the frame is made narrower.
+ */
+static void tab_update_layout(void)
+{
+    int row_h, pad, minw, gap, plus_w;
+    int cw, ch, max_rows, x, y, row;
+    bool full = false;
+    HDC hdc;
+    HFONT oldfont;
+    RECT fr;
+
+    if (!tab_frame_hwnd)
+        return;
+
+    GetClientRect(tab_frame_hwnd, &fr);
+    cw = fr.right - fr.left;
+    ch = fr.bottom - fr.top;
+
+    row_h = tab_row_height();
+    pad = tab_scale(TAB_PAD_W);
+    minw = tab_scale(TAB_MIN_W);
+    gap = tab_scale(TAB_GAP);
+    plus_w = tab_scale(TAB_PLUS_W);
+
+    g_tabcount = (tab_count < MAX_TABS) ? tab_count : MAX_TABS;
+
+    /*
+     * However many rows the tabs want, never let the strip eat the
+     * whole window: always leave at least two rows of it for the
+     * terminal. Any tab that still doesn't fit is left with an empty
+     * rectangle, so it is neither drawn nor clickable; that can only
+     * happen if the window is tiny compared with the number of tabs.
+     */
+    max_rows = (ch > 3*row_h) ? (ch - 2*row_h) / row_h : 1;
+    if (max_rows < 1)
+        max_rows = 1;
+
+    hdc = GetDC(tab_frame_hwnd);
+    oldfont = SelectObject(hdc, tab_label_font());
+
+    x = gap;
+    y = gap;
+    row = 0;
+
+    for (int i = 0; i < g_tabcount; i++) {
+        wchar_t label[1024];
+        SIZE sz;
+        int tw;
+        RECT tr;
+
+        tab_label(i, label, lenof(label));
+        GetTextExtentPoint32W(hdc, label, (int)wcslen(label), &sz);
+
+        tw = sz.cx + pad;
+        if (tw < minw)
+            tw = minw;
+        if (tw > cw - 2*gap)           /* never wider than the strip itself */
+            tw = cw - 2*gap;
+        if (tw < 1)
+            tw = 1;
+
+        /* Wrap onto the next row if this tab won't fit on the current one */
+        if (x > gap && x + tw > cw - gap) {
+            x = gap;
+            y += row_h;
+            row++;
+        }
+
+        if (row >= max_rows) {
+            full = true;
+            g_tabrects[i].left = g_tabrects[i].top = 0;
+            g_tabrects[i].right = g_tabrects[i].bottom = 0;
+            continue;
+        }
+
+        tr.left = x;
+        tr.top = y;
+        tr.right = x + tw;
+        tr.bottom = y + row_h - gap;
+        g_tabrects[i] = tr;
+
+        x = tr.right + gap;
+    }
+
+    /* The "+" that opens another session goes after the last tab */
+    if (!full) {
+        if (x > gap && x + plus_w > cw - gap) {
+            x = gap;
+            y += row_h;
+            row++;
+        }
+        if (row >= max_rows) {
+            g_plusrect.left = g_plusrect.top = 0;
+            g_plusrect.right = g_plusrect.bottom = 0;
+        } else {
+            g_plusrect.left = x;
+            g_plusrect.top = y;
+            g_plusrect.right = x + plus_w;
+            g_plusrect.bottom = y + row_h - gap;
+        }
+    } else {
+        g_plusrect.left = g_plusrect.top = 0;
+        g_plusrect.right = g_plusrect.bottom = 0;
+    }
+
+    /* Height of the strip is however many rows we ended up using */
+    g_strip_h = (row + 1) * row_h;
+    if (g_strip_h > max_rows * row_h)
+        g_strip_h = max_rows * row_h;
+    if (g_strip_h > ch)
+        g_strip_h = ch;
+
+    SelectObject(hdc, oldfont);
+    ReleaseDC(tab_frame_hwnd, hdc);
+}
+
 static void frame_set_title(WinGuiSeat *wgs)
 {
     if (!tab_frame_hwnd)
@@ -1010,6 +1235,21 @@ static void frame_set_title(WinGuiSeat *wgs)
     if (tab_active >= 0 && tab_list[tab_active] == wgs)
         sw_SetWindowText(tab_frame_hwnd, wgs->window_name);
     InvalidateRect(tab_frame_hwnd, NULL, true);
+
+    /*
+     * A new title changes how wide its tab wants to be, which can
+     * change how many rows the strip needs, and hence where the
+     * terminals have to start. Since title changes arrive while the
+     * terminal is processing data (an OSC 0/2 escape, say), we must not
+     * move and resize windows from here, because that would re-enter
+     * the terminal's resize handling; ask for a relayout through the
+     * message queue instead. (Not while we're tearing every tab down on
+     * exit, when the tab list is in flux.)
+     */
+    if (!g_closing_all && !g_relayout_pending) {
+        if (PostMessageW(tab_frame_hwnd, WM_TAB_RELAYOUT, 0, 0))
+            g_relayout_pending = true;
+    }
 }
 
 static int tab_find(WinGuiSeat *wgs)
@@ -1022,27 +1262,38 @@ static int tab_find(WinGuiSeat *wgs)
 
 static void tab_relayout(void)
 {
+    int cw, ch, sh;
+    RECT fr;
+
     if (!tab_frame_hwnd)
         return;
-    RECT fr;
+
     GetClientRect(tab_frame_hwnd, &fr);
-    int cw = fr.right - fr.left;
-    int ch = fr.bottom - fr.top - TAB_H;
+    cw = fr.right - fr.left;
+    ch = fr.bottom - fr.top;
+
     /*
      * While the frame is minimised its client area collapses to
      * nothing. Sizing the terminal children to that would make them
      * reflow their contents into a single column (which the terminal
      * cannot reliably undo afterwards), so leave the tabs alone until
-     * the frame has a usable client area again. The same goes for a
-     * frame too small to hold even the tab strip.
+     * the frame has a usable client area again.
      */
     if (IsIconic(tab_frame_hwnd) || cw <= 0 || ch <= 0)
         return;
+
+    tab_update_layout();
+    sh = tab_strip_height();
+
+    /* Not enough room left even for one row of terminal: don't shrink it */
+    if (ch - sh <= 0)
+        return;
+
     for (int i = 0; i < tab_count; i++) {
         WinGuiSeat *w = tab_list[i];
         ShowWindow(w->term_hwnd, i == tab_active ? SW_SHOW : SW_HIDE);
         SetWindowPos(w->term_hwnd, i == tab_active ? HWND_TOP : NULL,
-                     0, TAB_H, cw, ch,
+                     0, sh, cw, ch - sh,
                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
     }
     InvalidateRect(tab_frame_hwnd, NULL, true);
@@ -1211,7 +1462,7 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
             POINT p = { (int)(short)LOWORD(lParam),
                         (int)(short)HIWORD(lParam) };
             ScreenToClient(hwnd, &p);
-            if (p.y >= 0 && p.y < TAB_H) {
+            if (p.y >= 0 && p.y < tab_strip_height()) {
                 bool on_control = PtInRect(&g_plusrect, p);
                 for (int i = 0; i < g_tabcount && !on_control; i++)
                     if (PtInRect(&g_tabrects[i], p))
@@ -1248,6 +1499,14 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
       case WM_WINDOWPOSCHANGED:
         tab_relayout();
         return DefWindowProcW(hwnd, message, wParam, lParam);
+
+      case WM_TAB_RELAYOUT:
+        /* A tab's caption changed (see frame_set_title): redo the strip
+         * layout, which may have to re-wrap onto a different number of
+         * rows, and move the terminals if the strip's height changed. */
+        g_relayout_pending = false;
+        tab_relayout();
+        return 0;
 
       case WM_DPICHANGED: {
         /*
@@ -1319,63 +1578,54 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
         RECT fr, strip;
         GetClientRect(hwnd, &fr);
         strip.left = 0; strip.top = 0;
-        strip.right = fr.right; strip.bottom = TAB_H;
+        strip.right = fr.right;
+        strip.bottom = tab_strip_height();
+        if (strip.bottom > fr.bottom)
+            strip.bottom = fr.bottom;
         FillRect(hdc, &strip, GetSysColorBrush(COLOR_BTNFACE));
 
-        HFONT hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-        HFONT oldf = SelectObject(hdc, hf);
+        /*
+         * Draw from the rectangles worked out by tab_update_layout (so
+         * painting and clicking always agree), in a font scaled to the
+         * frame's DPI.
+         */
+        HFONT oldf = SelectObject(hdc, tab_label_font());
         SetBkMode(hdc, TRANSPARENT);
 
-        int x = 2, y = 2;
-        g_tabcount = (tab_count < MAX_TABS) ? tab_count : MAX_TABS;
-        for (int i = 0; i < g_tabcount; i++) {
-            WinGuiSeat *w = tab_list[i];
-            wchar_t label[1024];
-            const wchar_t *name;
-            if (i == tab_active) {
-                /* Mark the active tab with a leading "* " so it is
-                 * obvious which tab is current even without colour. */
-                _snwprintf(label, 1024, L"* %s",
-                           w->window_name ? w->window_name : L"");
-                label[1023] = L'\0';
-                name = label;
-            } else {
-                name = w->window_name ? w->window_name : L"";
-            }
-            SIZE sz;
-            GetTextExtentPoint32W(hdc, name, (int)wcslen(name), &sz);
-            int tw = (sz.cx + 34 < 120) ? 120 : sz.cx + 34;
-            RECT tr;
-            tr.left = x; tr.top = y;
-            tr.right = x + tw; tr.bottom = TAB_H - 2;
-            g_tabrects[i] = tr;
+        int closew = tab_scale(TAB_CLOSE_W);
 
-            HBRUSH fill = GetSysColorBrush(
-                i == tab_active ? COLOR_WINDOW : COLOR_BTNFACE);
-            FillRect(hdc, &tr, fill);
+        for (int i = 0; i < g_tabcount; i++) {
+            RECT tr = g_tabrects[i], trtext, cr;
+            wchar_t label[1024];
+
+            if (tr.right <= tr.left || tr.bottom <= tr.top)
+                continue;             /* this tab has no room in the strip */
+
+            FillRect(hdc, &tr, GetSysColorBrush(
+                         i == tab_active ? COLOR_WINDOW : COLOR_BTNFACE));
             DrawEdge(hdc, &tr,
                      i == tab_active ? EDGE_RAISED : EDGE_ETCHED, BF_RECT);
 
-            RECT trtext = tr;
-            trtext.left += 4;
-            DrawTextW(hdc, name, -1, &trtext,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-
-            RECT cr = tr;
-            cr.left = cr.right - 16;
+            /* Close box on the right-hand end of the tab */
+            cr = tr;
+            cr.left = cr.right - closew;
             DrawTextW(hdc, L"x", -1, &cr,
                       DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-            x += tw + 2;
+            tab_label(i, label, lenof(label));
+            trtext = tr;
+            trtext.left += tab_scale(4);
+            trtext.right = cr.left;
+            DrawTextW(hdc, label, -1, &trtext,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
 
-        RECT pr;
-        pr.left = x; pr.top = y;
-        pr.right = x + 24; pr.bottom = TAB_H - 2;
-        g_plusrect = pr;
-        DrawEdge(hdc, &pr, EDGE_RAISED, BF_RECT);
-        DrawTextW(hdc, L"+", -1, &pr,
-                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (g_plusrect.right > g_plusrect.left &&
+            g_plusrect.bottom > g_plusrect.top) {
+            DrawEdge(hdc, &g_plusrect, EDGE_RAISED, BF_RECT);
+            DrawTextW(hdc, L"+", -1, &g_plusrect,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
 
         SelectObject(hdc, oldf);
         EndPaint(hwnd, &ps);
@@ -1385,7 +1635,7 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
       case WM_LBUTTONDOWN: {
         int mx = (int)(short)LOWORD(lParam);
         int my = (int)(short)HIWORD(lParam);
-        if (my < TAB_H) {
+        if (my < tab_strip_height()) {
             if (PtInRect(&g_plusrect, mpt(mx, my))) {
                 open_new_session_dialog();
                 return 0;
@@ -1393,7 +1643,7 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
             for (int i = 0; i < g_tabcount; i++) {
                 if (PtInRect(&g_tabrects[i], mpt(mx, my))) {
                     RECT cr = g_tabrects[i];
-                    cr.left = cr.right - 16;
+                    cr.left = cr.right - tab_scale(TAB_CLOSE_W);
                     if (PtInRect(&cr, mpt(mx, my)))
                         close_tab(i);
                     else
@@ -3145,12 +3395,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
         WINDOWPOS *wp = (WINDOWPOS *)lParam;
         if (GetWindowLongPtr(hwnd, GWL_STYLE) & WS_CHILD) {
             RECT fr;
+            int sh, cw, ch;
+
             GetClientRect(tab_frame_hwnd, &fr);
-            wp->x = 0;
-            wp->y = TAB_H;
-            wp->cx = fr.right - fr.left;
-            wp->cy = fr.bottom - fr.top - TAB_H;
-            wp->flags &= ~(SWP_NOMOVE | SWP_NOSIZE);
+            sh = tab_strip_height();
+            cw = fr.right - fr.left;
+            ch = fr.bottom - fr.top - sh;
+
+            /* Only pin the child while the frame can actually hold it;
+             * when the frame is minimised (or shrunk below the tab
+             * strip) leave the child as it is rather than forcing it to
+             * a degenerate size. */
+            if (cw > 0 && ch > 0) {
+                wp->x = 0;
+                wp->y = sh;
+                wp->cx = cw;
+                wp->cy = ch;
+                wp->flags &= ~(SWP_NOMOVE | SWP_NOSIZE);
+            }
         }
         break;
       }
