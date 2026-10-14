@@ -169,6 +169,7 @@ static WinGuiSeat **tab_list = NULL;
 static int tab_count = 0;
 static int tab_active = -1;
 static bool g_quitting = false;
+static bool g_closing_all = false;   /* true while tearing down every tab on exit */
 static HMENU frame_savedsess_menu = NULL;
 static RECT g_tabrects[MAX_TABS];
 static RECT g_plusrect;
@@ -1134,6 +1135,27 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
         return hit;
       }
 
+      case WM_ACTIVATE: {
+        /*
+         * When the window is (re)activated - e.g. the user alt-tabs
+         * back into PuTTY - give keyboard input focus to the terminal
+         * of the currently active tab, so typing works immediately
+         * without having to click a tab first.
+         */
+        if (LOWORD(wParam) != WA_INACTIVE && tab_active >= 0 &&
+            tab_active < tab_count && tab_list && tab_list[tab_active])
+            SetFocus(tab_list[tab_active]->term_hwnd);
+        break;
+      }
+
+      case WM_SETFOCUS:
+        /* If the frame itself somehow receives focus, hand it to the
+         * active terminal so keystrokes are not lost. */
+        if (tab_active >= 0 && tab_active < tab_count && tab_list &&
+            tab_list[tab_active])
+            SetFocus(tab_list[tab_active]->term_hwnd);
+        break;
+
       case WM_SIZE:
       case WM_WINDOWPOSCHANGED:
         tab_relayout();
@@ -1156,7 +1178,18 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
         g_tabcount = (tab_count < MAX_TABS) ? tab_count : MAX_TABS;
         for (int i = 0; i < g_tabcount; i++) {
             WinGuiSeat *w = tab_list[i];
-            wchar_t *name = w->window_name ? w->window_name : L"";
+            wchar_t label[1024];
+            const wchar_t *name;
+            if (i == tab_active) {
+                /* Mark the active tab with a leading "* " so it is
+                 * obvious which tab is current even without colour. */
+                _snwprintf(label, 1024, L"* %s",
+                           w->window_name ? w->window_name : L"");
+                label[1023] = L'\0';
+                name = label;
+            } else {
+                name = w->window_name ? w->window_name : L"";
+            }
             SIZE sz;
             GetTextExtentPoint32W(hdc, name, (int)wcslen(name), &sz);
             int tw = (sz.cx + 34 < 120) ? 120 : sz.cx + 34;
@@ -1274,8 +1307,28 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
       case WM_CLOSE:
         if (MessageBox(tab_frame_hwnd,
                        "Close all PuTTY sessions and exit?",
-                       "PuTTY", MB_ICONWARNING | MB_OKCANCEL) == IDOK)
+                       "PuTTY", MB_ICONWARNING | MB_OKCANCEL) == IDOK) {
+            /*
+             * Tear down every session explicitly and deterministically.
+             * Destroying each terminal child runs its WM_DESTROY, which
+             * frees the backend/terminal and removes it from the tab
+             * list, so no session or backend thread is left running when
+             * we exit. (Relying on DestroyWindow(frame) to cascade into
+             * the children would re-activate other tabs mid-teardown.)
+             */
+            g_closing_all = true;
+            int guard = 0;
+            while (tab_count > 0 && guard++ <= MAX_TABS + 8) {
+                HWND th = tab_list[0]->term_hwnd;
+                if (th && IsWindow(th))
+                    DestroyWindow(th);   /* WM_DESTROY -> wgs_cleanup, tab_count-- */
+                else
+                    break;               /* nothing left we can destroy */
+            }
             DestroyWindow(hwnd);
+            if (!g_quitting)
+                PostQuitMessage(0);      /* safety net: always end the message loop */
+        }
         return 0;
 
       case WM_DESTROY:
@@ -2994,7 +3047,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                         tab_active = (idx > 0) ? idx - 1 : 0;
                     else if (idx < tab_active)
                         tab_active--;
-                    tab_activate(tab_active);
+                    /* While closing the whole window we are destroying
+                     * every child in turn; re-activating another tab here
+                     * would poke windows that are about to be destroyed,
+                     * so skip it and just clean up. */
+                    if (!g_closing_all)
+                        tab_activate(tab_active);
                 }
             }
             wgs_cleanup(wgs);
