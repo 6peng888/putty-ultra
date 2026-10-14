@@ -693,6 +693,7 @@ void test_simple(void)
     test_int_simple(CONF_proxy_port, "ProxyPort", 80);
     test_str_simple(CONF_proxy_username, "ProxyUsername", "");
     test_str_simple(CONF_proxy_password, "ProxyPassword", "");
+    test_str_simple(CONF_password, "Password", "");
     test_str_simple(CONF_proxy_telnet_command, "ProxyTelnetCommand", "connect %host %port\\n");
     test_int_translated(CONF_proxy_log_to_term, "ProxyLogToTerm", FORCE_OFF,
                         FORCE_ON, 0, FORCE_OFF, 1, AUTO, 2, -1);

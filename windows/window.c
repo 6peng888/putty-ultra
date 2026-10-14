@@ -321,6 +321,7 @@ static void start_backend(WinGuiSeat *wgs)
 
 
     wgs->cmdline_get_passwd_state = cmdline_get_passwd_input_state_new;
+    wgs->tried_configured_password = false;
 
     vt = backend_vt_from_conf(wgs->conf);
 
@@ -6754,11 +6755,49 @@ static bool win_seat_eof(Seat *seat)
     return true;   /* do respond to incoming EOF with outgoing */
 }
 
+/*
+ * If the session settings contain a password (the Password box in
+ * Connection/Data), use it to answer the server's password prompt, so
+ * that the user doesn't have to be asked for it. This is the same idea
+ * as the -pw command-line option, except that the password comes from
+ * the saved session.
+ *
+ * We only do this once per connection: if the configured password is
+ * out of date and the server rejects it, the user gets the normal
+ * interactive prompt rather than being stuck in a loop.
+ */
+static SeatPromptResult win_seat_configured_password(WinGuiSeat *wgs,
+                                                     prompts_t *p)
+{
+    const char *password;
+
+    if (wgs->tried_configured_password || !wgs->conf)
+        return SPR_INCOMPLETE;
+
+    password = conf_get_str(wgs->conf, CONF_password);
+    if (!*password)
+        return SPR_INCOMPLETE;
+
+    /*
+     * Only answer a prompt we can recognise as a request for a
+     * password: a single question, not echoed, and destined for the
+     * server. (This is the same test that the -pw option uses.)
+     */
+    if (p->n_prompts != 1 || p->prompts[0]->echo || !p->to_server)
+        return SPR_INCOMPLETE;
+
+    wgs->tried_configured_password = true;
+    prompt_set_result(p->prompts[0], password);
+    return SPR_OK;
+}
+
 static SeatPromptResult win_seat_get_userpass_input(Seat *seat, prompts_t *p)
 {
     WinGuiSeat *wgs = container_of(seat, WinGuiSeat, seat);
     SeatPromptResult spr;
     spr = cmdline_get_passwd_input(p, &wgs->cmdline_get_passwd_state, true);
+    if (spr.kind == SPRK_INCOMPLETE)
+        spr = win_seat_configured_password(wgs, p);
     if (spr.kind == SPRK_INCOMPLETE)
         spr = term_get_userpass_input(wgs->term, p);
     return spr;

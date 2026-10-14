@@ -1920,6 +1920,24 @@ The current system username is displayed in the dialog as a
 convenience. It is not saved in the configuration; if a saved session
 is later used by a different user, that user's name will be used.
 
+\S{config-password} \q{\ii{Password}}
+
+If you want PuTTY to use a particular password without asking you for
+it, you can type that password here. PuTTY will use it to answer the
+server's request for a password, and also a single non-echoing question
+asked during \i{keyboard-interactive} authentication. If the server
+doesn't accept the password, you will be prompted for one in the usual
+way.
+
+This is the same idea as the \c{\\-pw} command-line option (see
+\k{using-cmdline-pw}), except that the password is stored with the
+session, so it is used every time you load that session.
+
+\e{The password is stored in plain text} as part of the saved session,
+where anyone who can read your configuration can see it. So don't put a
+password here unless that is acceptable: leave this box empty, and use
+\k{using-cmdline-pw} to supply a password only when you need it.
+
 \S{config-termtype} \q{\ii{Terminal-type} string}
 
 Most servers you might connect to with PuTTY are designed to be

@@ -458,6 +458,11 @@ CONF_OPTION(username_from_env,
     DEFAULT_BOOL(false),
     SAVE_KEYWORD("UserNameFromEnvironment"),
 )
+CONF_OPTION(password,
+    VALUE_TYPE(STR),
+    DEFAULT_STR(""),
+    SAVE_KEYWORD("Password"),
+)
 CONF_OPTION(localusername,
     VALUE_TYPE(STR),
     DEFAULT_STR(""),

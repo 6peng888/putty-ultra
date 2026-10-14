@@ -76,6 +76,7 @@ struct WinGuiSeat {
     Backend *backend;
 
     cmdline_get_passwd_input_state cmdline_get_passwd_state;
+    bool tried_configured_password;    /* already used CONF_password once */
 
     struct unicode_data ucsdata;
     bool session_closed;
