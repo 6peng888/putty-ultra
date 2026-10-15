@@ -143,6 +143,7 @@ static void close_tab(int idx);
 static void frame_build_menu(void);
 static WinGuiSeat *frame_current_seat(void);
 static void frame_sync_scrollbars(void);
+static bool frame_corner_hotspot(POINT *pt);
 static void wgs_cleanup(WinGuiSeat *wgs);
 
 static struct sesslist sesslist;       /* for saved-session menu */
@@ -1717,6 +1718,30 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
       case WM_LBUTTONDOWN: {
         int mx = (int)(short)LOWORD(lParam);
         int my = (int)(short)HIWORD(lParam);
+
+        /*
+         * In full screen the frame has no title bar to right-click on,
+         * so a left click in the very top left corner of the monitor
+         * pops up the frame's system menu - the same menu the caption
+         * gives in windowed mode, and so the way to get out of full
+         * screen. Unmodified PuTTY has the same behaviour. (This is
+         * also why the tab strip is hit-tested afterwards: in full
+         * screen the strip occupies that corner, and tab 1 in
+         * particular begins there, but the corner pixel itself is in
+         * the gap before it.)
+         */
+        if (g_is_full_screen) {
+            POINT pt;
+            if (frame_corner_hotspot(&pt)) {
+                WinGuiSeat *w = frame_current_seat();
+                if (w)
+                    show_mouseptr(w, true);  /* the menu needs a pointer */
+                SendMessage(hwnd, WM_SYSCOMMAND, SC_MOUSEMENU,
+                            MAKELPARAM(pt.x, pt.y));
+                return 0;
+            }
+        }
+
         if (my < tab_strip_height()) {
             if (PtInRect(&g_plusrect, mpt(mx, my))) {
                 open_new_session_dialog();
@@ -7045,6 +7070,35 @@ static bool get_monitor_info(WinGuiSeat *wgs, MONITORINFO *mi)
     return false;
 }
 
+
+/*
+ * Is the mouse pointer in the top left hand pixel of the monitor the
+ * frame is on?
+ *
+ * This is the hotspot that brings up the frame's system menu when the
+ * frame has no title bar, i.e. in full screen: unmodified PuTTY offers
+ * the same corner for the same purpose, so that the menu - and with it
+ * a way back out of full screen - is still reachable without any
+ * window furniture. The test is for the monitor's corner pixel rather
+ * than a small box, so that it cannot steal clicks from the first tab,
+ * which in full screen also starts at the top left of the screen.
+ *
+ * The cursor position is returned in *pt, which the caller passes on to
+ * the system menu so that it pops up under the mouse.
+ */
+static bool frame_corner_hotspot(POINT *pt)
+{
+    MONITORINFO mi;
+    WinGuiSeat *w = frame_current_seat();
+
+    GetCursorPos(pt);
+
+    if (w && get_monitor_info(w, &mi))
+        return mi.rcMonitor.left == pt->x && mi.rcMonitor.top == pt->y;
+
+    /* No multi-monitor support: the only corner there is is (0,0). */
+    return pt->x == 0 && pt->y == 0;
+}
 
 /* Get the rect/size of a full-screen window on the nearest available
  * monitor in multimon systems; default to something sensible if only
