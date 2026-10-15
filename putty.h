@@ -1982,6 +1982,15 @@ char *save_settings(const char *section, Conf *conf);
 void save_open_settings(settings_w *sesskey, Conf *conf);
 bool load_settings(const char *section, Conf *conf);
 void load_open_settings(settings_r *sesskey, Conf *conf);
+/*
+ * The name of the saved session most recently loaded by
+ * load_settings(), or NULL if the last thing loaded was the default
+ * settings (or load_settings() has not been called at all). This is
+ * used by the Windows GUI to caption a session's tab with the name of
+ * the saved session it was started from.
+ */
+const char *settings_loaded_session_name(void);
+void settings_forget_loaded_session_name(void);
 void get_sesslist(struct sesslist *, bool allocate);
 bool do_defaults(const char *, Conf *);
 void registry_cleanup(void);

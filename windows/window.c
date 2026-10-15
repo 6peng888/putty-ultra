@@ -130,9 +130,10 @@ static void conf_cache_data(WinGuiSeat *wgs);
 /* Tabbed multi-session support (added modification) */
 static LRESULT CALLBACK FrameWndProc(HWND, UINT, WPARAM, LPARAM);
 static void new_session_finish(WinGuiSeat *wgs);
-static void new_session(Conf *conf);
+static void new_session(Conf *conf, const wchar_t *tab_name);
 static void tab_add(WinGuiSeat *wgs);
 static void tab_activate(int idx);
+static wchar_t *tab_name_from_session(const char *sessname);
 static bool tab_switch_key(int vk);
 static void tab_relayout(void);
 static int tab_find(WinGuiSeat *wgs);
@@ -585,6 +586,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
      */
     gui_term_process_cmdline(wgs->conf, cmdline);
 
+    /*
+     * Caption this session's tab with the name of the saved session it
+     * was started from, if any ('putty -load name', a '@name' command
+     * line, or a session picked in the configuration box). This is the
+     * last moment at which the name is still known, since it isn't part
+     * of the Conf.
+     */
+    wgs->tab_name = tab_name_from_session(settings_loaded_session_name());
+
     memset(&wgs->ucsdata, 0, sizeof(wgs->ucsdata));
 
     conf_cache_data(wgs);
@@ -1011,6 +1021,8 @@ static void wgs_cleanup(WinGuiSeat *wgs)
         sfree(wgs->window_name);
     if (wgs->icon_name)
         sfree(wgs->icon_name);
+    if (wgs->tab_name)
+        sfree(wgs->tab_name);
     if (wgs->savedsess_menu)
         DestroyMenu(wgs->savedsess_menu);
     if (wgs->specials_menu)
@@ -1103,8 +1115,39 @@ static HFONT tab_label_font(void)
 }
 
 /*
+ * Work out the fixed caption for a tab opened from the saved session
+ * called `sessname', or from no saved session if `sessname' is NULL.
+ *
+ * The name may have folder components in it (a session called
+ * "prod/web-01" lives in the "prod" folder), but the tab is too narrow
+ * to waste on the folder path, so only the last component is used.
+ *
+ * Returns NULL when the session wasn't started from a saved session,
+ * in which case the tab falls back to the window title.
+ */
+static wchar_t *tab_name_from_session(const char *sessname)
+{
+    const char *slash;
+
+    if (!sessname || !*sessname)
+        return NULL;
+
+    slash = strrchr(sessname, '/');
+    if (slash)
+        sessname = slash + 1;
+    if (!*sessname)
+        return NULL;
+
+    return dup_mb_to_wc(DEFAULT_CODEPAGE, sessname);
+}
+
+/*
  * Compose the caption of tab idx: its 1-based number (so the tabs can
- * be told apart at a glance) followed by the session title.
+ * be told apart at a glance) followed by the name of the saved session
+ * the tab was opened from. That name never changes, unlike the window
+ * title, which the remote shell can rewrite at any time with an OSC
+ * 0/2 escape; a tab whose session wasn't opened from a saved one shows
+ * the window title as before.
  *
  * Nothing about the text depends on whether the tab is the active one:
  * the active tab is indicated by its background instead (see the
@@ -1113,10 +1156,11 @@ static HFONT tab_label_font(void)
  */
 static void tab_label(int idx, wchar_t *buf, size_t buflen)
 {
-    const wchar_t *name = tab_list[idx]->window_name ?
-        tab_list[idx]->window_name : L"";
+    const wchar_t *name = tab_list[idx]->tab_name;
+    if (!name || !*name)
+        name = tab_list[idx]->window_name;
 
-    _snwprintf(buf, buflen, L"%d: %s", idx + 1, name);
+    _snwprintf(buf, buflen, L"%d: %s", idx + 1, name ? name : L"");
     buf[buflen - 1] = L'\0';
 }
 
@@ -1380,9 +1424,19 @@ static void open_new_session_dialog(void)
 {
     Conf *c = conf_new();
     load_open_settings(NULL, c);
+    /*
+     * Forgetting the name of the previously loaded saved session means
+     * that if the user cancels the box below, or opens it and configures
+     * a session by hand, this session's tab won't claim to be something
+     * it isn't. If the user does pick a saved session in the box, that
+     * loads it and records its name for us again.
+     */
+    settings_forget_loaded_session_name();
     if (do_config(c)) {
+        wchar_t *tab_name = tab_name_from_session(settings_loaded_session_name());
         prepare_session(c);
-        new_session(c);
+        new_session(c, tab_name);
+        sfree(tab_name);
     } else {
         conf_free(c);
     }
@@ -1803,7 +1857,9 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
         if ((wParam & ~0xF) == IDM_DUPSESS) {
             if (tab_active >= 0) {
                 Conf *c = conf_copy(tab_list[tab_active]->conf);
-                new_session(c);
+                /* A duplicate is the same session as its original, so
+                 * its tab is captioned the same way. */
+                new_session(c, tab_list[tab_active]->tab_name);
             }
             return 0;
         }
@@ -1814,8 +1870,11 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
             if (p + 1 < sesslist.nsessions) {
                 Conf *c = conf_new();
                 if (load_settings(sesslist.sessions[p + 1], c)) {
+                    wchar_t *tab_name = tab_name_from_session(
+                        sesslist.sessions[p + 1]);
                     prepare_session(c);
-                    new_session(c);
+                    new_session(c, tab_name);
+                    sfree(tab_name);
                 }
                 else
                     conf_free(c);
@@ -2160,7 +2219,13 @@ static void new_session_finish(WinGuiSeat *wgs)
     SetForegroundWindow(tab_frame_hwnd);
 }
 
-static void new_session(Conf *conf)
+/*
+ * Start a new session in a new tab. `tab_name' is the fixed caption to
+ * show on that tab - normally the name of the saved session it was
+ * opened from, as returned by tab_name_from_session() - or NULL if the
+ * tab should fall back to showing the window title.
+ */
+static void new_session(Conf *conf, const wchar_t *tab_name)
 {
     WinGuiSeat *wgs = snew(WinGuiSeat);
     memset(wgs, 0, sizeof(*wgs));
@@ -2171,6 +2236,8 @@ static void new_session(Conf *conf)
     wgs->caret_x = wgs->caret_y = -1;
     wgs->busy_status = BUSY_NOT;
     wgs->conf = conf;
+    if (tab_name && *tab_name)
+        wgs->tab_name = dupwcs(tab_name);
     new_session_finish(wgs);
 }
 
@@ -3625,8 +3692,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             open_new_session_dialog();
             break;
           case IDM_DUPSESS:
-            if (wgs->conf)
-                new_session(conf_copy(wgs->conf));
+            if (wgs->conf) {
+                /* A duplicate is the same session as its original, so
+                 * its tab is captioned the same way. */
+                new_session(conf_copy(wgs->conf), wgs->tab_name);
+            }
             break;
           case IDM_SAVEDSESS: {
             unsigned int sessno = ((lParam - IDM_SAVED_MIN)
@@ -3634,8 +3704,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             if (sessno < (unsigned)sesslist.nsessions) {
                 Conf *c = conf_new();
                 if (load_settings(sesslist.sessions[sessno], c)) {
+                    wchar_t *tab_name = tab_name_from_session(
+                        sesslist.sessions[sessno]);
                     prepare_session(c);
-                    new_session(c);
+                    new_session(c, tab_name);
+                    sfree(tab_name);
                 }
                 else
                     conf_free(c);

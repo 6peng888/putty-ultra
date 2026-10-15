@@ -690,9 +690,40 @@ void save_open_settings(settings_w *sesskey, Conf *conf)
     wmap(sesskey, "SSHManualHostKeys", conf, CONF_ssh_manual_hostkeys, false);
 }
 
+/*
+ * The name of the saved session most recently passed to
+ * load_settings(), or NULL if that was the default settings. The
+ * Windows GUI uses this to caption a session's tab with the name of
+ * the saved session it was started from, which - unlike the window
+ * title - does not change when the remote shell renames its window.
+ */
+static char *loaded_session_name = NULL;
+
+const char *settings_loaded_session_name(void)
+{
+    return loaded_session_name;
+}
+
+void settings_forget_loaded_session_name(void)
+{
+    sfree(loaded_session_name);
+    loaded_session_name = NULL;
+}
+
 bool load_settings(const char *section, Conf *conf)
 {
     settings_r *sesskey;
+
+    /*
+     * Remember which saved session this was, for the benefit of the
+     * Windows GUI's tab captions. Loading the default settings counts
+     * as not having a saved session name at all.
+     */
+    sfree(loaded_session_name);
+    if (section && *section && strcmp(section, "Default Settings"))
+        loaded_session_name = dupstr(section);
+    else
+        loaded_session_name = NULL;
 
     sesskey = open_settings_r(section);
     bool exists = (sesskey != NULL);

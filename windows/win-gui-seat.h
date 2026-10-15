@@ -125,6 +125,14 @@ struct WinGuiSeat {
 
     wchar_t *window_name, *icon_name;
 
+    /*
+     * The fixed caption shown on this session's tab: the name of the
+     * saved session it was started from, with any folder prefix
+     * removed, or NULL if it wasn't started from a saved session (in
+     * which case the tab shows the window title instead).
+     */
+    wchar_t *tab_name;
+
     int alt_numberpad_accumulator;
     int compose_state;
     int compose_char;
