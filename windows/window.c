@@ -133,6 +133,7 @@ static void new_session_finish(WinGuiSeat *wgs);
 static void new_session(Conf *conf);
 static void tab_add(WinGuiSeat *wgs);
 static void tab_activate(int idx);
+static bool tab_switch_key(int vk);
 static void tab_relayout(void);
 static int tab_find(WinGuiSeat *wgs);
 static void frame_set_title(WinGuiSeat *wgs);
@@ -1324,6 +1325,39 @@ static void tab_activate(int idx)
     frame_set_title(w);
     tab_relayout();
     SetFocus(w->term_hwnd);
+}
+
+/*
+ * Ctrl+1 .. Ctrl+9 switch straight to the tab carrying that number in
+ * its label (see tab_label). The whole chord is reserved for this: a
+ * Ctrl+digit whose number has no tab is swallowed rather than handed to
+ * the session, and TranslateKey correspondingly no longer turns
+ * Ctrl+2 .. Ctrl+8 into control characters. Numpad digits are
+ * deliberately not included, nor is the chord with Shift or Alt also
+ * held (so Ctrl+Alt+digit stays available to the keyboard layout).
+ *
+ * Returns true if the keystroke was consumed (i.e. it was Ctrl+digit).
+ */
+static bool tab_switch_key(int vk)
+{
+    int idx;
+
+    if (vk < '1' || vk > '9')
+        return false;
+    if (!(GetKeyState(VK_CONTROL) & 0x8000) ||
+        (GetKeyState(VK_MENU) & 0x8000) ||
+        (GetKeyState(VK_SHIFT) & 0x8000))
+        return false;
+
+    /*
+     * A Ctrl+digit beyond the last tab is still consumed; it just does
+     * nothing, so the number keys behave predictably no matter how many
+     * sessions are open.
+     */
+    idx = vk - '1';
+    if (idx < tab_count && tab_list && tab_list[idx])
+        tab_activate(idx);
+    return true;
 }
 
 static void tab_add(WinGuiSeat *wgs)
@@ -4473,6 +4507,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
         noise_ultralight(NOISE_SOURCE_KEY, lParam);
 
         /*
+         * Ctrl+1..Ctrl+9 jump to the tab with that number. Intercepted
+         * ahead of TranslateKey so the keystroke never reaches the
+         * session at all, whether or not a tab with that number exists.
+         */
+        if (message == WM_KEYDOWN && tab_switch_key((int)wParam))
+            return 0;
+
+        /*
          * We don't do TranslateMessage since it disassociates the
          * resulting CHAR message from the KEYDOWN that sparked it,
          * which we occasionally don't want. Instead, we process
@@ -5738,11 +5780,12 @@ static int TranslateKey(WinGuiSeat *wgs, UINT message, WPARAM wParam,
             *p++ = 0;
             return -2;
         }
-        /* Control-2 to Control-8 are special */
-        if (shift_state == 2 && wParam >= '2' && wParam <= '8') {
-            *p++ = "\000\033\034\035\036\037\177"[wParam - '2'];
-            return p - output;
-        }
+        /*
+         * (Control-2 to Control-8 used to be translated to the control
+         * characters NUL, ESC, FS, GS, RS, US and DEL here. Ctrl+digit
+         * is now claimed by the tab switcher in WndProc instead, so
+         * that mapping would be unreachable and has been dropped.)
+         */
         if (shift_state == 2 && (wParam == 0xBD || wParam == 0xBF)) {
             *p++ = 0x1F;
             return p - output;
