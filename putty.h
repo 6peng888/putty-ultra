@@ -300,6 +300,7 @@ struct unicode_data {
 #define LGTYP_DEBUG 2                  /* logmode: all chars of traffic */
 #define LGTYP_PACKETS 3                /* logmode: SSH data packets */
 #define LGTYP_SSHRAW 4                 /* logmode: SSH raw data */
+#define LGTYP_SCREEN 5                 /* logmode: what is shown on screen */
 
 /* Platform-generic function to set up a struct unicode_data. This is
  * only likely to be useful to test programs; real clients will want
@@ -2143,6 +2144,9 @@ void log_reconfig(LogContext *logctx, Conf *conf);
 void logfopen(LogContext *logctx);
 void logfclose(LogContext *logctx);
 void logtraffic(LogContext *logctx, unsigned char c, int logmode);
+void logscreen_char(LogContext *logctx, unsigned long c, int width,
+                    int cursor_x);
+void logscreen_newline(LogContext *logctx);
 void logflush(LogContext *logctx);
 LogPolicy *log_get_policy(LogContext *logctx);
 void logevent(LogContext *logctx, const char *event);

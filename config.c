@@ -1998,6 +1998,7 @@ void setup_config_box(struct controlbox *b, bool midsession,
                           "None", 't', I(LGTYP_NONE),
                           "Printable output", 'p', I(LGTYP_ASCII),
                           "All session output", 'l', I(LGTYP_DEBUG),
+                          "Screen output", 'n', I(LGTYP_SCREEN),
                           sshlogname, 's', I(LGTYP_PACKETS),
                           sshrawlogname, 'r', I(LGTYP_SSHRAW));
     }
@@ -2020,6 +2021,9 @@ void setup_config_box(struct controlbox *b, bool midsession,
     ctrl_checkbox(s, "Include header", 'i',
                   HELPCTX(logging_header),
                   conf_checkbox_handler, I(CONF_logheader));
+    ctrl_checkbox(s, "Prepend timestamp to each line", 'm',
+                  HELPCTX(no_help),
+                  conf_checkbox_handler, I(CONF_logtimestamp));
 
     if ((midsession && protocol == PROT_SSH) ||
         (!midsession && backend_vt_from_proto(PROT_SSH))) {

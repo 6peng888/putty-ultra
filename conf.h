@@ -868,6 +868,11 @@ CONF_OPTION(logheader,
     DEFAULT_BOOL(true),
     SAVE_KEYWORD("LogHeader"),
 )
+CONF_OPTION(logtimestamp,
+    VALUE_TYPE(BOOL),
+    DEFAULT_BOOL(false),
+    SAVE_KEYWORD("LogTimestamp"),
+)
 CONF_OPTION(logomitpass,
     VALUE_TYPE(BOOL),
     DEFAULT_BOOL(true),

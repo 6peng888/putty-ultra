@@ -20,6 +20,16 @@ struct LogContext {
     LogPolicy *lp;
     Conf *conf;
     int logtype;                       /* cached out of conf */
+    /*
+     * State for LGTYP_SCREEN ("screen output") logging: we buffer the
+     * text of the screen line currently being written, so that we can
+     * handle overwriting (e.g. "a<backspace>b" logs as "b"), and
+     * emit each displayed line as one log line.
+     */
+    strbuf *scrline;                   /* UTF-8 text of current line */
+    size_t *scrcelloff;                /* byte offset of each cell start */
+    int scrcellcap;
+    int screencells;                   /* cells filled in current line */
 };
 
 static Filename *xlatlognam(const Filename *s,
@@ -82,6 +92,126 @@ void logflush(LogContext *ctx)
             fflush(ctx->lgfp);
 }
 
+/*
+ * Screen-output logging (LGTYP_SCREEN): record exactly what the
+ * terminal displays, line by line, after control characters such as
+ * backspace and carriage return have taken effect. This is fed from
+ * the terminal layer, which tells us each displayable character, its
+ * width in cells, and the cursor column it was written to.
+ */
+
+/* Grow the per-cell byte-offset array to hold at least n more cells. */
+static void logscreen_grow_cells(LogContext *ctx, int ncells)
+{
+    if (ctx->screencells + ncells > ctx->scrcellcap) {
+        int newcap = ctx->scrcellcap ? ctx->scrcellcap : 256;
+        while (newcap < ctx->screencells + ncells)
+            newcap *= 2;
+        ctx->scrcelloff = sresize(ctx->scrcelloff, newcap, size_t);
+        ctx->scrcellcap = newcap;
+    }
+}
+
+/* Append one Unicode code point to the current line, in UTF-8. */
+static void logscreen_put_utf8(LogContext *ctx, unsigned long c)
+{
+    if (c < 0x80) {
+        put_byte(ctx->scrline, c);
+    } else if (c < 0x800) {
+        put_byte(ctx->scrline, 0xC0 | (c >> 6));
+        put_byte(ctx->scrline, 0x80 | (c & 0x3F));
+    } else if (c < 0x10000) {
+        put_byte(ctx->scrline, 0xE0 | (c >> 12));
+        put_byte(ctx->scrline, 0x80 | ((c >> 6) & 0x3F));
+        put_byte(ctx->scrline, 0x80 | (c & 0x3F));
+    } else {
+        put_byte(ctx->scrline, 0xF0 | (c >> 18));
+        put_byte(ctx->scrline, 0x80 | ((c >> 12) & 0x3F));
+        put_byte(ctx->scrline, 0x80 | ((c >> 6) & 0x3F));
+        put_byte(ctx->scrline, 0x80 | (c & 0x3F));
+    }
+}
+
+/*
+ * Write out the buffered line, optionally followed by a newline, and
+ * reset the buffer. A timestamp is prepended if that option is
+ * enabled and the line has any content.
+ */
+static void logscreen_flush(LogContext *ctx, bool with_newline)
+{
+    if (ctx->screencells > 0) {
+        if (conf_get_bool(ctx->conf, CONF_logtimestamp)) {
+            char buf[64];
+            struct tm tm = ltime();
+            strftime(buf, sizeof(buf), "[%Y-%m-%d %H:%M:%S] ", &tm);
+            logwrite(ctx, ptrlen_from_asciz(buf));
+        }
+        logwrite(ctx, make_ptrlen(ctx->scrline->s, ctx->scrline->len));
+    }
+    if (with_newline)
+        logwrite(ctx, make_ptrlen("\r\n", 2));
+    if (ctx->screencells > 0 || with_newline)
+        logflush(ctx);
+    ctx->scrline->len = 0;
+    ctx->screencells = 0;
+}
+
+/*
+ * Called by the terminal for each character it is about to display.
+ * cursor_x is the screen column the character will occupy (before
+ * this call advances the cursor), which lets us detect overwrites
+ * caused by backspace or carriage return, and line wraps.
+ */
+void logscreen_char(LogContext *ctx, unsigned long c, int width,
+                    int cursor_x)
+{
+    int ncells, i;
+    size_t startoff;
+
+    if (!ctx || ctx->logtype != LGTYP_SCREEN)
+        return;
+
+    /* Starting (back) at column 0 with a pending line: the screen has
+     * moved on to a new row, so emit what we had. This covers both
+     * autowrap and overwriting from column 0. */
+    if (cursor_x == 0 && ctx->screencells > 0)
+        logscreen_flush(ctx, true);
+
+    /* Overwrite: any cells to the right of the new cursor position
+     * (e.g. left behind by a backspace or carriage return) disappear
+     * from the screen, so remove them from the buffered line. */
+    if (cursor_x < ctx->screencells) {
+        ctx->scrline->len = ctx->scrcelloff[cursor_x];
+        ctx->screencells = cursor_x;
+    }
+
+    /* Tab-style forward movement leaves blanks on screen: pad. */
+    while (cursor_x > ctx->screencells) {
+        logscreen_grow_cells(ctx, 1);
+        ctx->scrcelloff[ctx->screencells++] = ctx->scrline->len;
+        put_byte(ctx->scrline, ' ');
+    }
+
+    ncells = (width > 1 ? width : 1);
+    logscreen_grow_cells(ctx, ncells);
+    startoff = ctx->scrline->len;
+    logscreen_put_utf8(ctx, c);
+    for (i = 0; i < ncells; i++)
+        ctx->scrcelloff[ctx->screencells++] = startoff;
+}
+
+/*
+ * Called by the terminal when it moves to the next screen row via a
+ * line feed (or equivalent): emit the pending line, if any.
+ */
+void logscreen_newline(LogContext *ctx)
+{
+    if (!ctx || ctx->logtype != LGTYP_SCREEN)
+        return;
+
+    logscreen_flush(ctx, true);
+}
+
 LogPolicy *log_get_policy(LogContext *ctx)
 {
     return ctx->lp;
@@ -124,6 +254,7 @@ static void logfopen_callback(void *vctx, int mode)
                        ctx->logtype == LGTYP_DEBUG ? "raw" :
                        ctx->logtype == LGTYP_PACKETS ? "SSH packets" :
                        ctx->logtype == LGTYP_SSHRAW ? "SSH raw data" :
+                       ctx->logtype == LGTYP_SCREEN ? "screen output" :
                        "unknown"),
                       filename_to_str(ctx->currlogfilename));
     lp_eventlog(ctx->lp, event);
@@ -196,6 +327,10 @@ void logfopen(LogContext *ctx)
 void logfclose(LogContext *ctx)
 {
     if (ctx->lgfp) {
+        /* Emit any pending screen line before the file goes away. */
+        if (ctx->logtype == LGTYP_SCREEN && ctx->state == L_OPEN &&
+            ctx->screencells > 0)
+            logscreen_flush(ctx, false);
         fclose(ctx->lgfp);
         ctx->lgfp = NULL;
     }
@@ -388,6 +523,10 @@ LogContext *log_init(LogPolicy *lp, Conf *conf)
     ctx->conf = conf_copy(conf);
     ctx->logtype = conf_get_int(ctx->conf, CONF_logtype);
     ctx->currlogfilename = NULL;
+    ctx->scrline = strbuf_new();
+    ctx->scrcelloff = NULL;
+    ctx->scrcellcap = 0;
+    ctx->screencells = 0;
     bufchain_init(&ctx->queue);
     return ctx;
 }
@@ -398,6 +537,9 @@ void log_free(LogContext *ctx)
     bufchain_clear(&ctx->queue);
     if (ctx->currlogfilename)
         filename_free(ctx->currlogfilename);
+    if (ctx->scrline)
+        strbuf_free(ctx->scrline);
+    sfree(ctx->scrcelloff);
     conf_free(ctx->conf);
     sfree(ctx);
 }

@@ -162,6 +162,7 @@ CONF_ENUM(log_type,
     VALUE(LGTYP_DEBUG, 2),
     VALUE(LGTYP_PACKETS, 3),
     VALUE(LGTYP_SSHRAW, 4),
+    VALUE(LGTYP_SCREEN, 5),
 )
 
 CONF_ENUM(log_to_existing_file,

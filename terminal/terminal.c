@@ -3318,8 +3318,12 @@ static void term_display_graphic_char(Terminal *term, unsigned long c)
         check_selection(term, term->curs, cursplus);
     }
     if (((c & CSET_MASK) == CSET_ASCII ||
-         (c & CSET_MASK) == 0) && term->logctx)
+         (c & CSET_MASK) == 0) && term->logctx) {
         logtraffic(term->logctx, (unsigned char) c, LGTYP_ASCII);
+        if (term->logtype == LGTYP_SCREEN)
+            logscreen_char(term->logctx, c & CSET_MASK ? c & ~CSET_MASK : c,
+                           width, term->curs.x);
+    }
 
     check_trust_status(term, cline);
 
@@ -4058,8 +4062,11 @@ static void term_out(Terminal *term, bool called_from_term_data)
                     term->curs.x = 0;
                 term->wrapnext = false;
                 seen_disp_event(term);
-                if (term->logctx)
+                if (term->logctx) {
                     logtraffic(term->logctx, (unsigned char) c, LGTYP_ASCII);
+                    if (term->logtype == LGTYP_SCREEN)
+                        logscreen_newline(term->logctx);
+                }
                 break;
               case '\t': {              /* HT: Character tabulation */
                 pos old_curs = term->curs;
