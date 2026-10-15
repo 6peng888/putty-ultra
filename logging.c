@@ -134,19 +134,20 @@ static void logscreen_put_utf8(LogContext *ctx, unsigned long c)
 
 /*
  * Write out the buffered line, optionally followed by a newline, and
- * reset the buffer. A timestamp is prepended if that option is
- * enabled and the line has any content.
+ * reset the buffer. A timestamp is prepended to every emitted line,
+ * including empty ones, when that option is enabled.
  */
 static void logscreen_flush(LogContext *ctx, bool with_newline)
 {
-    if (ctx->screencells > 0) {
+    if (with_newline || ctx->screencells > 0) {
         if (conf_get_bool(ctx->conf, CONF_logtimestamp)) {
             char buf[64];
             struct tm tm = ltime();
             strftime(buf, sizeof(buf), "[%Y-%m-%d %H:%M:%S] ", &tm);
             logwrite(ctx, ptrlen_from_asciz(buf));
         }
-        logwrite(ctx, make_ptrlen(ctx->scrline->s, ctx->scrline->len));
+        if (ctx->screencells > 0)
+            logwrite(ctx, make_ptrlen(ctx->scrline->s, ctx->scrline->len));
     }
     if (with_newline)
         logwrite(ctx, make_ptrlen("\r\n", 2));
