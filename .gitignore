@@ -146,3 +146,4 @@ Makefile
 /windows/*.wixpdb
 /build/
 /build2/
+/build-static/

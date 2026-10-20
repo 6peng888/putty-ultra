@@ -1,0 +1,2 @@
+cmake -S . -B build-static -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXE_LINKER_FLAGS="-static"
+cmake --build build-static -j 8
