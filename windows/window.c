@@ -198,6 +198,18 @@ static HFONT g_tab_font = NULL;      /* label font, scaled to the DPI */
 static int g_tab_font_dpi = 0;       /* DPI g_tab_font was built for */
 
 /*
+ * State of a tab drag, i.e. the left button held down on a tab. The
+ * press itself is an ordinary click and activates the tab; only once
+ * the pointer has travelled further than the system's drag threshold
+ * does it turn into a drag, in which the tab follows the pointer and
+ * is dropped wherever the button is released.
+ */
+static bool g_tab_dragging = false;
+static bool g_tab_drag_moved = false;   /* past the drag threshold */
+static int g_tab_drag_idx = -1;         /* index of the tab being dragged */
+static POINT g_tab_drag_start;          /* where the button went down */
+
+/*
  * Full screen is a property of the frame, because the frame is the
  * window that owns the title bar, the borders and the on-screen
  * geometry; the terminal children simply fill it. Every tab therefore
@@ -1321,6 +1333,39 @@ static int tab_find(WinGuiSeat *wgs)
     return -1;
 }
 
+/*
+ * Move the tab at index `from' to index `to', sliding the tabs in
+ * between along, and keep tab_active pointing at the same session as
+ * before (the session a tab holds is what matters, not its position).
+ * Only the order of the list changes: no window is created or
+ * destroyed, and the terminals are untouched.
+ */
+static void tab_move(int from, int to)
+{
+    WinGuiSeat *w;
+
+    if (from == to || from < 0 || from >= tab_count ||
+        to < 0 || to >= tab_count)
+        return;
+
+    w = tab_list[from];
+    if (from < to) {
+        for (int i = from; i < to; i++)
+            tab_list[i] = tab_list[i + 1];
+    } else {
+        for (int i = from; i > to; i--)
+            tab_list[i] = tab_list[i - 1];
+    }
+    tab_list[to] = w;
+
+    if (tab_active == from)
+        tab_active = to;
+    else if (from < tab_active && tab_active <= to)
+        tab_active--;
+    else if (to <= tab_active && tab_active < from)
+        tab_active++;
+}
+
 static void tab_relayout(void)
 {
     int cw, ch, sh;
@@ -1358,6 +1403,40 @@ static void tab_relayout(void)
                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
     }
     InvalidateRect(tab_frame_hwnd, NULL, true);
+}
+
+/* Index of the tab drawn under a client-area point, or -1 if none is */
+static int tab_index_at(int mx, int my)
+{
+    POINT p = mpt(mx, my);
+
+    /* Only the tabs that got a rectangle from tab_update_layout can be
+     * hit: any that didn't fit into the strip are neither drawn nor
+     * clickable, and dragging must agree with that. */
+    for (int i = 0; i < g_tabcount; i++)
+        if (PtInRect(&g_tabrects[i], p))
+            return i;
+    return -1;
+}
+
+/*
+ * A drag has moved the pointer to (mx,my): if it is over another tab,
+ * move the dragged tab to that position and redraw the strip. A single
+ * move is enough however fast the pointer went, because afterwards the
+ * dragged tab occupies the rectangle the pointer is in, so the next
+ * move can only push it further. (Moving a step at a time would lose
+ * tabs that the pointer jumped clean over.)
+ */
+static void tab_drag_update(int mx, int my)
+{
+    int target = tab_index_at(mx, my);
+
+    if (target < 0 || target == g_tab_drag_idx)
+        return;
+
+    tab_move(g_tab_drag_idx, target);
+    g_tab_drag_idx = target;
+    tab_relayout();
 }
 
 static void tab_activate(int idx)
@@ -1764,6 +1843,22 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
                       DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
 
+        /*
+         * Mark the tab that is being dragged, so that it is obvious the
+         * strip is in the middle of a reorder rather than merely having
+         * a tab selected. The tab itself has already moved to follow
+         * the pointer (see tab_drag_update).
+         */
+        if (g_tab_dragging && g_tab_drag_moved &&
+            g_tab_drag_idx >= 0 && g_tab_drag_idx < g_tabcount) {
+            RECT dr = g_tabrects[g_tab_drag_idx];
+
+            if (dr.right > dr.left && dr.bottom > dr.top) {
+                InflateRect(&dr, -1, -1);
+                DrawFocusRect(hdc, &dr);
+            }
+        }
+
         SelectObject(hdc, oldf);
         EndPaint(hwnd, &ps);
         return 0;
@@ -1805,10 +1900,26 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
                 if (PtInRect(&g_tabrects[i], mpt(mx, my))) {
                     RECT cr = g_tabrects[i];
                     cr.left = cr.right - tab_scale(TAB_CLOSE_W);
-                    if (PtInRect(&cr, mpt(mx, my)))
+                    if (PtInRect(&cr, mpt(mx, my))) {
                         close_tab(i);
-                    else
+                    } else {
+                        /*
+                         * Clicking the body of a tab both activates it
+                         * and arms a possible drag: the tab is activated
+                         * straight away (so a plain click behaves as it
+                         * always did), and the pointer is captured so
+                         * that any movement can be seen by the frame.
+                         * Nothing is reordered until the pointer has
+                         * moved past the click threshold, though, so
+                         * the jitter of a click cannot shuffle tabs.
+                         */
                         tab_activate(i);
+                        g_tab_dragging = true;
+                        g_tab_drag_moved = false;
+                        g_tab_drag_idx = i;
+                        g_tab_drag_start = mpt(mx, my);
+                        SetCapture(hwnd);
+                    }
                     return 0;
                 }
             }
@@ -1816,6 +1927,74 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
         }
         return DefWindowProcW(hwnd, message, wParam, lParam);
       }
+
+      case WM_MOUSEMOVE: {
+        int mx, my, tx, ty;
+
+        if (!g_tab_dragging)
+            return DefWindowProcW(hwnd, message, wParam, lParam);
+
+        mx = (int)(short)LOWORD(lParam);
+        my = (int)(short)HIWORD(lParam);
+
+        if (!g_tab_drag_moved) {
+            /*
+             * Wait for the pointer to leave the little rectangle that
+             * Windows itself treats as "no drag", so that a click with
+             * an unsteady hand does not reorder anything.
+             */
+            tx = GetSystemMetrics(SM_CXDRAG) / 2;
+            ty = GetSystemMetrics(SM_CYDRAG) / 2;
+            if (tx < 2)
+                tx = 2;
+            if (ty < 2)
+                ty = 2;
+            if (mx - g_tab_drag_start.x > -tx &&
+                mx - g_tab_drag_start.x < tx &&
+                my - g_tab_drag_start.y > -ty &&
+                my - g_tab_drag_start.y < ty)
+                return 0;
+
+            g_tab_drag_moved = true;
+            InvalidateRect(hwnd, NULL, false);
+        }
+
+        tab_drag_update(mx, my);
+        return 0;
+      }
+
+      case WM_LBUTTONUP:
+        if (g_tab_dragging) {
+            /*
+             * End of a drag. The tab has already been dropped where the
+             * user wanted it (see tab_drag_update), so there is nothing
+             * left to do but stop tracking the pointer. A press and
+             * release that never moved was just a click, which the
+             * WM_LBUTTONDOWN below already acted on.
+             */
+            g_tab_dragging = false;
+            g_tab_drag_moved = false;
+            g_tab_drag_idx = -1;
+            if (GetCapture() == hwnd)
+                ReleaseCapture();
+            InvalidateRect(hwnd, NULL, false);
+            return 0;
+        }
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+
+      case WM_CAPTURECHANGED:
+        /*
+         * Something else took the mouse away (another window captured
+         * it, or a message box opened while a tab is being dragged).
+         * The reordering already done stands - the strip shows it -
+         * but the drag itself is over, or the frame would keep moving
+         * tabs in response to a pointer it no longer owns.
+         */
+        g_tab_dragging = false;
+        g_tab_drag_moved = false;
+        g_tab_drag_idx = -1;
+        InvalidateRect(hwnd, NULL, false);
+        break;
 
       case WM_INITMENUPOPUP:
         if ((HMENU)wParam == frame_savedsess_menu)
@@ -3636,6 +3815,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                 for (int i = idx; i < tab_count - 1; i++)
                     tab_list[i] = tab_list[i + 1];
                 tab_count--;
+                /*
+                 * Removing a tab renumbers the ones after it, so a drag
+                 * in progress no longer knows which tab it is dragging.
+                 * Abandon it rather than drop some other tab somewhere
+                 * unintended. (The release of the capture also clears
+                 * the drag state, but do that explicitly too.)
+                 */
+                if (g_tab_dragging && idx <= g_tab_drag_idx) {
+                    g_tab_dragging = false;
+                    g_tab_drag_moved = false;
+                    g_tab_drag_idx = -1;
+                    if (GetCapture() == tab_frame_hwnd)
+                        ReleaseCapture();
+                }
                 if (tab_count > 0) {
                     if (idx == tab_active)
                         tab_active = (idx > 0) ? idx - 1 : 0;
