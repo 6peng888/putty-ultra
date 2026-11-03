@@ -1990,6 +1990,7 @@ void load_open_settings(settings_r *sesskey, Conf *conf);
  * the saved session it was started from.
  */
 const char *settings_loaded_session_name(void);
+void settings_remember_loaded_session_name(const char *name);
 void settings_forget_loaded_session_name(void);
 void get_sesslist(struct sesslist *, bool allocate);
 bool do_defaults(const char *, Conf *);

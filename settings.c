@@ -704,6 +704,15 @@ const char *settings_loaded_session_name(void)
     return loaded_session_name;
 }
 
+void settings_remember_loaded_session_name(const char *name)
+{
+    sfree(loaded_session_name);
+    if (name && *name && strcmp(name, "Default Settings"))
+        loaded_session_name = dupstr(name);
+    else
+        loaded_session_name = NULL;
+}
+
 void settings_forget_loaded_session_name(void)
 {
     sfree(loaded_session_name);

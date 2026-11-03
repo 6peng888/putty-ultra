@@ -896,6 +896,17 @@ static void sessionsaver_handler(dlgcontrol *ctrl, dlgparam *dlg,
                 if (errmsg) {
                     dlg_error_msg(dlg, errmsg);
                     sfree(errmsg);
+                } else if (!ssd->midsession) {
+                    /*
+                     * In the initial config box, a session the user
+                     * just saved is the session about to be launched:
+                     * remember its name so the new tab can caption
+                     * itself with it. (Change Settings must not do
+                     * this; the running session was started from
+                     * whatever it was started from.)
+                     */
+                    settings_remember_loaded_session_name(
+                        ssd->savedsession);
                 }
             }
             get_sesslist(&ssd->sesslist, false);
