@@ -881,15 +881,14 @@ static void sessionsaver_handler(dlgcontrol *ctrl, dlgparam *dlg,
         } else if (ctrl == ssd->savebutton) {
             bool isdef = !strcmp(ssd->savedsession, "Default Settings");
             if (!ssd->savedsession[0]) {
-                int i = dlg_listbox_index(ssd->listbox, dlg);
-                if (i < 0) {
-                    dlg_beep(dlg);
-                    return;
-                }
-                isdef = !strcmp(ssd->sesslist.sessions[i], "Default Settings");
+                /*
+                 * With no session name typed in, save to Default
+                 * Settings, rather than whatever happens to be
+                 * highlighted in the list box.
+                 */
+                isdef = true;
                 sfree(ssd->savedsession);
-                ssd->savedsession = dupstr(isdef ? "" :
-                                           ssd->sesslist.sessions[i]);
+                ssd->savedsession = dupstr("");
             }
             {
                 char *errmsg = save_settings(ssd->savedsession, conf);
