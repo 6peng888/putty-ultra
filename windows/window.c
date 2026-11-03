@@ -1533,9 +1533,24 @@ static void close_tab(int idx)
     WinGuiSeat *w = tab_list[idx];
     if (w->backend && !w->session_closed &&
         conf_get_bool(w->conf, CONF_warn_on_close)) {
-        if (MessageBox(tab_frame_hwnd,
-                       "Are you sure you want to close this session?",
-                       "PuTTY", MB_ICONWARNING | MB_OKCANCEL) == IDCANCEL)
+        /*
+         * Warn the same way the terminal window's own close box does,
+         * including the backend's note about any downstream
+         * connections this upstream is carrying: closing the tab
+         * takes those down too.
+         */
+        char *additional = NULL;
+        char *msg;
+        if (w->backend->vt->close_warn_text)
+            additional = w->backend->vt->close_warn_text(w->backend);
+        msg = dupprintf("Are you sure you want to close this session?%s%s",
+                        additional ? "\n" : "",
+                        additional ? additional : "");
+        int r = MessageBox(tab_frame_hwnd, msg, "PuTTY",
+                           MB_ICONWARNING | MB_OKCANCEL | MB_DEFBUTTON1);
+        sfree(msg);
+        sfree(additional);
+        if (r == IDCANCEL)
             return;
     }
     DestroyWindow(w->term_hwnd);
