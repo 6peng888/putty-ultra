@@ -1502,15 +1502,18 @@ static void tab_add(WinGuiSeat *wgs)
 static void open_new_session_dialog(void)
 {
     Conf *c = conf_new();
-    load_open_settings(NULL, c);
     /*
-     * Forgetting the name of the previously loaded saved session means
-     * that if the user cancels the box below, or opens it and configures
-     * a session by hand, this session's tab won't claim to be something
-     * it isn't. If the user does pick a saved session in the box, that
-     * loads it and records its name for us again.
+     * Load the saved Default Settings as the starting point, the same
+     * way the first session at startup does (gui_term_process_cmdline
+     * calls do_defaults(NULL, ...)), so that this box shows the same
+     * configuration. Loading "Default Settings" also clears the
+     * remembered session name, which is what we want here: if the user
+     * cancels the box below, or opens it and configures a session by
+     * hand, this session's tab won't claim to be something it isn't.
+     * If the user does pick or save a session in the box, that records
+     * its name for us again.
      */
-    settings_forget_loaded_session_name();
+    do_defaults(NULL, c);
     if (do_config(c)) {
         wchar_t *tab_name = tab_name_from_session(settings_loaded_session_name());
         prepare_session(c);
