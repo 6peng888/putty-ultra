@@ -15,10 +15,12 @@
 
 #include <assert.h>
 #include <ctype.h>
+#include <wchar.h>
 
 #include "putty.h"
 #include "misc.h"
 #include "dialog.h"
+#include "i18n.h"
 
 #include <commctrl.h>
 
@@ -77,6 +79,34 @@ void ctlposinit(struct ctlpos *cp, HWND hwnd,
     cp->width -= leftborder + rightborder;
 }
 
+/*
+ * Work out the wide-character form of a piece of control text.
+ *
+ * Returns NULL if the text is plain (untranslated) and can stay on the
+ * existing ANSI path. Returns a malloc'ed wide string if either
+ *   - the text is a translation-table key, or
+ *   - the text already contains non-ASCII bytes, in which case it is
+ *     taken to be UTF-8 (control texts are labels, never user data in
+ *     the system code page; those go through the list/edit APIs).
+ */
+static wchar_t *ui_text_w(const char *text)
+{
+    const char *p;
+
+    if (!text)
+        return NULL;
+
+    wchar_t *wtext = i18n_lookup_w(text);
+    if (wtext)
+        return wtext;
+
+    for (p = text; *p; p++)
+        if ((unsigned char)*p >= 0x80)
+            return dup_mb_to_wc(CP_UTF8, text);
+
+    return NULL;
+}
+
 HWND doctl(struct ctlpos *cp, RECT r, const char *wclass, int wstyle,
            int exstyle, const char *wtext, int wid)
 {
@@ -95,9 +125,30 @@ HWND doctl(struct ctlpos *cp, RECT r, const char *wclass, int wstyle,
      * without creating any actual controls.
      */
     if (cp->hwnd) {
-        ctl = CreateWindowEx(exstyle, wclass, wtext, wstyle,
-                             r.left, r.top, r.right, r.bottom,
-                             cp->hwnd, (HMENU)(ULONG_PTR)wid, hinst, NULL);
+        /*
+         * Every child control's text goes through here, which makes
+         * this the one place that needs to know about translation.
+         * Text with a translation is passed as a wide string (the
+         * table is UTF-8); everything else keeps the existing ANSI
+         * path, because plenty of control texts are not UI strings at
+         * all (session names, paths and the like, in the system's
+         * local code page).
+         */
+        wchar_t *wtext_w = ui_text_w(wtext);
+        if (wtext_w) {
+            wchar_t *wclass_w = dup_mb_to_wc(CP_UTF8, wclass);
+            ctl = CreateWindowExW(exstyle, wclass_w, wtext_w, wstyle,
+                                  r.left, r.top, r.right, r.bottom,
+                                  cp->hwnd, (HMENU)(ULONG_PTR)wid, hinst,
+                                  NULL);
+            sfree(wclass_w);
+            sfree(wtext_w);
+        } else {
+            ctl = CreateWindowEx(exstyle, wclass, wtext, wstyle,
+                                 r.left, r.top, r.right, r.bottom,
+                                 cp->hwnd, (HMENU)(ULONG_PTR)wid, hinst,
+                                 NULL);
+        }
         SendMessage(ctl, WM_SETFONT, cp->font, MAKELPARAM(true, 0));
 
         if (!strcmp(wclass, "LISTBOX")) {
@@ -116,6 +167,21 @@ HWND doctl(struct ctlpos *cp, RECT r, const char *wclass, int wstyle,
     } else
         ctl = NULL;
     return ctl;
+}
+
+/*
+ * Set the text of an existing child control, translating it through
+ * the i18n table if it has an entry there.
+ */
+static void set_dlg_item_text_tr(HWND hwnd, int id, const char *text)
+{
+    wchar_t *wtext = ui_text_w(text);
+    if (wtext) {
+        SetDlgItemTextW(hwnd, id, wtext);
+        sfree(wtext);
+    } else {
+        SetDlgItemText(hwnd, id, text ? text : "");
+    }
 }
 
 /*
@@ -1593,6 +1659,26 @@ static char *shortcut_escape(const char *text, char shortcut)
     return strbuf_to_str(sb);
 }
 
+/*
+ * Work out the text to display for a control labelled `label' whose
+ * accelerator is `shortcut'.
+ *
+ * If the label has a translation, the translation is used verbatim:
+ * it is already UTF-8, and the translator is responsible for putting a
+ * single '&' in front of whichever character should be the accelerator
+ * (or none at all). Otherwise the English text is passed through
+ * shortcut_escape as usual.
+ *
+ * Returns a malloc'ed string.
+ */
+static char *control_text(const char *label, char shortcut)
+{
+    const char *translated = i18n_lookup(label);
+    if (translated)
+        return dupstr(translated);
+    return shortcut_escape(label, shortcut);
+}
+
 void winctrl_add_shortcuts(struct dlgparam *dp, struct winctrl *c)
 {
     int i;
@@ -1920,7 +2006,7 @@ void winctrl_layout(struct dlgparam *dp, struct winctrls *wc,
                 int lines;
                 num_ids = 1;
                 wrapped = staticwrap(&pos, cp->hwnd,
-                                     ctrl->label, &lines);
+                                     i18n_or(ctrl->label), &lines);
                 escaped = shortcut_escape(wrapped, NO_SHORTCUT);
                 statictext(&pos, escaped, lines, base_id);
                 sfree(escaped);
@@ -1928,14 +2014,13 @@ void winctrl_layout(struct dlgparam *dp, struct winctrls *wc,
             } else {
                 num_ids = 1;
                 editboxfw(&pos, false, true, NULL, 0, base_id);
-                SetDlgItemText(pos.hwnd, base_id, ctrl->label);
+                set_dlg_item_text_tr(pos.hwnd, base_id, ctrl->label);
                 MakeDlgItemBorderless(pos.hwnd, base_id);
             }
             break;
           case CTRL_EDITBOX:
             num_ids = 2;               /* static, edit */
-            escaped = shortcut_escape(ctrl->label,
-                                      ctrl->editbox.shortcut);
+            escaped = control_text(ctrl->label, ctrl->editbox.shortcut);
             shortcuts[nshortcuts++] = ctrl->editbox.shortcut;
             if (ctrl->editbox.percentwidth == 100) {
                 if (ctrl->editbox.has_list)
@@ -1961,18 +2046,17 @@ void winctrl_layout(struct dlgparam *dp, struct winctrls *wc,
             struct radio *buttons;
             int i;
 
-            escaped = shortcut_escape(ctrl->label,
-                                      ctrl->radio.shortcut);
+            escaped = control_text(ctrl->label, ctrl->radio.shortcut);
             shortcuts[nshortcuts++] = ctrl->radio.shortcut;
 
             buttons = snewn(ctrl->radio.nbuttons, struct radio);
 
             for (i = 0; i < ctrl->radio.nbuttons; i++) {
                 buttons[i].text =
-                    shortcut_escape(ctrl->radio.buttons[i],
-                                    (char)(ctrl->radio.shortcuts ?
-                                           ctrl->radio.shortcuts[i] :
-                                           NO_SHORTCUT));
+                    control_text(ctrl->radio.buttons[i],
+                                 (char)(ctrl->radio.shortcuts ?
+                                        ctrl->radio.shortcuts[i] :
+                                        NO_SHORTCUT));
                 buttons[i].id = base_id + 1 + i;
                 if (ctrl->radio.shortcuts) {
                     assert(nshortcuts < MAX_SHORTCUTS_PER_CTRL);
@@ -1993,15 +2077,13 @@ void winctrl_layout(struct dlgparam *dp, struct winctrls *wc,
           }
           case CTRL_CHECKBOX:
             num_ids = 1;
-            escaped = shortcut_escape(ctrl->label,
-                                      ctrl->checkbox.shortcut);
+            escaped = control_text(ctrl->label, ctrl->checkbox.shortcut);
             shortcuts[nshortcuts++] = ctrl->checkbox.shortcut;
             checkbox(&pos, escaped, base_id);
             sfree(escaped);
             break;
           case CTRL_BUTTON:
-            escaped = shortcut_escape(ctrl->label,
-                                      ctrl->button.shortcut);
+            escaped = control_text(ctrl->label, ctrl->button.shortcut);
             shortcuts[nshortcuts++] = ctrl->button.shortcut;
             if (ctrl->button.iscancel)
                 actual_base_id = IDCANCEL;
@@ -2011,8 +2093,7 @@ void winctrl_layout(struct dlgparam *dp, struct winctrls *wc,
             break;
           case CTRL_LISTBOX:
             num_ids = 2;
-            escaped = shortcut_escape(ctrl->label,
-                                      ctrl->listbox.shortcut);
+            escaped = control_text(ctrl->label, ctrl->listbox.shortcut);
             shortcuts[nshortcuts++] = ctrl->listbox.shortcut;
             if (ctrl->listbox.draglist) {
                 data = snew(struct prefslist);
@@ -2064,7 +2145,7 @@ void winctrl_layout(struct dlgparam *dp, struct winctrls *wc,
             sfree(escaped);
             break;
           case CTRL_FILESELECT:
-            escaped = shortcut_escape(ctrl->label, ctrl->fileselect.shortcut);
+            escaped = control_text(ctrl->label, ctrl->fileselect.shortcut);
             shortcuts[nshortcuts++] = ctrl->fileselect.shortcut;
             num_ids = 3;
             if (!ctrl->fileselect.just_button) {
@@ -2077,8 +2158,7 @@ void winctrl_layout(struct dlgparam *dp, struct winctrls *wc,
             break;
           case CTRL_FONTSELECT:
             num_ids = 3;
-            escaped = shortcut_escape(ctrl->label,
-                                      ctrl->fontselect.shortcut);
+            escaped = control_text(ctrl->label, ctrl->fontselect.shortcut);
             shortcuts[nshortcuts++] = ctrl->fontselect.shortcut;
             statictext(&pos, escaped, 1, base_id);
             staticbtn(&pos, "", base_id+1, "Change...", base_id+2);
@@ -2244,13 +2324,29 @@ bool winctrl_handle_command(struct dlgparam *dp, UINT msg,
 
         SetMapMode(hdc, MM_TEXT);      /* ensure logical units == pixels */
 
-        GetTextExtentPoint32(hdc, (char *)c->data,
-                             strlen((char *)c->data), &s);
-        DrawEdge(hdc, &r, EDGE_ETCHED, BF_ADJUST | BF_RECT);
-        TextOut(hdc,
-                r.left + (r.right-r.left-s.cx)/2,
-                r.top + (r.bottom-r.top-s.cy)/2,
-                (char *)c->data, strlen((char *)c->data));
+        /*
+         * The panel title is drawn by hand, so it needs its own
+         * translation and wide-character drawing (a translated title
+         * is UTF-8, which the ANSI text calls cannot render).
+         */
+        const char *title = (const char *)c->data;
+        wchar_t *title_w = ui_text_w(title);
+        if (title_w) {
+            GetTextExtentPoint32W(hdc, title_w, wcslen(title_w), &s);
+            DrawEdge(hdc, &r, EDGE_ETCHED, BF_ADJUST | BF_RECT);
+            TextOutW(hdc,
+                     r.left + (r.right-r.left-s.cx)/2,
+                     r.top + (r.bottom-r.top-s.cy)/2,
+                     title_w, wcslen(title_w));
+            sfree(title_w);
+        } else {
+            GetTextExtentPoint32(hdc, title, strlen(title), &s);
+            DrawEdge(hdc, &r, EDGE_ETCHED, BF_ADJUST | BF_RECT);
+            TextOut(hdc,
+                    r.left + (r.right-r.left-s.cx)/2,
+                    r.top + (r.bottom-r.top-s.cy)/2,
+                    title, strlen(title));
+        }
 
         return true;
     }
@@ -2764,6 +2860,23 @@ void dlg_listbox_del(dlgcontrol *ctrl, dlgparam *dp, int index)
     SendDlgItemMessage(dp->hwnd, c->base_id+1, msg, index, 0);
 }
 
+/*
+ * Add an item of text to a list box or combo box, translating it if
+ * the table has an entry. Items are display-only: the config code
+ * reads selections back by index or by numeric id, never by text, so
+ * translating the display text is safe.
+ */
+static LRESULT send_item_text(HWND hwnd, int id, int msg, const char *text)
+{
+    wchar_t *wtext = ui_text_w(text);
+    if (wtext) {
+        LRESULT r = SendDlgItemMessageW(hwnd, id, msg, 0, (LPARAM)wtext);
+        sfree(wtext);
+        return r;
+    }
+    return SendDlgItemMessage(hwnd, id, msg, 0, (LPARAM)text);
+}
+
 void dlg_listbox_add(dlgcontrol *ctrl, dlgparam *dp, char const *text)
 {
     struct winctrl *c = dlg_findbyctrl(dp, ctrl);
@@ -2779,7 +2892,7 @@ void dlg_listbox_add(dlgcontrol *ctrl, dlgparam *dp, char const *text)
     }
     msg = (c->ctrl->type==CTRL_LISTBOX && c->ctrl->listbox.height!=0 ?
            LB_ADDSTRING : CB_ADDSTRING);
-    SendDlgItemMessage(dp->hwnd, c->base_id+1, msg, 0, (LPARAM)text);
+    send_item_text(dp->hwnd, c->base_id+1, msg, text);
 }
 
 /*
@@ -2806,7 +2919,7 @@ void dlg_listbox_addwithid(dlgcontrol *ctrl, dlgparam *dp,
            LB_ADDSTRING : CB_ADDSTRING);
     msg2 = (c->ctrl->type==CTRL_LISTBOX && c->ctrl->listbox.height!=0 ?
             LB_SETITEMDATA : CB_SETITEMDATA);
-    index = SendDlgItemMessage(dp->hwnd, c->base_id+1, msg, 0, (LPARAM)text);
+    index = (int)send_item_text(dp->hwnd, c->base_id+1, msg, text);
     SendDlgItemMessage(dp->hwnd, c->base_id+1, msg2, index, (LPARAM)id);
 }
 
@@ -2891,7 +3004,7 @@ void dlg_text_set(dlgcontrol *ctrl, dlgparam *dp, char const *text)
 {
     struct winctrl *c = dlg_findbyctrl(dp, ctrl);
     assert(c && c->ctrl->type == CTRL_TEXT);
-    SetDlgItemText(dp->hwnd, c->base_id, text);
+    set_dlg_item_text_tr(dp->hwnd, c->base_id, text);
 }
 
 void dlg_label_change(dlgcontrol *ctrl, dlgparam *dp, char const *text)
@@ -2903,41 +3016,42 @@ void dlg_label_change(dlgcontrol *ctrl, dlgparam *dp, char const *text)
     assert(c);
     switch (c->ctrl->type) {
       case CTRL_EDITBOX:
-        escaped = shortcut_escape(text, c->ctrl->editbox.shortcut);
+        escaped = control_text(text, c->ctrl->editbox.shortcut);
         id = c->base_id;
         break;
       case CTRL_RADIO:
-        escaped = shortcut_escape(text, c->ctrl->radio.shortcut);
+        escaped = control_text(text, c->ctrl->radio.shortcut);
         id = c->base_id;
         break;
       case CTRL_CHECKBOX:
-        escaped = shortcut_escape(text, ctrl->checkbox.shortcut);
+        escaped = control_text(text, ctrl->checkbox.shortcut);
         id = c->base_id;
         break;
       case CTRL_BUTTON:
-        escaped = shortcut_escape(text, ctrl->button.shortcut);
+        escaped = control_text(text, ctrl->button.shortcut);
         id = c->base_id;
         break;
       case CTRL_LISTBOX:
-        escaped = shortcut_escape(text, ctrl->listbox.shortcut);
+        escaped = control_text(text, ctrl->listbox.shortcut);
         id = c->base_id;
         break;
       case CTRL_FILESELECT:
-        escaped = shortcut_escape(text, ctrl->fileselect.shortcut);
+        escaped = control_text(text, ctrl->fileselect.shortcut);
         if (ctrl->fileselect.just_button)
             id = c->base_id + 2;       /* the button */
         else
             id = c->base_id;           /* the label */
         break;
       case CTRL_FONTSELECT:
-        escaped = shortcut_escape(text, ctrl->fontselect.shortcut);
+        escaped = control_text(text, ctrl->fontselect.shortcut);
         id = c->base_id;
         break;
       default:
         unreachable("bad control type in label_change");
     }
     if (escaped) {
-        SetDlgItemText(dp->hwnd, id, escaped);
+        /* Translated labels need the wide-character path. */
+        set_dlg_item_text_tr(dp->hwnd, id, escaped);
         sfree(escaped);
     }
 }

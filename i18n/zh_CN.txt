@@ -1,0 +1,567 @@
+# PuTTY 简体中文界面翻译
+#
+# 使用方法：把本文件复制到 putty.exe 所在目录，并命名为
+#     putty-i18n-zh_CN.txt
+# 程序启动时会按系统界面语言自动查找对应文件；也可以用环境变量
+#     PUTTY_LANG=zh_CN
+# 强制指定。找不到文件时界面保持英文，不会出错。
+#
+# 格式：英文原文=译文
+#   * 以 # 开头的行是注释，空行忽略；
+#   * 英文原文必须与程序中的字符串完全一致（包括 & 加速键标记和末尾的冒号）；
+#   * 两侧的空格会被去掉；
+#   * 支持 \n \r \t \\ 转义；
+#   * 想修改某个用语，改右侧内容后重启程序即可，无需重新编译；
+#   * 增加其它语言只需复制本文件为 putty-i18n-<语言>.txt 再翻译。
+
+# ===== 标题栏 / 右键菜单 =====
+Ne&w Session...=新建会话(&W)...
+Reco&nnect Session=重新连接会话(&N)
+&Duplicate Session=复制会话(&D)
+Sa&ved Sessions=已保存会话(&V)
+Duplicate channel=复用连接通道
+&Copy=复制(&C)
+&Paste=粘贴(&P)
+Chan&ge Settings...=修改设置(&G)...
+&Event Log=事件日志(&E)
+C&lear Scrollback=清除回滚缓冲区(&L)
+Rese&t Terminal=重置终端(&T)
+&Full Screen=全屏(&F)
+&Help=帮助(&H)
+&About PuTTY=关于 PuTTY(&A)
+&About PuTTYtel=关于 PuTTYtel(&A)
+C&opy All to Clipboard=全部复制到剪贴板(&O)
+&Restart Session=重新启动会话(&R)
+
+# ===== 对话框标题与提示 =====
+PuTTY Configuration=PuTTY 配置
+PuTTY Reconfiguration=PuTTY 重新配置
+PuTTYtel Configuration=PuTTYtel 配置
+Close all PuTTY sessions and exit?=关闭所有 PuTTY 会话并退出？
+Connection closed by remote host=远程主机关闭了连接
+Are you sure you want to close this session?%s%s=确定要关闭此会话吗？%s%s
+This will also close %d downstream connection%s.=这还会关闭 %d 个下游连接。
+%s Exit Confirmation=%s 退出确认
+
+# ===== 配置框通用 =====
+Cate&gory:=分类(&G)：
+About=关于
+Help=帮助
+Open=打开
+Cancel=取消
+Apply=应用
+Save=保存
+Load=载入
+Delete=删除
+Add=添加
+Remove=删除
+Set=设置
+Modify=修改
+Key=密钥
+Value=值
+Variable=变量
+No=否
+Yes=是
+None=无
+Off=关
+On=开
+Auto=自动
+Default=默认
+(auto)=（自动）
+(optional):=（可选）：
+Block=方块
+Underline=下划线
+Vertical line=竖线
+Disabled=已禁用
+Flashing=闪烁
+Steady=常亮
+Normal=普通
+Application=应用模式
+Empty string=空字符串
+Window title=窗口标题
+Prompt=提示
+Password=密码
+Odd=奇校验
+Even=偶校验
+Mark=标记
+Space=空格
+Local=本地
+Remote=远程
+Dynamic=动态
+Source port=源端口
+Destination=目标
+Port=端口
+
+# ===== 会话面板 =====
+Session=会话
+Basic options for your %s session=%s 会话的基本选项
+Specify the destination you want to connect to=指定要连接的目标
+Host Name (or IP address)=主机名（或 IP 地址）
+Connection type:=连接类型：
+Other:=其它：
+Serial line=串口线路
+Speed=速度
+Load, save or delete a stored session=载入、保存或删除已存储的会话
+Saved Sessions=已保存的会话
+Save the current session settings=保存当前会话设置
+Close window on exit:=退出时关闭窗口：
+Always=总是
+Never=从不
+Only on clean exit=仅在正常退出时
+
+# ===== 会话 / 日志面板 =====
+Logging=日志
+Options controlling session logging=控制会话日志的选项
+Session logging:=会话日志：
+Printable output=可打印输出
+All session output=全部会话输出
+SSH packets=SSH 数据包
+SSH packets and raw data=SSH 数据包与原始数据
+Screen output=屏幕输出
+Log file name:=日志文件名：
+Select session log file name=选择会话日志文件名
+What to do if the log file already exists:=如果日志文件已存在：
+Always overwrite it=总是覆盖
+Always append to the end of it=总是追加到末尾
+Ask the user every time=每次询问
+Flush log file frequently=频繁刷新日志文件
+Include header=包含文件头
+Prepend timestamp to each line=每行前置时间戳
+Options specific to SSH packet logging=SSH 数据包日志专用选项
+Omit known password fields=省略已知的密码字段
+Omit session data=省略会话数据
+
+# ===== 终端面板 =====
+Terminal=终端
+Options controlling the terminal emulation=控制终端仿真的选项
+Set various terminal options=设置各种终端选项
+Auto wrap mode initially on=初始化时自动换行
+DEC Origin Mode initially on=初始化时启用 DEC 原点模式
+Implicit CR in every LF=每个换行符隐含回车
+Implicit LF in every CR=每个回车符隐含换行
+Use background colour to erase screen=使用背景色擦除屏幕
+Enable blinking text=启用闪烁文字
+Answerback to ^E:=应答字符（^E）：
+Line discipline options=行规程选项
+Local echo:=本地回显：
+Force on=强制开
+Force off=强制关
+Local line editing:=本地行编辑：
+Remote-controlled printing=远程控制打印
+Printer to send ANSI printer output to:=接收 ANSI 打印输出的打印机：
+
+# ===== 终端 / 键盘面板 =====
+Keyboard=键盘
+Options controlling the effects of keys=控制按键行为的选项
+Change the sequences sent by:=修改以下按键发送的序列：
+The Backspace key=退格键
+Control-H=Control-H
+Control-? (127)=Control-? (127)
+The Home and End keys=Home 与 End 键
+Standard=标准
+The Function keys and keypad=功能键与小键盘
+Linux=Linux
+ESC[n~=ESC[n~
+Xterm R6=Xterm R6
+VT400=VT400
+VT100+=VT100+
+SCO=SCO
+Xterm 216+=Xterm 216+
+Shift/Ctrl/Alt with the arrow keys=方向键配合 Shift/Ctrl/Alt
+Ctrl toggles app mode=Ctrl 切换应用模式
+xterm-style bitmap=xterm 风格位图
+Application keypad settings:=应用小键盘设置：
+Initial state of cursor keys:=光标键初始状态：
+Initial state of numeric keypad:=数字小键盘初始状态：
+NetHack=NetHack
+
+# ===== 终端 / 响铃面板 =====
+Bell=响铃
+Options controlling the terminal bell=控制终端响铃的选项
+Set the style of bell=设置响铃方式
+Action to happen when a bell occurs:=响铃时的动作：
+None (bell disabled)=无（禁用响铃）
+Make default system alert sound=使用系统默认提示音
+Visual bell (flash window)=视觉提示（闪烁窗口）
+Play a custom sound file=播放自定义声音文件
+Beep using the PC speaker=使用 PC 蜂鸣器
+Custom sound file to play as a bell:=作为响铃播放的声音文件：
+Select bell sound file=选择响铃声音文件
+Taskbar/caption indication on bell:=响铃时的任务栏/标题指示：
+Control the bell overload behaviour=控制响铃过载行为
+Bell is temporarily disabled when over-used=响铃过于频繁时暂时禁用
+Over-use means this many bells...=过载判定为这么多次响铃……
+... in this many seconds=……在这个秒数内
+The bell is re-enabled after a few seconds of silence.=静默几秒后重新启用响铃。
+Seconds of silence required=所需的静默秒数
+
+# ===== 终端 / 功能面板 =====
+Features=功能
+Enabling and disabling advanced terminal features=启用或禁用高级终端功能
+Disable application cursor keys mode=禁用应用光标键模式
+Disable application keypad mode=禁用应用小键盘模式
+Disable xterm-style mouse reporting=禁用 xterm 风格鼠标报告
+Disable remote-controlled terminal resizing=禁用远程控制终端缩放
+Disable switching to alternate terminal screen=禁用切换到备用终端屏幕
+Disable remote-controlled window title changing=禁用远程控制窗口标题修改
+Response to remote title query (SECURITY):=对远程标题查询的响应（安全）：
+Disable remote-controlled clearing of scrollback=禁用远程清除回滚缓冲区
+Disable destructive backspace on server sending ^?=服务器发送 ^? 时禁用破坏性退格
+Disable remote-controlled character set configuration=禁用远程字符集配置
+Disable Arabic text shaping=禁用阿拉伯文整形
+Disable bidirectional text display=禁用双向文本显示
+Disable bracketed paste mode=禁用括号粘贴模式
+
+# ===== 窗口面板 =====
+Window=窗口
+Appearance=外观
+Behaviour=行为
+Options controlling %s's window=控制 %s 窗口的选项
+Set the size of the window=设置窗口大小
+Columns=列
+Rows=行
+Control the scrollback in the window=控制窗口中的回滚
+Lines of scrollback=回滚行数
+Display scrollbar=显示滚动条
+Reset scrollback on keypress=按键时重置回滚位置
+Reset scrollback on display activity=显示活动时重置回滚位置
+Push erased text into scrollback=将被擦除的文本推入回滚缓冲区
+Configure the appearance of %s's window=设置 %s 窗口的外观
+Adjust the use of the cursor=调整光标的使用
+Cursor appearance:=光标外观：
+Cursor blinks=光标闪烁
+Font settings=字体设置
+Font used in the terminal window=终端窗口使用的字体
+Adjust the use of the mouse pointer=调整鼠标指针的使用
+Hide mouse pointer when typing in window=在窗口中输入时隐藏鼠标指针
+Adjust the window border=调整窗口边框
+Gap between text and window edge:=文本与窗口边缘的间距：
+Configure the behaviour of %s's window=设置 %s 窗口的行为
+Adjust the behaviour of the window title=调整窗口标题的行为
+Window title:=窗口标题：
+Separate window and icon titles=窗口标题与图标标题分开
+Warn before closing window=关闭窗口前警告
+When window is resized:=窗口大小改变时：
+Change the number of rows and columns=改变行数与列数
+Change the size of the font=改变字体大小
+Change font size only when maximised=仅在最大化时改变字体大小
+Forbid resizing completely=完全禁止缩放
+Window closes on ALT-F4=ALT-F4 关闭窗口
+System menu appears on ALT-Space=ALT-Space 打开系统菜单
+System menu appears on ALT alone=单独按 ALT 打开系统菜单
+Ensure window is always on top=保持窗口总在最前
+Full screen on Alt-Enter=Alt-Enter 切换全屏
+Sunken-edge border (slightly thicker)=凹陷边框（略粗）
+Allow selection of variable-pitch fonts=允许选择比例字体
+Font quality:=字体质量：
+Antialiased=抗锯齿
+Non-Antialiased=无抗锯齿
+ClearType=ClearType
+
+# ===== 窗口 / 翻译面板 =====
+Translation=翻译
+Options controlling character set translation=控制字符集转换的选项
+Character set translation=字符集转换
+Remote character set:=远程字符集：
+Treat CJK ambiguous characters as wide=将 CJK 歧义字符视为宽字符
+Adjust how %s handles line drawing characters=调整 %s 处理制表符的方式
+Handling of line drawing characters:=制表符处理方式：
+Use Unicode line drawing code points=使用 Unicode 制表符码位
+Poor man's line drawing (+, - and |)=简易制表符（+、- 和 |）
+Copy and paste line drawing characters as lqqqk=复制粘贴时用 lqqqk 表示制表符
+Enable VT100 line drawing even in UTF-8 mode=在 UTF-8 模式下也启用 VT100 制表符
+Character set translation on received data=接收数据时的字符集转换
+Font has XWindows encoding=字体使用 XWindows 编码
+Use font in both ANSI and OEM modes=在 ANSI 和 OEM 模式下都使用该字体
+Use font in OEM mode only=仅在 OEM 模式下使用该字体
+
+# ===== 窗口 / 选择面板 =====
+Selection=选择
+Copy=复制
+Colours=颜色
+Options controlling copy and paste=控制复制与粘贴的选项
+Control use of mouse=控制鼠标的使用
+Shift overrides application's use of mouse=Shift 覆盖应用的鼠标使用
+Default selection mode (Alt+drag does the other one):=默认选择模式（Alt+拖动为另一种）：
+Rectangular block=矩形块
+Assign copy/paste actions to clipboards=为剪贴板分配复制/粘贴动作
+Auto-copy selected text to=自动复制选中文本到
+Mouse paste action:=鼠标粘贴动作：
+{Ctrl,Shift} + Ins:={Ctrl,Shift} + Ins：
+Ctrl + Shift + {C,V}:=Ctrl + Shift + {C,V}：
+Control pasting of text from clipboard to terminal=控制从剪贴板粘贴到终端
+Permit control characters in pasted text=允许粘贴文本中的控制字符
+Options controlling copying from terminal to clipboard=控制从终端复制到剪贴板的选项
+Classes of character that group together=一起构成单词的字符类别
+Character classes:=字符类别：
+Set to class=设为该类别
+Formatting of copied characters=复制字符的格式
+Copy to clipboard in RTF as well as plain text=同时以 RTF 和纯文本复制到剪贴板
+Action of mouse buttons:=鼠标按键动作：
+Windows (Middle extends, Right brings up menu)=Windows（中键扩展，右键菜单）
+Compromise (Middle extends, Right pastes)=折中（中键扩展，右键粘贴）
+xterm (Right extends, Middle pastes)=xterm（右键扩展，中键粘贴）
+
+# ===== 窗口 / 颜色面板 =====
+Options controlling use of colours=控制颜色使用的选项
+General options for colour usage=颜色使用的通用选项
+Allow terminal to specify ANSI colours=允许终端指定 ANSI 颜色
+Allow terminal to use xterm 256-colour mode=允许终端使用 xterm 256 色模式
+Allow terminal to use 24-bit colours=允许终端使用 24 位颜色
+Indicate bolded text by changing:=用以下方式表示粗体文本：
+The font=字体
+The colour=颜色
+Both=两者都用
+Adjust the precise colours %s displays=精确调整 %s 显示的颜色
+Select a colour from the list, and then click the=从列表中选择一种颜色，然后点击
+Select a colour to adjust:=选择要调整的颜色：
+RGB value:=RGB 值：
+Red=红
+Green=绿
+Blue=蓝
+Attempt to use logical palettes=尝试使用逻辑调色板
+Use system colours=使用系统颜色
+
+# ===== 连接面板 =====
+Connection=连接
+Options controlling the connection=控制连接的选项
+Sending of null packets to keep session active=发送空数据包以保持会话活跃
+Seconds between keepalives (0 to turn off)=保活间隔秒数（0 表示关闭）
+Low-level TCP connection options=底层 TCP 连接选项
+Disable Nagle's algorithm (TCP_NODELAY option)=禁用 Nagle 算法（TCP_NODELAY 选项）
+Enable TCP keepalives (SO_KEEPALIVE option)=启用 TCP 保活（SO_KEEPALIVE 选项）
+Internet protocol version=Internet 协议版本
+IPv4=IPv4
+IPv6=IPv6
+Logical name of remote host (e.g. for SSH key lookup):=远程主机的逻辑名称（例如用于查找 SSH 密钥）：
+Logical name of remote host:=远程主机的逻辑名称：
+Logical name of remote host=远程主机的逻辑名称
+Command to run at connection event=连接事件时运行的命令
+Command to run before connection=连接前运行的命令
+Data=数据
+Data to send to the server=发送给服务器的数据
+Login details=登录信息
+Auto-login username=自动登录用户名
+Use system username (%s)=使用系统用户名（%s）
+When username is not specified:=未指定用户名时：
+Terminal details=终端信息
+Terminal-type string=终端类型字符串
+Terminal speeds=终端速率
+Environment variables=环境变量
+
+# ===== 代理面板 =====
+Proxy=代理
+Options controlling proxy usage=控制代理使用的选项
+Proxy type:=代理类型：
+Proxy hostname=代理主机名
+Exclude Hosts/IPs=排除的主机/IP
+Consider proxying local host connections=考虑代理本机连接
+Do DNS name lookup at proxy end:=在代理端进行 DNS 名称解析：
+Username=用户名
+Command to send to proxy (for some types)=发送给代理的命令（部分类型）
+Print proxy diagnostics=输出代理诊断信息
+in the terminal window=到终端窗口
+Only until session starts=仅在会话启动前
+SOCKS 5=SOCKS 5
+SOCKS 4=SOCKS 4
+HTTP CONNECT=HTTP CONNECT
+SSH to proxy and use port forwarding=SSH 到代理并使用端口转发
+SSH to proxy and execute a command=SSH 到代理并执行命令
+SSH to proxy and invoke a subsystem=SSH 到代理并调用子系统
+Local (run a subprogram to connect)=本地（运行子程序来连接）
+'Telnet' (send an ad-hoc command)=“Telnet”（发送临时命令）
+
+# ===== SSH 面板 =====
+SSH=SSH
+Options controlling SSH connections=控制 SSH 连接的选项
+Remote command:=远程命令：
+Protocol options=协议选项
+Don't start a shell or command at all=完全不启动 shell 或命令
+Enable compression=启用压缩
+Sharing an SSH connection between PuTTY tools=在 PuTTY 工具之间共享 SSH 连接
+Share SSH connections if possible=尽可能共享 SSH 连接
+Permitted roles in a shared connection:=共享连接中允许的角色：
+Upstream (connecting to the real server)=上游（连接到真实服务器）
+Downstream (connecting to the upstream PuTTY)=下游（连接到上游 PuTTY）
+SSH protocol version:=SSH 协议版本：
+1 (INSECURE)=1（不安全）
+
+# ===== SSH / 密钥交换 =====
+Kex=密钥交换
+Options controlling SSH key exchange=控制 SSH 密钥交换的选项
+Key exchange algorithm options=密钥交换算法选项
+Algorithm selection policy:=算法选择策略：
+Attempt GSSAPI key exchange=尝试 GSSAPI 密钥交换
+Options controlling key re-exchange=控制密钥重交换的选项
+Max minutes before rekey (0 for no limit)=重交换前最大分钟数（0 表示不限）
+Minutes between GSS checks (0 for never)=GSS 检查间隔分钟数（0 表示从不）
+Max data before rekey (0 for no limit)=重交换前最大数据量（0 表示不限）
+(Use 1M for 1 megabyte, 1G for 1 gigabyte etc)=（用 1M 表示 1 兆字节，1G 表示 1 吉字节等）
+Diffie-Hellman group 1 (1024-bit)=Diffie-Hellman 组 1（1024 位）
+Diffie-Hellman group 14 (2048-bit)=Diffie-Hellman 组 14（2048 位）
+Diffie-Hellman group 15 (3072-bit)=Diffie-Hellman 组 15（3072 位）
+Diffie-Hellman group 16 (4096-bit)=Diffie-Hellman 组 16（4096 位）
+Diffie-Hellman group 17 (6144-bit)=Diffie-Hellman 组 17（6144 位）
+Diffie-Hellman group 18 (8192-bit)=Diffie-Hellman 组 18（8192 位）
+Diffie-Hellman group exchange=Diffie-Hellman 组交换
+RSA-based key exchange=基于 RSA 的密钥交换
+ECDH key exchange=ECDH 密钥交换
+NTRU Prime / Curve25519 hybrid kex=NTRU Prime / Curve25519 混合密钥交换
+ML-KEM / Curve25519 hybrid kex=ML-KEM / Curve25519 混合密钥交换
+ML-KEM / NIST ECDH hybrid kex=ML-KEM / NIST ECDH 混合密钥交换
+
+# ===== SSH / 主机密钥 =====
+Host keys=主机密钥
+Options controlling SSH host keys=控制 SSH 主机密钥的选项
+Host key algorithm preference=主机密钥算法优先级
+Prefer algorithms for which a host key is known=优先使用已知主机密钥的算法
+Manually configure host keys for this connection=手动配置此连接的主机密钥
+Host keys or fingerprints to accept:=要接受的主机密钥或指纹：
+Add key=添加密钥
+You need to specify a host key or=需要指定主机密钥或
+Host key is not in a valid format=主机密钥格式无效
+Specified host key is already listed=该主机密钥已在列表中
+Configure trusted certification authorities=配置受信任的证书颁发机构
+Configure host CAs=配置主机 CA
+
+# ===== SSH / 加密 =====
+Cipher=加密
+Options controlling SSH encryption=控制 SSH 加密的选项
+Encryption options=加密选项
+Encryption cipher selection policy:=加密算法选择策略：
+Enable legacy use of single-DES in SSH-2=允许 SSH-2 中旧式单 DES
+ChaCha20 (SSH-2 only)=ChaCha20（仅 SSH-2）
+AES-GCM (SSH-2 only)=AES-GCM（仅 SSH-2）
+AES (SSH-2 only)=AES（仅 SSH-2）
+Arcfour (SSH-2 only)=Arcfour（仅 SSH-2）
+3DES=3DES
+Blowfish=Blowfish
+DES=DES
+-- warn below here --=-- 以下为警告 --
+Ed25519=Ed25519
+Ed448=Ed448
+ECDSA=ECDSA
+DSA=DSA
+RSA=RSA
+
+# ===== SSH / 认证 =====
+Auth=认证
+Credentials=凭据
+GSSAPI=GSSAPI
+Options controlling SSH authentication=控制 SSH 认证的选项
+Display pre-authentication banner (SSH-2 only)=显示认证前横幅（仅 SSH-2）
+Bypass authentication entirely (SSH-2 only)=完全绕过认证（仅 SSH-2）
+Disconnect if authentication succeeds trivially=若认证轻易成功则断开
+Authentication methods=认证方法
+Attempt authentication using Pageant=尝试使用 Pageant 认证
+Attempt TIS or CryptoCard auth (SSH-1)=尝试 TIS 或 CryptoCard 认证（SSH-1）
+Other authentication-related options=其它认证相关选项
+Allow agent forwarding=允许代理转发
+Allow attempted changes of username in SSH-2=允许 SSH-2 中尝试更改用户名
+Credentials to authenticate with=用于认证的凭据
+Public-key authentication=公钥认证
+Private key file for authentication:=用于认证的私钥文件：
+Select private key file=选择私钥文件
+Certificate to use with the private key=与私钥配合使用的证书
+Select certificate file=选择证书文件
+Plugin to provide authentication responses=提供认证响应的插件
+Plugin command to run=运行的插件命令
+Options controlling GSSAPI authentication=控制 GSSAPI 认证的选项
+Attempt GSSAPI authentication (SSH-2 only)=尝试 GSSAPI 认证（仅 SSH-2）
+Attempt GSSAPI key exchange (SSH-2 only)=尝试 GSSAPI 密钥交换（仅 SSH-2）
+Allow GSSAPI credential delegation=允许 GSSAPI 凭据委派
+Preference order for GSSAPI libraries:=GSSAPI 库的优先顺序：
+User-supplied GSSAPI library path:=用户指定的 GSSAPI 库路径：
+Select library file=选择库文件
+Caps Lock acts as Cyrillic switch=Caps Lock 作为西里尔字母切换
+
+# ===== SSH / TTY =====
+TTY=TTY
+Remote terminal settings=远程终端设置
+Don't allocate a pseudo-terminal=不分配伪终端
+Terminal modes=终端模式
+Terminal modes to send:=要发送的终端模式：
+For selected mode, send:=对于所选模式，发送：
+Nothing=无
+This:=此项：
+
+# ===== SSH / X11 =====
+X11=X11
+Options controlling SSH X11 forwarding=控制 SSH X11 转发的选项
+X11 forwarding=X11 转发
+Enable X11 forwarding=启用 X11 转发
+X display location=X 显示位置
+Remote X11 authentication protocol=远程 X11 认证协议
+MIT-Magic-Cookie-1=MIT-Magic-Cookie-1
+XDM-Authorization-1=XDM-Authorization-1
+X authority file for local display=本地显示的 X authority 文件
+Select X authority file=选择 X authority 文件
+
+# ===== SSH / 隧道 =====
+Tunnels=隧道
+Options controlling SSH port forwarding=控制 SSH 端口转发的选项
+Port forwarding=端口转发
+Local ports accept connections from other hosts=本地端口接受其它主机的连接
+Remote ports do the same (SSH-2 only)=远程端口亦然（仅 SSH-2）
+Forwarded ports:=转发的端口：
+Add new forwarded port:=添加新的转发端口：
+You need to specify a source port number=需要指定源端口号
+Specified forwarding already exists=该转发已存在
+No action=无动作
+
+# ===== SSH / 服务器缺陷 =====
+Bugs=缺陷
+More bugs=更多缺陷
+Workarounds for SSH server bugs=SSH 服务器缺陷的规避方法
+Detection of known bugs in SSH servers=SSH 服务器已知缺陷的检测
+Manually enabled workarounds=手动启用的规避方法
+Further workarounds for SSH server bugs=SSH 服务器缺陷的进一步规避
+Chokes on SSH-2 ignore messages=无法处理 SSH-2 ignore 消息
+Handles SSH-2 key re-exchange badly=SSH-2 密钥重交换处理不当
+Chokes on PuTTY's SSH-2 'winadj' requests=无法处理 PuTTY 的 SSH-2 “winadj” 请求
+Replies to requests on closed channels=回复已关闭通道上的请求
+Ignores SSH-2 maximum packet size=忽略 SSH-2 最大包长度
+Discards data sent before its greeting=丢弃问候语之前发送的数据
+Chokes on PuTTY's full KEXINIT=无法处理 PuTTY 的完整 KEXINIT
+Old RSA/SHA2 cert algorithm naming=旧式 RSA/SHA2 证书算法命名
+Requires padding on SSH-2 RSA signatures=要求 SSH-2 RSA 签名带填充
+Only supports pre-RFC4419 SSH-2 DH GEX=仅支持 RFC4419 之前的 SSH-2 DH GEX
+Miscomputes SSH-2 HMAC keys=SSH-2 HMAC 密钥计算错误
+Misuses the session ID in SSH-2 PK auth=SSH-2 公钥认证中误用会话 ID
+Miscomputes SSH-2 encryption keys=SSH-2 加密密钥计算错误
+Chokes on SSH-1 ignore messages=无法处理 SSH-1 ignore 消息
+Refuses all SSH-1 password camouflage=拒绝所有 SSH-1 密码伪装
+Chokes on SSH-1 RSA authentication=无法处理 SSH-1 RSA 认证
+
+# ===== 串口 / Telnet / Rlogin / SUPDUP =====
+Serial=串口
+Options controlling local serial lines=控制本地串口的选项
+Select a serial line=选择串口线路
+Serial line to connect to=要连接的串口
+Configure the serial line=配置串口
+Speed (baud)=速度（波特）
+Data bits=数据位
+Stop bits=停止位
+Parity=校验
+Flow control=流控
+Telnet=Telnet
+Options controlling Telnet connections=控制 Telnet 连接的选项
+Telnet protocol adjustments=Telnet 协议调整
+Handling of OLD_ENVIRON ambiguity:=OLD_ENVIRON 歧义的处理：
+BSD (commonplace)=BSD（常见）
+RFC 1408 (unusual)=RFC 1408（少见）
+Telnet negotiation mode:=Telnet 协商模式：
+Passive=被动
+Active=主动
+Keyboard sends Telnet special commands=键盘发送 Telnet 特殊命令
+Return key sends Telnet New Line instead of ^M=回车键发送 Telnet New Line 而非 ^M
+Rlogin=Rlogin
+Options controlling Rlogin connections=控制 Rlogin 连接的选项
+Local username:=本地用户名：
+SUPDUP=SUPDUP
+Options controlling SUPDUP connections=控制 SUPDUP 连接的选项
+Location string=位置字符串
+Extended ASCII Character set:=扩展 ASCII 字符集：
+ITS=ITS
+WAITS=WAITS
+Terminal scrolling=终端滚动

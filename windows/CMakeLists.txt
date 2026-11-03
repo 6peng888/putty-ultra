@@ -40,6 +40,7 @@ add_sources_from_current_dir(utils
   utils/subprocess_waiter.c
   utils/version.c
   utils/win_strerror.c
+  ../utils/i18n.c
   unicode.c)
 if(NOT HAVE_STRTOUMAX)
   add_sources_from_current_dir(utils utils/strtoumax.c)
@@ -63,7 +64,7 @@ add_sources_from_current_dir(otherbackends
 add_sources_from_current_dir(agent
   agent-client.c)
 add_sources_from_current_dir(guiterminal
-  dialog.c controls.c config.c printing.c jump-list.c sizetip.c)
+  dialog.c controls.c config.c printing.c jump-list.c sizetip.c i18n.c)
 add_dependencies(guiterminal generated_licence_h) # dialog.c uses licence.h
 
 # This object awkwardly needs to live in the network library as well
@@ -113,6 +114,17 @@ target_link_libraries(putty
   ${platform_libraries})
 set_target_properties(putty PROPERTIES WIN32_EXECUTABLE ON)
 installed_program(putty)
+
+# UI translation data. The files are read at run time from next to the
+# executable, so they can be corrected without rebuilding; this just
+# puts a copy there after each build.
+file(GLOB PUTTY_I18N_FILES "${CMAKE_SOURCE_DIR}/i18n/*.txt")
+foreach(i18n_file ${PUTTY_I18N_FILES})
+  get_filename_component(i18n_name "${i18n_file}" NAME)
+  add_custom_command(TARGET putty POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${i18n_file}" "${CMAKE_BINARY_DIR}/putty-i18n-${i18n_name}")
+endforeach()
 
 add_executable(puttytel
   window.c

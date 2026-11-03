@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <ctype.h>
 #include <time.h>
+#include <wchar.h>
 
 #include "putty.h"
 #include "ssh.h"
@@ -16,6 +17,7 @@
 #include "storage.h"
 #include "dialog.h"
 #include "licence.h"
+#include "i18n.h"
 
 #include <commctrl.h>
 #include <commdlg.h>
@@ -160,8 +162,16 @@ static void pds_initdialog_start(PortableDialogStuff *pds, HWND hwnd)
 {
     pds->dp->hwnd = hwnd;
 
-    if (pds->dp->wintitle)     /* apply override title, if provided */
-        SetWindowText(hwnd, pds->dp->wintitle);
+    if (pds->dp->wintitle) {   /* apply override title, if provided */
+        /* Translate the title, but keep it wide: the table is UTF-8. */
+        wchar_t *wtitle = i18n_lookup_w(pds->dp->wintitle);
+        if (wtitle) {
+            SetWindowTextW(hwnd, wtitle);
+            sfree(wtitle);
+        } else {
+            SetWindowText(hwnd, pds->dp->wintitle);
+        }
+    }
 
     /* The portable dialog system generally includes the ability to
      * handle context help for particular controls. Enable the
@@ -499,10 +509,29 @@ static HTREEITEM treeview_insert(struct treeview_faff *faff,
 #define INSITEM item
 #endif
     ins.INSITEM.mask = TVIF_TEXT | TVIF_PARAM;
-    ins.INSITEM.pszText = text;
-    ins.INSITEM.cchTextMax = strlen(text)+1;
     ins.INSITEM.lParam = (LPARAM)path;
-    newitem = TreeView_InsertItem(faff->treeview, &ins);
+    /*
+     * The node's lParam keeps the untranslated path (the dialog code
+     * selects panels by that), but the label shown to the user is
+     * translated and inserted as a wide string.
+     */
+    wchar_t *wtext = i18n_lookup_w(text);
+    if (wtext) {
+        TVINSERTSTRUCTW insw;
+        insw.hParent = ins.hParent;
+        insw.hInsertAfter = ins.hInsertAfter;
+        insw.INSITEM.mask = TVIF_TEXT | TVIF_PARAM;
+        insw.INSITEM.pszText = wtext;
+        insw.INSITEM.cchTextMax = wcslen(wtext) + 1;
+        insw.INSITEM.lParam = (LPARAM)path;
+        newitem = (HTREEITEM)SendMessageW(faff->treeview, TVM_INSERTITEMW, 0,
+                                          (LPARAM)&insw);
+        sfree(wtext);
+    } else {
+        ins.INSITEM.pszText = text;
+        ins.INSITEM.cchTextMax = strlen(text)+1;
+        newitem = TreeView_InsertItem(faff->treeview, &ins);
+    }
     if (level > 0)
         TreeView_Expand(faff->treeview, faff->lastat[level - 1],
                         (level > 1 ? TVE_COLLAPSE : TVE_EXPAND));
@@ -557,12 +586,27 @@ static INT_PTR GenericMainDlgProc(HWND hwnd, UINT msg, WPARAM wParam,
             r.top = 3;
             r.bottom = r.top + 10;
             MapDialogRect(hwnd, &r);
-            tvstatic = CreateWindowEx(0, "STATIC", "Cate&gory:",
-                                      WS_CHILD | WS_VISIBLE,
-                                      r.left, r.top,
-                                      r.right - r.left, r.bottom - r.top,
-                                      hwnd, (HMENU) IDCX_TVSTATIC, hinst,
-                                      NULL);
+            {
+                wchar_t *wlabel = i18n_lookup_w("Cate&gory:");
+                if (wlabel) {
+                    tvstatic = CreateWindowExW(0, L"STATIC", wlabel,
+                                               WS_CHILD | WS_VISIBLE,
+                                               r.left, r.top,
+                                               r.right - r.left,
+                                               r.bottom - r.top,
+                                               hwnd, (HMENU) IDCX_TVSTATIC,
+                                               hinst, NULL);
+                    sfree(wlabel);
+                } else {
+                    tvstatic = CreateWindowEx(0, "STATIC", "Cate&gory:",
+                                              WS_CHILD | WS_VISIBLE,
+                                              r.left, r.top,
+                                              r.right - r.left,
+                                              r.bottom - r.top,
+                                              hwnd, (HMENU) IDCX_TVSTATIC,
+                                              hinst, NULL);
+                }
+            }
             font = SendMessage(hwnd, WM_GETFONT, 0, 0);
             SendMessage(tvstatic, WM_SETFONT, font, MAKELPARAM(true, 0));
 

@@ -10,6 +10,7 @@
 #include <signal.h>
 
 #include "putty.h"
+#include "i18n.h"
 #include "pageant.h" /* for AGENT_MAX_MSGLEN */
 #include "tree234.h"
 #include "storage.h"
@@ -726,7 +727,8 @@ static char *ssh_close_warn_text(Backend *be)
     int ndowns = share_ndownstreams(ssh->connshare);
     if (ndowns == 0)
         return NULL;
-    char *msg = dupprintf("This will also close %d downstream connection%s.",
+    char *msg = dupprintf(i18n_or("This will also close %d downstream "
+                                   "connection%s."),
                           ndowns, ndowns==1 ? "" : "s");
     return msg;
 }

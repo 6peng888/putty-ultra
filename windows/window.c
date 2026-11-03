@@ -14,6 +14,7 @@
 #define COMPILE_MULTIMON_STUBS
 
 #include "putty.h"
+#include "i18n.h"
 #include "ssh.h"
 #include "terminal.h"
 #include "storage.h"
@@ -144,6 +145,11 @@ static void frame_build_saved_menu(void);
 static void open_new_session_dialog(void);
 static void close_tab(int idx);
 static void frame_build_menu(void);
+static void menu_add(HMENU menu, UINT flags, UINT_PTR id, const char *text);
+static void menu_insert(HMENU menu, UINT pos, UINT flags, UINT_PTR id,
+                        const char *text);
+static int message_box_i18n(HWND hwnd, const char *text, const char *caption,
+                            UINT type);
 static WinGuiSeat *frame_current_seat(void);
 static void frame_sync_scrollbars(void);
 static bool frame_corner_hotspot(POINT *pt);
@@ -452,8 +458,8 @@ static void close_session(void *vctx)
      */
     for (i = 0; i < lenof(wgs->popup_menus); i++) {
         DeleteMenu(wgs->popup_menus[i].menu, IDM_RESTART, MF_BYCOMMAND);
-        InsertMenu(wgs->popup_menus[i].menu, IDM_DUPSESS,
-                   MF_BYCOMMAND | MF_ENABLED, IDM_RESTART, "&Restart Session");
+        menu_insert(wgs->popup_menus[i].menu, IDM_DUPSESS,
+                    MF_BYCOMMAND | MF_ENABLED, IDM_RESTART, "&Restart Session");
     }
 }
 
@@ -534,6 +540,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 
     dll_hijacking_protection();
     enable_dit();
+
+    /* Load the UI translation table (if the user has one) before any
+     * menu or dialog is built. */
+    i18n_init();
 
     hinst = inst;
     hprev = prev;
@@ -867,8 +877,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 
         for (j = 0; j < lenof(wgs->popup_menus); j++) {
             m = wgs->popup_menus[j].menu;
-            AppendMenu(m, MF_ENABLED, IDM_COPY, "&Copy");
-            AppendMenu(m, MF_ENABLED, IDM_PASTE, "&Paste");
+            menu_add(m, MF_ENABLED, IDM_COPY, "&Copy");
+            menu_add(m, MF_ENABLED, IDM_PASTE, "&Paste");
         }
 
         wgs->savedsess_menu = CreateMenu();
@@ -879,26 +889,26 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
             m = wgs->popup_menus[j].menu;
 
             AppendMenu(m, MF_SEPARATOR, 0, 0);
-            AppendMenu(m, MF_ENABLED, IDM_SHOWLOG, "&Event Log");
+            menu_add(m, MF_ENABLED, IDM_SHOWLOG, "&Event Log");
             AppendMenu(m, MF_SEPARATOR, 0, 0);
-            AppendMenu(m, MF_ENABLED, IDM_NEWSESS, "Ne&w Session...");
-            AppendMenu(m, MF_ENABLED, IDM_DUPSESS, "&Duplicate Session");
-            AppendMenu(m, MF_POPUP | MF_ENABLED, (UINT_PTR)wgs->savedsess_menu,
-                       "Sa&ved Sessions");
-            AppendMenu(m, MF_ENABLED, IDM_RECONF, "Chan&ge Settings...");
+            menu_add(m, MF_ENABLED, IDM_NEWSESS, "Ne&w Session...");
+            menu_add(m, MF_ENABLED, IDM_DUPSESS, "&Duplicate Session");
+            menu_add(m, MF_POPUP | MF_ENABLED, (UINT_PTR)wgs->savedsess_menu,
+                     "Sa&ved Sessions");
+            menu_add(m, MF_ENABLED, IDM_RECONF, "Chan&ge Settings...");
             AppendMenu(m, MF_SEPARATOR, 0, 0);
-            AppendMenu(m, MF_ENABLED, IDM_COPYALL, "C&opy All to Clipboard");
-            AppendMenu(m, MF_ENABLED, IDM_CLRSB, "C&lear Scrollback");
-            AppendMenu(m, MF_ENABLED, IDM_RESET, "Rese&t Terminal");
+            menu_add(m, MF_ENABLED, IDM_COPYALL, "C&opy All to Clipboard");
+            menu_add(m, MF_ENABLED, IDM_CLRSB, "C&lear Scrollback");
+            menu_add(m, MF_ENABLED, IDM_RESET, "Rese&t Terminal");
             AppendMenu(m, MF_SEPARATOR, 0, 0);
-            AppendMenu(m, (conf_get_int(wgs->conf, CONF_resize_action)
-                           == RESIZE_DISABLED) ? MF_GRAYED : MF_ENABLED,
-                       IDM_FULLSCREEN, "&Full Screen");
+            menu_add(m, (conf_get_int(wgs->conf, CONF_resize_action)
+                         == RESIZE_DISABLED) ? MF_GRAYED : MF_ENABLED,
+                     IDM_FULLSCREEN, "&Full Screen");
             AppendMenu(m, MF_SEPARATOR, 0, 0);
             if (has_help())
-                AppendMenu(m, MF_ENABLED, IDM_HELP, "&Help");
+                menu_add(m, MF_ENABLED, IDM_HELP, "&Help");
             str = dupprintf("&About %s", appname);
-            AppendMenu(m, MF_ENABLED, IDM_ABOUT, str);
+            menu_add(m, MF_ENABLED, IDM_ABOUT, str);
             sfree(str);
         }
     }
@@ -1543,11 +1553,12 @@ static void close_tab(int idx)
         char *msg;
         if (w->backend->vt->close_warn_text)
             additional = w->backend->vt->close_warn_text(w->backend);
-        msg = dupprintf("Are you sure you want to close this session?%s%s",
+        msg = dupprintf(i18n_or("Are you sure you want to close this "
+                                 "session?%s%s"),
                         additional ? "\n" : "",
                         additional ? additional : "");
-        int r = MessageBox(tab_frame_hwnd, msg, "PuTTY",
-                           MB_ICONWARNING | MB_OKCANCEL | MB_DEFBUTTON1);
+        int r = message_box_i18n(tab_frame_hwnd, msg, "PuTTY",
+                                 MB_ICONWARNING | MB_OKCANCEL | MB_DEFBUTTON1);
         sfree(msg);
         sfree(additional);
         if (r == IDCANCEL)
@@ -2177,9 +2188,10 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
       }
 
       case WM_CLOSE:
-        if (MessageBox(tab_frame_hwnd,
-                       "Close all PuTTY sessions and exit?",
-                       "PuTTY", MB_ICONWARNING | MB_OKCANCEL) == IDOK) {
+        if (message_box_i18n(tab_frame_hwnd,
+                             "Close all PuTTY sessions and exit?",
+                             "PuTTY",
+                             MB_ICONWARNING | MB_OKCANCEL) == IDOK) {
             /*
              * Tear down every session explicitly and deterministically.
              * Destroying each terminal child runs its WM_DESTROY, which
@@ -2217,6 +2229,54 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
     return 0;
 }
 
+/*
+ * Menu text goes through the translation table. A translated item is
+ * added as a wide string, because the table is UTF-8 and the
+ * narrow-character menu API cannot display it.
+ */
+static void menu_add(HMENU menu, UINT flags, UINT_PTR id, const char *text)
+{
+    wchar_t *wtext = i18n_lookup_w(text);
+    if (wtext) {
+        AppendMenuW(menu, flags, id, wtext);
+        sfree(wtext);
+    } else {
+        AppendMenu(menu, flags, id, text);
+    }
+}
+
+static void menu_insert(HMENU menu, UINT pos, UINT flags, UINT_PTR id,
+                        const char *text)
+{
+    wchar_t *wtext = i18n_lookup_w(text);
+    if (wtext) {
+        InsertMenuW(menu, pos, flags, id, wtext);
+        sfree(wtext);
+    } else {
+        InsertMenu(menu, pos, flags, id, text);
+    }
+}
+
+/*
+ * Show a message box whose text and caption come from us (either
+ * English or a translation). Both are handled as UTF-8 on the way into
+ * the wide-character API; callers must not pass text in the system's
+ * local code page (e.g. messages straight from a server) through here.
+ */
+static int message_box_i18n(HWND hwnd, const char *text, const char *caption,
+                            UINT type)
+{
+    const char *tr_text = i18n_or(text);
+    const char *tr_caption = caption ? i18n_or(caption) : NULL;
+    wchar_t *wtext = dup_mb_to_wc(CP_UTF8, tr_text);
+    wchar_t *wcaption = tr_caption ? dup_mb_to_wc(CP_UTF8, tr_caption) : NULL;
+    int r = MessageBoxW(hwnd, wtext, wcaption, type);
+
+    sfree(wtext);
+    sfree(wcaption);
+    return r;
+}
+
 static void frame_build_menu(void)
 {
     HMENU sm = GetSystemMenu(tab_frame_hwnd, false);
@@ -2224,32 +2284,32 @@ static void frame_build_menu(void)
 
     frame_savedsess_menu = CreateMenu();
     AppendMenu(sm, MF_SEPARATOR, 0, 0);
-    AppendMenu(sm, MF_ENABLED, IDM_NEWSESS, "Ne&w Session...");
+    menu_add(sm, MF_ENABLED, IDM_NEWSESS, "Ne&w Session...");
     /* Enabled on demand in WM_INITMENUPOPUP: only when the active
      * session's connection is down. */
-    AppendMenu(sm, MF_GRAYED, IDM_RECONNECT, "Reco&nnect Session");
-    AppendMenu(sm, MF_ENABLED, IDM_DUPSESS, "&Duplicate Session");
-    AppendMenu(sm, MF_POPUP | MF_ENABLED, (UINT_PTR)frame_savedsess_menu,
-               "Sa&ved Sessions");
+    menu_add(sm, MF_GRAYED, IDM_RECONNECT, "Reco&nnect Session");
+    menu_add(sm, MF_ENABLED, IDM_DUPSESS, "&Duplicate Session");
+    menu_add(sm, MF_POPUP | MF_ENABLED, (UINT_PTR)frame_savedsess_menu,
+             "Sa&ved Sessions");
     AppendMenu(sm, MF_SEPARATOR, 0, 0);
     /* Enabled on demand in WM_INITMENUPOPUP: only when the active
      * session is a live SSH connection it can share. */
-    AppendMenu(sm, MF_GRAYED, IDM_DUPCHANNEL, "Duplicate channel");
+    menu_add(sm, MF_GRAYED, IDM_DUPCHANNEL, "Duplicate channel");
     AppendMenu(sm, MF_SEPARATOR, 0, 0);
-    AppendMenu(sm, MF_ENABLED, IDM_COPY, "&Copy");
-    AppendMenu(sm, MF_ENABLED, IDM_PASTE, "&Paste");
+    menu_add(sm, MF_ENABLED, IDM_COPY, "&Copy");
+    menu_add(sm, MF_ENABLED, IDM_PASTE, "&Paste");
     AppendMenu(sm, MF_SEPARATOR, 0, 0);
-    AppendMenu(sm, MF_ENABLED, IDM_RECONF, "Chan&ge Settings...");
-    AppendMenu(sm, MF_ENABLED, IDM_SHOWLOG, "&Event Log");
-    AppendMenu(sm, MF_ENABLED, IDM_CLRSB, "C&lear Scrollback");
-    AppendMenu(sm, MF_ENABLED, IDM_RESET, "Rese&t Terminal");
+    menu_add(sm, MF_ENABLED, IDM_RECONF, "Chan&ge Settings...");
+    menu_add(sm, MF_ENABLED, IDM_SHOWLOG, "&Event Log");
+    menu_add(sm, MF_ENABLED, IDM_CLRSB, "C&lear Scrollback");
+    menu_add(sm, MF_ENABLED, IDM_RESET, "Rese&t Terminal");
     AppendMenu(sm, MF_SEPARATOR, 0, 0);
-    AppendMenu(sm, MF_ENABLED, IDM_FULLSCREEN, "&Full Screen");
+    menu_add(sm, MF_ENABLED, IDM_FULLSCREEN, "&Full Screen");
     AppendMenu(sm, MF_SEPARATOR, 0, 0);
     if (has_help())
-        AppendMenu(sm, MF_ENABLED, IDM_HELP, "&Help");
+        menu_add(sm, MF_ENABLED, IDM_HELP, "&Help");
     str = dupprintf("&About %s", appname);
-    AppendMenu(sm, MF_ENABLED, IDM_ABOUT, str);
+    menu_add(sm, MF_ENABLED, IDM_ABOUT, str);
     sfree(str);
 
     frame_build_saved_menu();
@@ -2458,8 +2518,8 @@ static void new_session_finish(WinGuiSeat *wgs)
 
         for (j = 0; j < lenof(wgs->popup_menus); j++) {
             m = wgs->popup_menus[j].menu;
-            AppendMenu(m, MF_ENABLED, IDM_COPY, "&Copy");
-            AppendMenu(m, MF_ENABLED, IDM_PASTE, "&Paste");
+            menu_add(m, MF_ENABLED, IDM_COPY, "&Copy");
+            menu_add(m, MF_ENABLED, IDM_PASTE, "&Paste");
         }
 
         wgs->savedsess_menu = CreateMenu();
@@ -2470,26 +2530,26 @@ static void new_session_finish(WinGuiSeat *wgs)
             m = wgs->popup_menus[j].menu;
 
             AppendMenu(m, MF_SEPARATOR, 0, 0);
-            AppendMenu(m, MF_ENABLED, IDM_SHOWLOG, "&Event Log");
+            menu_add(m, MF_ENABLED, IDM_SHOWLOG, "&Event Log");
             AppendMenu(m, MF_SEPARATOR, 0, 0);
-            AppendMenu(m, MF_ENABLED, IDM_NEWSESS, "Ne&w Session...");
-            AppendMenu(m, MF_ENABLED, IDM_DUPSESS, "&Duplicate Session");
-            AppendMenu(m, MF_POPUP | MF_ENABLED, (UINT_PTR)wgs->savedsess_menu,
-                       "Sa&ved Sessions");
-            AppendMenu(m, MF_ENABLED, IDM_RECONF, "Chan&ge Settings...");
+            menu_add(m, MF_ENABLED, IDM_NEWSESS, "Ne&w Session...");
+            menu_add(m, MF_ENABLED, IDM_DUPSESS, "&Duplicate Session");
+            menu_add(m, MF_POPUP | MF_ENABLED, (UINT_PTR)wgs->savedsess_menu,
+                     "Sa&ved Sessions");
+            menu_add(m, MF_ENABLED, IDM_RECONF, "Chan&ge Settings...");
             AppendMenu(m, MF_SEPARATOR, 0, 0);
-            AppendMenu(m, MF_ENABLED, IDM_COPYALL, "C&opy All to Clipboard");
-            AppendMenu(m, MF_ENABLED, IDM_CLRSB, "C&lear Scrollback");
-            AppendMenu(m, MF_ENABLED, IDM_RESET, "Rese&t Terminal");
+            menu_add(m, MF_ENABLED, IDM_COPYALL, "C&opy All to Clipboard");
+            menu_add(m, MF_ENABLED, IDM_CLRSB, "C&lear Scrollback");
+            menu_add(m, MF_ENABLED, IDM_RESET, "Rese&t Terminal");
             AppendMenu(m, MF_SEPARATOR, 0, 0);
-            AppendMenu(m, (conf_get_int(wgs->conf, CONF_resize_action)
-                           == RESIZE_DISABLED) ? MF_GRAYED : MF_ENABLED,
-                       IDM_FULLSCREEN, "&Full Screen");
+            menu_add(m, (conf_get_int(wgs->conf, CONF_resize_action)
+                         == RESIZE_DISABLED) ? MF_GRAYED : MF_ENABLED,
+                     IDM_FULLSCREEN, "&Full Screen");
             AppendMenu(m, MF_SEPARATOR, 0, 0);
             if (has_help())
-                AppendMenu(m, MF_ENABLED, IDM_HELP, "&Help");
+                menu_add(m, MF_ENABLED, IDM_HELP, "&Help");
             str = dupprintf("&About %s", appname);
-            AppendMenu(m, MF_ENABLED, IDM_ABOUT, str);
+            menu_add(m, MF_ENABLED, IDM_ABOUT, str);
             sfree(str);
         }
     }
@@ -3768,8 +3828,9 @@ static void exit_callback(void *vctx)
              * we should not generate this informational one. */
             if (exitcode != INT_MAX) {
                 show_mouseptr(wgs, true);
-                MessageBox(wgs->term_hwnd, "Connection closed by remote host",
-                           appname, MB_OK | MB_ICONINFORMATION);
+                message_box_i18n(wgs->term_hwnd,
+                                 "Connection closed by remote host",
+                                 appname, MB_OK | MB_ICONINFORMATION);
             }
         }
     }
@@ -3910,17 +3971,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
       case WM_CLOSE: {
         char *title, *msg, *additional = NULL;
         show_mouseptr(wgs, true);
-        title = dupprintf("%s Exit Confirmation", appname);
+        title = dupprintf(i18n_or("%s Exit Confirmation"), appname);
         if (wgs->backend && wgs->backend->vt->close_warn_text) {
             additional = wgs->backend->vt->close_warn_text(wgs->backend);
         }
-        msg = dupprintf("Are you sure you want to close this session?%s%s",
+        msg = dupprintf(i18n_or("Are you sure you want to close this "
+                                "session?%s%s"),
                         additional ? "\n" : "",
                         additional ? additional : "");
         if (wgs->session_closed ||
             !conf_get_bool(wgs->conf, CONF_warn_on_close) ||
-            MessageBox(hwnd, msg, title,
-                       MB_ICONWARNING | MB_OKCANCEL | MB_DEFBUTTON1)
+            message_box_i18n(hwnd, msg, title,
+                             MB_ICONWARNING | MB_OKCANCEL | MB_DEFBUTTON1)
             == IDOK)
             DestroyWindow(hwnd);
         sfree(title);

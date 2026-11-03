@@ -9,6 +9,7 @@
 #include "putty.h"
 #include "dialog.h"
 #include "storage.h"
+#include "i18n.h"
 
 static void about_handler(dlgcontrol *ctrl, dlgparam *dlg,
                           void *data, int event)
@@ -226,7 +227,7 @@ void win_setup_config_box(struct controlbox *b, HWND *hwndp, bool has_help,
      * additional options when working with line-drawing
      * characters.
      */
-    str = dupprintf("Adjust how %s displays line drawing characters", appname);
+    str = dupprintf(i18n_or("Adjust how %s displays line drawing characters"), appname);
     s = ctrl_getset(b, "Window/Translation", "linedraw", str);
     sfree(str);
     {

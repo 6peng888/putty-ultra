@@ -10,6 +10,7 @@
 #include "dialog.h"
 #include "storage.h"
 #include "tree234.h"
+#include "i18n.h"
 
 #define PRINTER_DISABLED_STRING "None (printing disabled)"
 
@@ -1836,7 +1837,7 @@ void setup_config_box(struct controlbox *b, bool midsession,
     /*
      * The Session panel.
      */
-    str = dupprintf("Basic options for your %s session", appname);
+    str = dupprintf(i18n_or("Basic options for your %s session"), appname);
     ctrl_settitle(b, "Session", str);
     sfree(str);
 
@@ -2236,7 +2237,7 @@ void setup_config_box(struct controlbox *b, bool midsession,
     /*
      * The Window panel.
      */
-    str = dupprintf("Options controlling %s's window", appname);
+    str = dupprintf(i18n_or("Options controlling %s's window"), appname);
     ctrl_settitle(b, "Window", str);
     sfree(str);
 
@@ -2280,7 +2281,7 @@ void setup_config_box(struct controlbox *b, bool midsession,
     /*
      * The Window/Appearance panel.
      */
-    str = dupprintf("Configure the appearance of %s's window", appname);
+    str = dupprintf(i18n_or("Configure the appearance of %s's window"), appname);
     ctrl_settitle(b, "Window/Appearance", str);
     sfree(str);
 
@@ -2319,7 +2320,7 @@ void setup_config_box(struct controlbox *b, bool midsession,
     /*
      * The Window/Behaviour panel.
      */
-    str = dupprintf("Configure the behaviour of %s's window", appname);
+    str = dupprintf(i18n_or("Configure the behaviour of %s's window"), appname);
     ctrl_settitle(b, "Window/Behaviour", str);
     sfree(str);
 
@@ -2355,7 +2356,7 @@ void setup_config_box(struct controlbox *b, bool midsession,
                   HELPCTX(translation_cjk_ambig_wide),
                   conf_checkbox_handler, I(CONF_cjk_ambig_wide));
 
-    str = dupprintf("Adjust how %s handles line drawing characters", appname);
+    str = dupprintf(i18n_or("Adjust how %s handles line drawing characters"), appname);
     s = ctrl_getset(b, "Window/Translation", "linedraw", str);
     sfree(str);
     ctrl_radiobuttons(
@@ -2466,7 +2467,7 @@ void setup_config_box(struct controlbox *b, bool midsession,
                       "The colour", I(BOLD_STYLE_COLOUR),
                       "Both", I(BOLD_STYLE_FONT | BOLD_STYLE_COLOUR));
 
-    str = dupprintf("Adjust the precise colours %s displays", appname);
+    str = dupprintf(i18n_or("Adjust the precise colours %s displays"), appname);
     s = ctrl_getset(b, "Window/Colours", "adjust", str);
     sfree(str);
     ctrl_text(s, "Select a colour from the list, and then click the"
