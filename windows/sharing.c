@@ -28,6 +28,43 @@ static char *make_name(const char *prefix, const char *name)
     return retname;
 }
 
+char *platform_ssh_share_new_listener(Plug *upplug, Socket **sock_out,
+                                      char **err)
+{
+    static unsigned long counter;
+    char *suffix, *obf, *pipename;
+    Socket *ret;
+
+    *err = NULL;
+
+    /*
+     * The name only needs to be unique among this process's listening
+     * sockets: the name is handed directly (in-process) to the
+     * downstream that targets it, and the counter is never reused.
+     */
+    suffix = dupprintf("dedicated.%lu.%lu", GetCurrentProcessId(),
+                       ++counter);
+    obf = capi_obfuscate_string(suffix);
+    sfree(suffix);
+    if (!obf) {
+        *err = dupprintf("Unable to call CryptProtectMemory: %s",
+                         win_strerror(GetLastError()));
+        return NULL;
+    }
+    pipename = make_name(CONNSHARE_PIPE_PREFIX, obf);
+    sfree(obf);
+
+    ret = new_named_pipe_listener(pipename, upplug);
+    if (sk_socket_error(ret)) {
+        *err = dupstr(sk_socket_error(ret));
+        sk_close(ret);
+        sfree(pipename);
+        return NULL;
+    }
+    *sock_out = ret;
+    return pipename;
+}
+
 int platform_ssh_share(const char *pi_name, Conf *conf,
                        Plug *downplug, Plug *upplug, Socket **sock,
                        char **logtext, char **ds_err, char **us_err,
@@ -36,6 +73,30 @@ int platform_ssh_share(const char *pi_name, Conf *conf,
     char *name, *mutexname, *pipename;
     HANDLE mutex;
     Socket *retsock;
+
+    /*
+     * Directed attach: the caller (in-process "Duplicate channel")
+     * knows the exact listening socket of the upstream it wants, so
+     * try only that, as downstream only, and skip the mutex dance
+     * since we will never want to become an upstream ourselves.
+     */
+    const char *dedpipe = conf_get_str(conf, CONF_ssh_share_pipe);
+    if (dedpipe && *dedpipe) {
+        *logtext = NULL;
+        *ds_err = NULL;
+        *us_err = NULL;
+        if (can_downstream) {
+            retsock = new_named_pipe_client(dedpipe, downplug);
+            if (sk_socket_error(retsock) == NULL) {
+                *logtext = dupstr(dedpipe);
+                *sock = retsock;
+                return SHARE_DOWNSTREAM;
+            }
+            *ds_err = dupprintf("%s: %s", dedpipe, sk_socket_error(retsock));
+            sk_close(retsock);
+        }
+        return SHARE_NONE;
+    }
 
     /*
      * Transform the platform-independent version of the connection

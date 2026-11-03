@@ -280,6 +280,19 @@ CONF_OPTION(ssh_simple,
     DEFAULT_BOOL(false),
     NOT_SAVED,
 )
+CONF_OPTION(ssh_share_pipe,
+    /*
+     * Set internally by the Windows GUI's "Duplicate channel" to the
+     * platform socket name of one specific upstream's listening
+     * socket, so that this launch attaches to _that_ upstream rather
+     * than to whichever same-target upstream instance the OS happens
+     * to hand out. Never set by user configuration, or loaded,
+     * saved, or shown.
+     */
+    VALUE_TYPE(STR),
+    DEFAULT_STR(""),
+    NOT_SAVED,
+)
 CONF_OPTION(ssh_connection_sharing,
     VALUE_TYPE(BOOL),
     DEFAULT_BOOL(false),
@@ -294,6 +307,19 @@ CONF_OPTION(ssh_connection_sharing_downstream,
     VALUE_TYPE(BOOL),
     DEFAULT_BOOL(true),
     SAVE_KEYWORD("ConnectionSharingDownstream"),
+)
+CONF_OPTION(ssh_dial_fresh,
+    /*
+     * Set internally by the Windows GUI's "Duplicate Session" to make
+     * this one launch dial its own connection instead of attaching to
+     * an existing shared upstream, without changing any of the saved
+     * settings (in particular "Share SSH connections if possible"
+     * keeps whatever value it had). Never set by user configuration,
+     * or loaded, saved, or shown.
+     */
+    VALUE_TYPE(BOOL),
+    DEFAULT_BOOL(false),
+    NOT_SAVED,
 )
 CONF_OPTION(ssh_manual_hostkeys,
     /*

@@ -123,6 +123,7 @@ add_executable(puttytel
   ${CMAKE_SOURCE_DIR}/stubs/no-console.c
   ${CMAKE_SOURCE_DIR}/stubs/no-rand.c
   ${CMAKE_SOURCE_DIR}/stubs/no-dit.c
+  ${CMAKE_SOURCE_DIR}/stubs/no-ssh-sharepipe.c
   ${CMAKE_SOURCE_DIR}/proxy/nocproxy.c
   ${CMAKE_SOURCE_DIR}/proxy/nosshproxy.c
   puttytel.rc)
@@ -163,6 +164,7 @@ if(HAVE_CONPTY)
     ${CMAKE_SOURCE_DIR}/stubs/no-console.c
     ${CMAKE_SOURCE_DIR}/stubs/no-rand.c
     ${CMAKE_SOURCE_DIR}/stubs/no-dit.c
+    ${CMAKE_SOURCE_DIR}/stubs/no-ssh-sharepipe.c
     ${CMAKE_SOURCE_DIR}/proxy/nosshproxy.c
     pterm.rc)
   be_list(pterm pterm)

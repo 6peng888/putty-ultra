@@ -51,6 +51,7 @@
 #define IDM_COPY      0x0190
 #define IDM_PASTE     0x01A0
 #define IDM_RECONNECT 0x01B0
+#define IDM_DUPCHANNEL 0x01C0
 #define IDM_SPECIALSEP 0x0200
 
 #define IDM_SPECIAL_MIN 0x0400
@@ -2007,13 +2008,22 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
             /*
              * Reconnect makes sense only for a session whose
              * connection has gone down, so enable it just when the
-             * active tab is in that state.
+             * active tab is in that state. Duplicate channel needs a
+             * live SSH connection to share.
              */
             bool down = (tab_active >= 0 &&
                          !tab_list[tab_active]->backend &&
                          tab_list[tab_active]->session_closed);
             EnableMenuItem((HMENU)wParam, IDM_RECONNECT, MF_BYCOMMAND |
                            (down ? MF_ENABLED : MF_GRAYED));
+            bool candup = (tab_active >= 0 &&
+                           tab_list[tab_active]->backend &&
+                           tab_list[tab_active]->backend->vt->protocol
+                           == PROT_SSH &&
+                           conf_get_bool(tab_list[tab_active]->conf,
+                                         CONF_ssh_connection_sharing));
+            EnableMenuItem((HMENU)wParam, IDM_DUPCHANNEL, MF_BYCOMMAND |
+                           (candup ? MF_ENABLED : MF_GRAYED));
         }
         break;
 
@@ -2052,6 +2062,16 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
         if ((wParam & ~0xF) == IDM_DUPSESS) {
             if (tab_active >= 0) {
                 Conf *c = conf_copy(tab_list[tab_active]->conf);
+                /*
+                 * A duplicate dials its own connection rather than
+                 * attaching to the original's shared one. Do that via
+                 * the in-memory-only ssh_dial_fresh flag, so that all
+                 * saved settings - including "Share SSH connections
+                 * if possible" - stay exactly as in the source.
+                 * (Reuse of the original connection is what Duplicate
+                 * channel is for.)
+                 */
+                conf_set_bool(c, CONF_ssh_dial_fresh, true);
                 /* A duplicate is the same session as its original, so
                  * its tab is captioned the same way. */
                 new_session(c, tab_list[tab_active]->tab_name);
@@ -2060,6 +2080,64 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
         }
         if ((wParam & ~0xF) == IDM_SAVEDSESS)
             return 0;   /* submenu header */
+        if ((wParam & ~0xF) == IDM_DUPCHANNEL) {
+            /*
+             * Open a new tab reusing the active tab's SSH connection,
+             * in the manner of "Share SSH connections if possible":
+             * the new session is told to take part in connection
+             * sharing (both roles), so when it comes up it attaches
+             * to the existing upstream as a downstream instead of
+             * dialling the server again. Sharing is negotiated by
+             * target (user@host:port), so this only actually reuses
+             * the connection if the original tab was started with
+             * sharing enabled (or is otherwise already listening as
+             * an upstream).
+             */
+            if (tab_active >= 0 && tab_list[tab_active]->backend &&
+                tab_list[tab_active]->backend->vt->protocol == PROT_SSH &&
+                conf_get_bool(tab_list[tab_active]->conf,
+                              CONF_ssh_connection_sharing)) {
+                Conf *c = conf_copy(tab_list[tab_active]->conf);
+                conf_set_bool(c, CONF_ssh_connection_sharing, true);
+                conf_set_bool(c, CONF_ssh_connection_sharing_upstream, true);
+                conf_set_bool(c, CONF_ssh_connection_sharing_downstream, true);
+                /*
+                 * The source may be a session opened by Duplicate
+                 * Session, which carries the in-memory dial-fresh
+                 * flag to make its own launch dial a separate
+                 * connection. This launch is meant to reuse the
+                 * source's connection, so clear the flag.
+                 */
+                conf_set_bool(c, CONF_ssh_dial_fresh, false);
+                /*
+                 * Aim this launch at _this_ tab's upstream: ask it for
+                 * a dedicated listening socket name so the new session
+                 * attaches to it, rather than to whichever same-target
+                 * upstream instance the OS happens to hand out. If the
+                 * source isn't itself listening as an upstream (e.g.
+                 * it is a downstream of another connection), fall back
+                 * to the ordinary deterministic name.
+                 */
+                char *pipename = backend_get_dedicated_share_pipe(
+                    tab_list[tab_active]->backend);
+                if (pipename) {
+                    char *msg = dupprintf(
+                        "Duplicate channel: targeting dedicated "
+                        "listening socket %s", pipename);
+                    lp_eventlog(&tab_list[tab_active]->logpolicy, msg);
+                    sfree(msg);
+                    conf_set_str(c, CONF_ssh_share_pipe, pipename);
+                    sfree(pipename);
+                } else {
+                    lp_eventlog(&tab_list[tab_active]->logpolicy,
+                                "Duplicate channel: source is not "
+                                "listening as an upstream; falling back "
+                                "to the default shared socket name");
+                }
+                new_session(c, tab_list[tab_active]->tab_name);
+            }
+            return 0;
+        }
         if (wParam >= IDM_SAVED_MIN && wParam < IDM_SAVED_MAX) {
             int p = (int)((wParam - IDM_SAVED_MIN) / MENU_SAVED_STEP);
             if (p + 1 < sesslist.nsessions) {
@@ -2138,6 +2216,10 @@ static void frame_build_menu(void)
     AppendMenu(sm, MF_ENABLED, IDM_DUPSESS, "&Duplicate Session");
     AppendMenu(sm, MF_POPUP | MF_ENABLED, (UINT_PTR)frame_savedsess_menu,
                "Sa&ved Sessions");
+    AppendMenu(sm, MF_SEPARATOR, 0, 0);
+    /* Enabled on demand in WM_INITMENUPOPUP: only when the active
+     * session is a live SSH connection it can share. */
+    AppendMenu(sm, MF_GRAYED, IDM_DUPCHANNEL, "Duplicate channel");
     AppendMenu(sm, MF_SEPARATOR, 0, 0);
     AppendMenu(sm, MF_ENABLED, IDM_COPY, "&Copy");
     AppendMenu(sm, MF_ENABLED, IDM_PASTE, "&Paste");
@@ -3911,9 +3993,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             break;
           case IDM_DUPSESS:
             if (wgs->conf) {
+                Conf *c = conf_copy(wgs->conf);
+                /*
+                 * A duplicate dials its own connection rather than
+                 * attaching to the original's shared one. Do that via
+                 * the in-memory-only ssh_dial_fresh flag, so that all
+                 * saved settings - including "Share SSH connections
+                 * if possible" - stay exactly as in the source.
+                 * (Reuse of the original connection is what Duplicate
+                 * channel is for.)
+                 */
+                conf_set_bool(c, CONF_ssh_dial_fresh, true);
                 /* A duplicate is the same session as its original, so
                  * its tab is captioned the same way. */
-                new_session(conf_copy(wgs->conf), wgs->tab_name);
+                new_session(c, wgs->tab_name);
             }
             break;
           case IDM_SAVEDSESS: {

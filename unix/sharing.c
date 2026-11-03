@@ -368,3 +368,13 @@ void platform_ssh_share_cleanup(const char *name)
 
     sfree(dirname);
 }
+
+char *platform_ssh_share_new_listener(Plug *upplug, Socket **sock_out,
+                                      char **err)
+{
+    /*
+     * Targeted attach is a Windows-GUI feature; on Unix, callers fall
+     * back to the ordinary deterministic socket name.
+     */
+    return NULL;
+}

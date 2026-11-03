@@ -177,6 +177,15 @@ void share_activate(ssh_sharing_state *sharestate,
                     const char *server_verstring);
 void sharestate_free(ssh_sharing_state *state);
 int share_ndownstreams(ssh_sharing_state *state);
+/*
+ * Set up an extra listening socket for an existing upstream, with a
+ * name unique to that upstream. Returns the platform socket name a
+ * new downstream can use to attach to _this_ upstream specifically
+ * (see CONF_ssh_share_pipe), or NULL on failure or if this sharing
+ * state is not an upstream. The returned string must be freed by the
+ * caller.
+ */
+char *share_ensure_dedicated_listener(ssh_sharing_state *state);
 
 void ssh_connshare_log(Ssh *ssh, int event, const char *logtext,
                        const char *ds_err, const char *us_err);
@@ -1709,6 +1718,15 @@ int platform_ssh_share(const char *name, Conf *conf,
                        char **logtext, char **ds_err, char **us_err,
                        bool can_upstream, bool can_downstream);
 void platform_ssh_share_cleanup(const char *name);
+/*
+ * Create an additional listening socket for an existing upstream
+ * ('upplug' is the upstream's plug), whose name is unique to that
+ * upstream. Returns the platform-specific socket name, with *sock set
+ * to the listening Socket, or NULL on failure. The returned name must
+ * be freed by the caller.
+ */
+char *platform_ssh_share_new_listener(Plug *upplug, Socket **sock_out,
+                                      char **err);
 
 /*
  * List macro defining the SSH-1 message type codes.

@@ -1977,6 +1977,15 @@ void random_destroy_seed(void);
  */
 const struct BackendVtable *backend_vt_from_name(const char *name);
 const struct BackendVtable *backend_vt_from_proto(int proto);
+/*
+ * If 'be' is a live SSH upstream, set up (or reuse) an extra
+ * connection-sharing listening socket whose name is unique to it, and
+ * return that name (to be handed to a new downstream via
+ * CONF_ssh_share_pipe, so the new session attaches to _this_ upstream
+ * specifically). Returns NULL if 'be' is not SSH or is not an
+ * upstream. The returned string must be freed by the caller.
+ */
+char *backend_get_dedicated_share_pipe(Backend *be);
 char *get_remote_username(Conf *conf); /* dynamically allocated */
 char *save_settings(const char *section, Conf *conf);
 void save_open_settings(settings_w *sesskey, Conf *conf);

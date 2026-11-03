@@ -142,7 +142,11 @@
 
 struct ssh_sharing_state {
     char *sockname;                  /* the socket name, kept for cleanup */
+    bool is_upstream;                /* are we carrying the connection? */
     Socket *listensock;              /* the master listening Socket */
+    Socket *dedicated_listensock;    /* extra listener, name unique to us */
+    char *dedicated_pipename;        /* that listener's name, for targeted
+                                      * downstreams */
     tree234 *connections;            /* holds ssh_sharing_connstates */
     unsigned nextid;                 /* preferred id for next connstate */
     ConnectionLayer *cl;             /* instance of the ssh connection layer */
@@ -514,7 +518,10 @@ void sharestate_free(ssh_sharing_state *sharestate)
 {
     struct ssh_sharing_connstate *cs;
 
-    platform_ssh_share_cleanup(sharestate->sockname);
+    /* A dial-fresh upstream has a dedicated listener but no master
+     * socket to clean up. */
+    if (sharestate->sockname)
+        platform_ssh_share_cleanup(sharestate->sockname);
 
     while ((cs = (struct ssh_sharing_connstate *)
             delpos234(sharestate->connections, 0)) != NULL) {
@@ -525,9 +532,40 @@ void sharestate_free(ssh_sharing_state *sharestate)
         sk_close(sharestate->listensock);
         sharestate->listensock = NULL;
     }
+    if (sharestate->dedicated_listensock) {
+        sk_close(sharestate->dedicated_listensock);
+        sharestate->dedicated_listensock = NULL;
+    }
+    sfree(sharestate->dedicated_pipename);
+    sharestate->dedicated_pipename = NULL;
     sfree(sharestate->server_verstring);
     sfree(sharestate->sockname);
     sfree(sharestate);
+}
+
+char *share_ensure_dedicated_listener(ssh_sharing_state *sharestate)
+{
+    /*
+     * Only an upstream can accept targeted downstreams; callers
+     * should fall back to the ordinary deterministic attach if this
+     * sharing state is not carrying a connection.
+     */
+    if (!sharestate->is_upstream)
+        return NULL;
+
+    if (!sharestate->dedicated_listensock) {
+        Socket *sock = NULL;
+        char *err = NULL;
+        char *pipename = platform_ssh_share_new_listener(
+            &sharestate->plug, &sock, &err);
+        if (!pipename) {
+            sfree(err);
+            return NULL;
+        }
+        sharestate->dedicated_listensock = sock;
+        sharestate->dedicated_pipename = pipename;
+    }
+    return dupstr(sharestate->dedicated_pipename);
 }
 
 static struct share_halfchannel *share_add_halfchannel(
@@ -2076,9 +2114,60 @@ Socket *ssh_connection_sharing_init(
     can_upstream = share_can_be_upstream &&
         conf_get_bool(conf, CONF_ssh_connection_sharing_upstream);
     can_downstream = share_can_be_downstream &&
-        conf_get_bool(conf, CONF_ssh_connection_sharing_downstream);
+        conf_get_bool(conf, CONF_ssh_connection_sharing_downstream) &&
+        /* The GUI can ask for one launch to dial its own connection
+         * even though sharing is configured (see "Duplicate Session"):
+         * suppress only the downstream attach, not sharing itself. */
+        !conf_get_bool(conf, CONF_ssh_dial_fresh);
     if (!can_upstream && !can_downstream)
         return NULL;
+
+    if (conf_get_bool(conf, CONF_ssh_dial_fresh)) {
+        /*
+         * This launch (the GUI's "Duplicate Session") deliberately
+         * dials its own connection, so it must not attach downstream
+         * to an existing upstream. Nor can it claim the ordinary
+         * shared name: an upstream for the same target very likely
+         * holds it already, and the first pipe instance claims the
+         * name exclusively, so creating a listener there would fail
+         * outright and leave this session with no sharing at all.
+         * Give it only a dedicated listener instead, whose unique
+         * name the GUI hands to "Duplicate channel" launches so that
+         * they attach to this connection specifically.
+         */
+        Socket *sock = NULL;
+        char *err = NULL;
+        char *pipename;
+
+        if (!can_upstream)
+            return NULL;               /* nothing to share: just dial */
+
+        sharestate = snew(struct ssh_sharing_state);
+        memset(sharestate, 0, sizeof(*sharestate));
+        sharestate->plug.vt = &ssh_sharing_listen_plugvt;
+        sharestate->is_upstream = true;
+        sharestate->connections = newtree234(share_connstate_cmp);
+        sharestate->nextid = 1;
+
+        pipename = platform_ssh_share_new_listener(
+            &sharestate->plug, &sock, &err);
+        if (!pipename) {
+            if (err)
+                logeventf(logctx, "Could not set up connection sharing "
+                          "as upstream: %s", err);
+            sfree(err);
+            freetree234(sharestate->connections);
+            sfree(sharestate);
+            *state = NULL;
+            return NULL;
+        }
+        logeventf(logctx, "Sharing this connection at %s", pipename);
+        sharestate->dedicated_listensock = sock;
+        sharestate->dedicated_pipename = pipename;
+
+        *state = sharestate;
+        return NULL;
+    }
 
     sockname = ssh_share_sockname(host, port, conf);
 
@@ -2088,7 +2177,10 @@ Socket *ssh_connection_sharing_init(
      */
     sharestate = snew(struct ssh_sharing_state);
     sharestate->plug.vt = &ssh_sharing_listen_plugvt;
+    sharestate->is_upstream = false;
     sharestate->listensock = NULL;
+    sharestate->dedicated_listensock = NULL;
+    sharestate->dedicated_pipename = NULL;
     sharestate->cl = NULL;
 
     /*
@@ -2161,6 +2253,7 @@ Socket *ssh_connection_sharing_init(
         logeventf(logctx, "Sharing this connection at %s", logtext);
 
         *state = sharestate;
+        sharestate->is_upstream = true;
         sharestate->listensock = sock;
         sharestate->connections = newtree234(share_connstate_cmp);
         sharestate->server_verstring = NULL;

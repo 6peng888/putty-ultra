@@ -23,3 +23,9 @@ int platform_ssh_share(const char *name, Conf *conf,
 void platform_ssh_share_cleanup(const char *name)
 {
 }
+
+char *platform_ssh_share_new_listener(Plug *upplug, Socket **sock_out,
+                                      char **err)
+{
+    return NULL;
+}

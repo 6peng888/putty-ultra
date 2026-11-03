@@ -1283,6 +1283,18 @@ void ssh_got_fallback_cmd(Ssh *ssh)
     ssh->fallback_cmd = true;
 }
 
+char *backend_get_dedicated_share_pipe(Backend *be)
+{
+    Ssh *ssh;
+
+    if (be->vt != &ssh_backend && be->vt != &sshconn_backend)
+        return NULL;
+    ssh = container_of(be, Ssh, backend);
+    if (!ssh->connshare)
+        return NULL;
+    return share_ensure_dedicated_listener(ssh->connshare);
+}
+
 const BackendVtable ssh_backend = {
     .init = ssh_init,
     .free = ssh_free,
