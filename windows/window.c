@@ -2703,7 +2703,7 @@ static void win_seat_connection_fatal(Seat *seat, const char *msg)
     sfree(title);
 
     if (conf_get_int(wgs->conf, CONF_close_on_exit) == FORCE_ON)
-        PostQuitMessage(1);
+        DestroyWindow(wgs->term_hwnd);  /* close this tab, not the whole app */
     else {
         queue_toplevel_callback(close_session, wgs);
     }
@@ -3637,7 +3637,13 @@ static void exit_callback(void *vctx)
          * appropriate action. */
         if (close_on_exit == FORCE_ON ||
             (close_on_exit == AUTO && exitcode != INT_MAX)) {
-            PostQuitMessage(0);
+            /*
+             * With the tabbed UI, quitting the message loop here would
+             * take down every tab. Destroy only this session's terminal
+             * window instead: its WM_DESTROY removes it from the tab
+             * strip, and quits the program only if it was the last one.
+             */
+            DestroyWindow(wgs->term_hwnd);
         } else {
             queue_toplevel_callback(close_session, wgs);
             wgs->session_closed = true;
