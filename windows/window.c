@@ -50,6 +50,7 @@
 #define IDM_FULLSCREEN  0x0180
 #define IDM_COPY      0x0190
 #define IDM_PASTE     0x01A0
+#define IDM_RECONNECT 0x01B0
 #define IDM_SPECIALSEP 0x0200
 
 #define IDM_SPECIAL_MIN 0x0400
@@ -2002,6 +2003,18 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
       case WM_INITMENUPOPUP:
         if ((HMENU)wParam == frame_savedsess_menu)
             frame_build_saved_menu();
+        else if ((HMENU)wParam == GetSystemMenu(hwnd, false)) {
+            /*
+             * Reconnect makes sense only for a session whose
+             * connection has gone down, so enable it just when the
+             * active tab is in that state.
+             */
+            bool down = (tab_active >= 0 &&
+                         !tab_list[tab_active]->backend &&
+                         tab_list[tab_active]->session_closed);
+            EnableMenuItem((HMENU)wParam, IDM_RECONNECT, MF_BYCOMMAND |
+                           (down ? MF_ENABLED : MF_GRAYED));
+        }
         break;
 
       case WM_SYSCOMMAND: {
@@ -2119,6 +2132,9 @@ static void frame_build_menu(void)
     frame_savedsess_menu = CreateMenu();
     AppendMenu(sm, MF_SEPARATOR, 0, 0);
     AppendMenu(sm, MF_ENABLED, IDM_NEWSESS, "Ne&w Session...");
+    /* Enabled on demand in WM_INITMENUPOPUP: only when the active
+     * session's connection is down. */
+    AppendMenu(sm, MF_GRAYED, IDM_RECONNECT, "Reco&nnect Session");
     AppendMenu(sm, MF_ENABLED, IDM_DUPSESS, "&Duplicate Session");
     AppendMenu(sm, MF_POPUP | MF_ENABLED, (UINT_PTR)frame_savedsess_menu,
                "Sa&ved Sessions");
@@ -3918,6 +3934,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             break;
           }
           case IDM_RESTART:
+          case IDM_RECONNECT:   /* sent to the active tab by the frame */
             if (!wgs->backend) {
                 lp_eventlog(&wgs->logpolicy, "----- Session restarted -----");
                 term_pwron(wgs->term, false);
