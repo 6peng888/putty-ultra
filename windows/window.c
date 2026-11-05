@@ -427,6 +427,8 @@ static void start_backend(WinGuiSeat *wgs)
     }
 
     wgs->session_closed = false;
+    if (tab_frame_hwnd)
+        InvalidateRect(tab_frame_hwnd, NULL, false);   /* un-strike the tab */
 }
 
 static void close_session(void *vctx)
@@ -436,6 +438,14 @@ static void close_session(void *vctx)
     int i;
 
     wgs->session_closed = true;
+    /*
+     * Repaint the tab strip ourselves rather than relying on the title
+     * change below: wintw_set_title does nothing if the title happens
+     * to be unchanged, and the tab has to show that the session has
+     * ended either way.
+     */
+    if (tab_frame_hwnd)
+        InvalidateRect(tab_frame_hwnd, NULL, false);
     newtitle = dupprintf("%s (inactive)", appname);
     win_set_icon_title(&wgs->termwin, newtitle, DEFAULT_CODEPAGE);
     win_set_title(&wgs->termwin, newtitle, DEFAULT_CODEPAGE);
@@ -1653,6 +1663,40 @@ static void frame_build_saved_menu(void)
     build_savedsess_menu(frame_savedsess_menu);
 }
 
+/*
+ * Draw a line through the middle of the part of `trtext' that a tab
+ * label actually occupies, to mark a tab whose session has ended. The
+ * extent is measured with the same flags as the real DrawTextW call, so
+ * the line covers exactly the visible characters even when the label
+ * has been shortened with an ellipsis.
+ */
+static void tab_strike_through(HDC hdc, const wchar_t *label,
+                               const RECT *trtext)
+{
+    RECT calc = *trtext;
+    HPEN pen, oldpen;
+    int y, thickness;
+
+    DrawTextW(hdc, label, -1, &calc,
+              DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_CALCRECT);
+    if (calc.right > trtext->right)
+        calc.right = trtext->right;
+    if (calc.right <= trtext->left)
+        return;                    /* no visible text to strike out */
+
+    y = (trtext->top + trtext->bottom) / 2;
+    thickness = tab_scale(1);
+    if (thickness < 1)
+        thickness = 1;
+
+    pen = CreatePen(PS_SOLID, thickness, GetTextColor(hdc));
+    oldpen = SelectObject(hdc, pen);
+    MoveToEx(hdc, trtext->left, y, NULL);
+    LineTo(hdc, calc.right, y);
+    SelectObject(hdc, oldpen);
+    DeleteObject(pen);
+}
+
 static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
                                      WPARAM wParam, LPARAM lParam)
 {
@@ -1840,6 +1884,7 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
             RECT tr = g_tabrects[i], trtext, cr;
             wchar_t label[1024];
             bool active = (i == tab_active);
+            bool closed = tab_list[i]->session_closed;
 
             if (tr.right <= tr.left || tr.bottom <= tr.top)
                 continue;             /* this tab has no room in the strip */
@@ -1848,9 +1893,19 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
                                                 COLOR_HIGHLIGHT :
                                                 COLOR_BTNFACE));
             DrawEdge(hdc, &tr, active ? EDGE_RAISED : EDGE_ETCHED, BF_RECT);
-            SetTextColor(hdc, GetSysColor(active ?
-                                          COLOR_HIGHLIGHTTEXT :
-                                          COLOR_BTNTEXT));
+            /*
+             * A tab whose session has ended is struck through, so that
+             * it stands out whether or not it is the active one (the
+             * highlight colours of the active tab leave no room for a
+             * different text colour). Inactive dead tabs are drawn in
+             * the grey that Windows reserves for unavailable things.
+             */
+            if (active)
+                SetTextColor(hdc, GetSysColor(COLOR_HIGHLIGHTTEXT));
+            else if (closed)
+                SetTextColor(hdc, GetSysColor(COLOR_GRAYTEXT));
+            else
+                SetTextColor(hdc, GetSysColor(COLOR_BTNTEXT));
 
             /* Close box on the right-hand end of the tab */
             cr = tr;
@@ -1864,6 +1919,9 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
             trtext.right = cr.left;
             DrawTextW(hdc, label, -1, &trtext,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+            if (closed)
+                tab_strike_through(hdc, label, &trtext);
         }
 
         if (g_plusrect.right > g_plusrect.left &&
