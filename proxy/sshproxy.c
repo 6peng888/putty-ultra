@@ -673,12 +673,12 @@ Socket *sshproxy_new_connection(SockAddr *addr, const char *hostname,
     /*
      * Turn off SSH features we definitely don't want. It would be
      * awkward and counterintuitive to have the proxy SSH connection
-     * become a connection-sharing upstream (but it's fine to have it
-     * be a downstream, if that's configured). And we don't want to
-     * open X forwardings, agent forwardings or (other) port
-     * forwardings as a side effect of this one operation.
+     * offer itself for reuse by a "Duplicate channel" (which would
+     * also cost us the single-channel optimisation below). And we
+     * don't want to open X forwardings, agent forwardings or (other)
+     * port forwardings as a side effect of this one operation.
      */
-    conf_set_bool(sp->conf, CONF_ssh_connection_sharing_upstream, false);
+    conf_set_bool(sp->conf, CONF_ssh_share_upstream, false);
     conf_set_bool(sp->conf, CONF_x11_forward, false);
     conf_set_bool(sp->conf, CONF_agentfwd, false);
     for (const char *subkey;

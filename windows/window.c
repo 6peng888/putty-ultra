@@ -2100,12 +2100,19 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
                          tab_list[tab_active]->session_closed);
             EnableMenuItem((HMENU)wParam, IDM_RECONNECT, MF_BYCOMMAND |
                            (down ? MF_ENABLED : MF_GRAYED));
-            bool candup = (tab_active >= 0 &&
-                           tab_list[tab_active]->backend &&
-                           tab_list[tab_active]->backend->vt->protocol
-                           == PROT_SSH &&
-                           conf_get_bool(tab_list[tab_active]->conf,
-                                         CONF_ssh_connection_sharing));
+            /*
+             * Duplicate channel needs a live SSH connection that is
+             * actually offering itself for reuse - which rules out a
+             * tab that is itself a downstream of another one.
+             */
+            bool candup = false;
+            if (tab_active >= 0 && tab_list[tab_active]->backend &&
+                tab_list[tab_active]->backend->vt->protocol == PROT_SSH) {
+                char *pipename = backend_get_dedicated_share_pipe(
+                    tab_list[tab_active]->backend);
+                candup = (pipename != NULL);
+                sfree(pipename);
+            }
             EnableMenuItem((HMENU)wParam, IDM_DUPCHANNEL, MF_BYCOMMAND |
                            (candup ? MF_ENABLED : MF_GRAYED));
         }
@@ -2147,15 +2154,14 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
             if (tab_active >= 0) {
                 Conf *c = conf_copy(tab_list[tab_active]->conf);
                 /*
-                 * A duplicate dials its own connection rather than
-                 * attaching to the original's shared one. Do that via
-                 * the in-memory-only ssh_dial_fresh flag, so that all
-                 * saved settings - including "Share SSH connections
-                 * if possible" - stay exactly as in the source.
-                 * (Reuse of the original connection is what Duplicate
-                 * channel is for.)
+                 * A duplicate always dials its own connection; reusing
+                 * the original's connection is what Duplicate channel
+                 * is for. Only that action sets the in-memory-only
+                 * CONF_ssh_share_pipe, so the duplicate must drop any
+                 * value it inherits from a source tab that was itself
+                 * started that way.
                  */
-                conf_set_bool(c, CONF_ssh_dial_fresh, true);
+                conf_set_str(c, CONF_ssh_share_pipe, "");
                 /* A duplicate is the same session as its original, so
                  * its tab is captioned the same way. */
                 new_session(c, tab_list[tab_active]->tab_name);
@@ -2166,44 +2172,27 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
             return 0;   /* submenu header */
         if ((wParam & ~0xF) == IDM_DUPCHANNEL) {
             /*
-             * Open a new tab reusing the active tab's SSH connection,
-             * in the manner of "Share SSH connections if possible":
-             * the new session is told to take part in connection
-             * sharing (both roles), so when it comes up it attaches
-             * to the existing upstream as a downstream instead of
-             * dialling the server again. Sharing is negotiated by
-             * target (user@host:port), so this only actually reuses
-             * the connection if the original tab was started with
-             * sharing enabled (or is otherwise already listening as
-             * an upstream).
+             * Open a new tab reusing the active tab's SSH connection.
+             * This is the only action that ever does: it asks the
+             * active session for a listening socket name unique to it,
+             * and passes that name to the new launch in
+             * CONF_ssh_share_pipe, so the new session attaches to this
+             * connection as a downstream instead of dialling the
+             * server again. No other launch looks for an existing
+             * connection to reuse.
              */
             if (tab_active >= 0 && tab_list[tab_active]->backend &&
-                tab_list[tab_active]->backend->vt->protocol == PROT_SSH &&
-                conf_get_bool(tab_list[tab_active]->conf,
-                              CONF_ssh_connection_sharing)) {
+                tab_list[tab_active]->backend->vt->protocol == PROT_SSH) {
                 Conf *c = conf_copy(tab_list[tab_active]->conf);
-                conf_set_bool(c, CONF_ssh_connection_sharing, true);
-                conf_set_bool(c, CONF_ssh_connection_sharing_upstream, true);
-                conf_set_bool(c, CONF_ssh_connection_sharing_downstream, true);
                 /*
-                 * The source may be a session opened by Duplicate
-                 * Session, which carries the in-memory dial-fresh
-                 * flag to make its own launch dial a separate
-                 * connection. This launch is meant to reuse the
-                 * source's connection, so clear the flag.
-                 */
-                conf_set_bool(c, CONF_ssh_dial_fresh, false);
-                /*
-                 * Aim this launch at _this_ tab's upstream: ask it for
-                 * a dedicated listening socket name so the new session
-                 * attaches to it, rather than to whichever same-target
-                 * upstream instance the OS happens to hand out. If the
-                 * source isn't itself listening as an upstream (e.g.
-                 * it is a downstream of another connection), fall back
-                 * to the ordinary deterministic name.
+                 * Drop any name inherited from the source tab's own
+                 * configuration (which could only be set if the source
+                 * was itself a duplicate channel), so we never aim the
+                 * new session at the wrong upstream.
                  */
                 char *pipename = backend_get_dedicated_share_pipe(
                     tab_list[tab_active]->backend);
+                conf_set_str(c, CONF_ssh_share_pipe, "");
                 if (pipename) {
                     char *msg = dupprintf(
                         "Duplicate channel: targeting dedicated "
@@ -2214,9 +2203,9 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
                     sfree(pipename);
                 } else {
                     lp_eventlog(&tab_list[tab_active]->logpolicy,
-                                "Duplicate channel: source is not "
-                                "listening as an upstream; falling back "
-                                "to the default shared socket name");
+                                "Duplicate channel: the active session is "
+                                "not offering its connection for reuse, so "
+                                "this tab will make a new connection");
                 }
                 new_session(c, tab_list[tab_active]->tab_name);
             }
@@ -4130,15 +4119,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             if (wgs->conf) {
                 Conf *c = conf_copy(wgs->conf);
                 /*
-                 * A duplicate dials its own connection rather than
-                 * attaching to the original's shared one. Do that via
-                 * the in-memory-only ssh_dial_fresh flag, so that all
-                 * saved settings - including "Share SSH connections
-                 * if possible" - stay exactly as in the source.
-                 * (Reuse of the original connection is what Duplicate
-                 * channel is for.)
+                 * A duplicate always dials its own connection; reusing
+                 * the original's connection is what Duplicate channel
+                 * is for. Only that action sets the in-memory-only
+                 * CONF_ssh_share_pipe, so the duplicate must drop any
+                 * value it inherits from a source tab that was itself
+                 * started that way.
                  */
-                conf_set_bool(c, CONF_ssh_dial_fresh, true);
+                conf_set_str(c, CONF_ssh_share_pipe, "");
                 /* A duplicate is the same session as its original, so
                  * its tab is captioned the same way. */
                 new_session(c, wgs->tab_name);

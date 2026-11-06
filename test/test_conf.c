@@ -861,9 +861,6 @@ void test_simple(void)
     test_file_simple(CONF_xauthfile, "X11AuthFile");
     test_bool_simple(CONF_lport_acceptall, "LocalPortAcceptAll", false);
     test_bool_simple(CONF_rport_acceptall, "RemotePortAcceptAll", false);
-    test_bool_simple(CONF_ssh_connection_sharing, "ConnectionSharing", false);
-    test_bool_simple(CONF_ssh_connection_sharing_upstream, "ConnectionSharingUpstream", true);
-    test_bool_simple(CONF_ssh_connection_sharing_downstream, "ConnectionSharingDownstream", true);
     test_bool_simple(CONF_stamp_utmp, "StampUtmp", true);
     test_bool_simple(CONF_login_shell, "LoginShell", true);
     test_bool_simple(CONF_scrollbar_on_left, "ScrollbarOnLeft", false);

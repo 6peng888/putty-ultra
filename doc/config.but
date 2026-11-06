@@ -2333,65 +2333,48 @@ connection to SSH-1.
 
 \S{config-ssh-sharing} Sharing an SSH connection between PuTTY tools
 
-The controls in this box allow you to configure PuTTY to reuse an
-existing SSH connection, where possible.
-
 The SSH-2 protocol permits you to run multiple data channels over the
 same SSH connection, so that you can log in just once (and do the
 expensive encryption setup just once) and then have more than one
 terminal window open.
 
-Each instance of PuTTY can still run at most one terminal session, but
-using the controls in this box, you can configure PuTTY to check if
-another instance of itself has already connected to the target host,
-and if so, share that instance's SSH connection instead of starting a
-separate new one.
+PuTTY can do this too, but there is nothing to configure: no saved
+session setting has any effect on connection sharing. Reusing an SSH
+connection only ever happens when you ask for it explicitly, by
+selecting \q{Duplicate channel} from the system menu (on Windows).
 
-To enable this feature, just tick the box \q{Share SSH connections if
-possible}. Then, whenever you start up a PuTTY session connecting to a
-particular host, it will try to reuse an existing SSH connection if
-one is available. For example, selecting \q{Duplicate Session} from
-the system menu will launch another session on the same host, and if
-sharing is enabled then it will reuse the existing SSH connection.
+The way it works is:
 
-When this mode is in use, the first PuTTY that connected to a given
-server becomes the \q{upstream}, which means that it is the one
-managing the real SSH connection. All subsequent PuTTYs which reuse
-the connection are referred to as \q{downstreams}: they do not connect
-to the real server at all, but instead connect to the upstream PuTTY
-via local inter-process communication methods.
+\b Every session which makes its own SSH connection also offers that
+connection for reuse. Such a session is called an \q{upstream}: it is
+the one managing the real SSH connection, and it cannot terminate
+until all the sessions reusing it have closed. (This is similar to the
+effect you get with port forwarding or X11 forwarding, in which a
+PuTTY whose terminal session has already finished will still remain
+open so as to keep serving forwarded connections.)
 
-For this system to be activated, \e{both} the upstream and downstream
-instances of PuTTY must have the sharing option enabled.
+\b A session started in any other way - \q{New Session}, \q{Duplicate
+Session}, a saved session, or a command line - \e{never} reuses an
+existing SSH connection. It always dials the server itself. In
+particular, \q{Duplicate Session} gives you a second, independent
+connection to the same host, which is what you want if you need to
+authenticate separately or keep the two sessions independent.
 
-The upstream PuTTY can therefore not terminate until all its
-downstreams have closed. This is similar to the effect you get with
-port forwarding or X11 forwarding, in which a PuTTY whose terminal
-session has already finished will still remain open so as to keep
-serving forwarded connections.
+\b Only \q{Duplicate channel} reuses a connection. It opens a new
+terminal session attached to the connection of the session you
+invoked it from, instead of dialling the server again. It targets that
+one session specifically, so it does not matter whether any other
+session happens to be connected to the same host.
 
-In case you need to configure this system in more detail, there are
-two additional checkboxes which allow you to specify whether a
-particular PuTTY can act as an upstream or a downstream or both.
-(These boxes only take effect if the main \q{Share SSH connections if
-possible} box is also ticked.) By default both of these boxes are
-ticked, so that multiple PuTTYs started from the same configuration
-will designate one of themselves as the upstream and share a single
-connection; but if for some reason you need a particular PuTTY
-configuration \e{not} to be an upstream (e.g. because you definitely
-need it to close promptly) or not to be a downstream (e.g. because it
-needs to do its own authentication using a special private key) then
-you can untick one or the other of these boxes.
+Sessions which reuse another one's connection are referred to as
+\q{downstreams}: they do not connect to the real server at all, but
+instead connect to the upstream PuTTY via local inter-process
+communication methods.
 
-I have referred to \q{PuTTY} throughout the above discussion, but all
-the other PuTTY tools which make SSH connections can use this
-mechanism too. For example, if PSCP or PSFTP loads a configuration
-with sharing enabled, then it can act as a downstream and use an
-existing SSH connection set up by an instance of GUI PuTTY. The one
-special case is that PSCP and PSFTP will \e{never} act as upstreams.
-
-It is possible to test programmatically for the existence of a live
-upstream using Plink. See \k{plink-option-shareexists}.
+If you need a particular session not to offer its connection for
+reuse - for example, because you definitely need it to close promptly
+- start it with the \c{\-noshare} option (see
+\k{using-cmdline-share-noshare}).
 
 \H{config-ssh-kex} The Kex panel
 

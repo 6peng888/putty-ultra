@@ -225,12 +225,12 @@ prompt.)
 
 \dt \cw{\-noshare}
 
-\dd Don't test and try to share an existing connection, always make
-a new connection.
+\dd Don't offer this connection for reuse by a \q{Duplicate channel}
+from the GUI.
 
 \dt \cw{\-share}
 
-\dd Test and try to share an existing connection.
+\dd Offer this connection for reuse (this is the default).
 
 \dt \cw{\-hostkey} \e{key}
 

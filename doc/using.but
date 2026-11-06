@@ -1141,22 +1141,21 @@ the main network connection. See \k{config-preconn-hook} for more
 details.
 
 \S2{using-cmdline-share-noshare} \i\c{\-share}, \i\c{\-noshare}:
-enable/disable connection sharing
+control whether this connection may be reused
 
-These options control whether SSH connection sharing is attempted.
+There is no saved-session setting for SSH connection sharing, and no
+PuTTY session ever reuses another one's SSH connection unless you ask
+for it with \q{Duplicate channel}. These options only control the
+other side of the arrangement: whether the connection made by this
+invocation is itself offered for reuse.
+
+With \c{\-share} (the default), the new connection is offered for
+reuse, so that a \q{Duplicate channel} launched from that session can
+attach to it. With \c{\-noshare}, this connection will not be offered
+for reuse.
+
 See \k{config-ssh-sharing} for more information about SSH connection
-sharing. These options are equivalent to the \q{Share SSH connections
-if possible} checkbox in the GUI configuration.
-
-With \c{\-share}, a PuTTY tool will check to see if there's an
-existing \q{upstream} for this host. If there is, then the new session
-will connect via that upstream. If there isn't, the new session will
-\e{become} an upstream for future connections (unless \c{\-share}
-has been given as an option to the file transfer tools, PSCP and PSFTP,
-which never act as upstreams).
-
-With \c{\-noshare}, this connection will not participate in connection
-sharing (either as an upstream or a downstream).
+sharing.
 
 (This option is only meaningful with the SSH-2 protocol.)
 

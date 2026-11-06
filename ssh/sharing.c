@@ -518,8 +518,9 @@ void sharestate_free(ssh_sharing_state *sharestate)
 {
     struct ssh_sharing_connstate *cs;
 
-    /* A dial-fresh upstream has a dedicated listener but no master
-     * socket to clean up. */
+    /* An ordinary upstream has a dedicated listener, and possibly no
+     * per-target shared name to clean up (on platforms where only the
+     * dedicated listener is used). */
     if (sharestate->sockname)
         platform_ssh_share_cleanup(sharestate->sockname);
 
@@ -546,9 +547,9 @@ void sharestate_free(ssh_sharing_state *sharestate)
 char *share_ensure_dedicated_listener(ssh_sharing_state *sharestate)
 {
     /*
-     * Only an upstream can accept targeted downstreams; callers
-     * should fall back to the ordinary deterministic attach if this
-     * sharing state is not carrying a connection.
+     * Only an upstream can accept targeted downstreams; a downstream
+     * (or a launch that isn't sharing at all) has nothing to offer,
+     * and the caller must not open a reusing session.
      */
     if (!sharestate->is_upstream)
         return NULL;
@@ -1884,8 +1885,22 @@ static void share_listen_closing(Plug *plug, PlugCloseType type,
         container_of(plug, ssh_sharing_state, plug);
     if (type != PLUGCLOSE_NORMAL)
         log_general(sharestate, "listening socket: %s", error_msg);
-    sk_close(sharestate->listensock);
-    sharestate->listensock = NULL;
+    /*
+     * Both listeners share this plug, so either of them can be the
+     * one reporting this. Drop whichever ones we still hold: the one
+     * that is closing is no longer usable, and the other is of little
+     * use on its own (a session's connection is offered for reuse
+     * through the dedicated listener, and losing it only means a
+     * later duplicate channel has to make a new connection).
+     */
+    if (sharestate->listensock) {
+        sk_close(sharestate->listensock);
+        sharestate->listensock = NULL;
+    }
+    if (sharestate->dedicated_listensock) {
+        sk_close(sharestate->dedicated_listensock);
+        sharestate->dedicated_listensock = NULL;
+    }
 }
 
 static void share_send_verstring(ssh_sharing_connstate *cs)
@@ -2089,14 +2104,27 @@ void ssh_connshare_provide_connlayer(ssh_sharing_state *sharestate,
 }
 
 /*
- * Init function for connection sharing. We either open a listening
- * socket and become an upstream, or connect to an existing one and
- * become a downstream, or do neither. We are responsible for deciding
- * which of these to do (including checking the Conf to see if
- * connection sharing is even enabled in the first place). If we
- * become a downstream, we return the Socket with which we connected
- * to the upstream; otherwise (whether or not we have established an
- * upstream) we return NULL.
+ * Init function for connection sharing.
+ *
+ * A launch has two possible roles:
+ *
+ *  - upstream: offer this session's SSH connection for a later
+ *    "Duplicate channel" to reuse. Every session that is capable of
+ *    it takes this role, so that the GUI always has a specific
+ *    connection to point a new duplicate channel at.
+ *
+ *  - downstream: reuse another session's SSH connection instead of
+ *    dialling the server. Exactly one kind of launch does this: the
+ *    GUI's "Duplicate channel", which records the platform socket
+ *    name of the upstream it wants in CONF_ssh_share_pipe. No other
+ *    launch ever looks for an existing connection to attach to -
+ *    "New Session" and "Duplicate Session" always dial their own.
+ *
+ * So: if CONF_ssh_share_pipe is set, we attach to that one upstream
+ * and return the Socket we connected with. Otherwise we may set up a
+ * dedicated listening socket for our own connection and return NULL,
+ * just as if we had done nothing, because the caller only needs to
+ * know when we have become a downstream.
  */
 Socket *ssh_connection_sharing_init(
     const char *host, int port, Conf *conf, LogContext *logctx,
@@ -2108,39 +2136,45 @@ Socket *ssh_connection_sharing_init(
     char *sockname;
     Socket *sock, *toret = NULL;
     struct ssh_sharing_state *sharestate;
+    const char *sharepipe = conf_get_str(conf, CONF_ssh_share_pipe);
+    bool attach_to_upstream = (sharepipe && *sharepipe);
 
-    if (!conf_get_bool(conf, CONF_ssh_connection_sharing))
-        return NULL;                   /* do not share anything */
-    can_upstream = share_can_be_upstream &&
-        conf_get_bool(conf, CONF_ssh_connection_sharing_upstream);
-    can_downstream = share_can_be_downstream &&
-        conf_get_bool(conf, CONF_ssh_connection_sharing_downstream) &&
-        /* The GUI can ask for one launch to dial its own connection
-         * even though sharing is configured (see "Duplicate Session"):
-         * suppress only the downstream attach, not sharing itself. */
-        !conf_get_bool(conf, CONF_ssh_dial_fresh);
+    if (attach_to_upstream) {
+        /*
+         * We were started by "Duplicate channel", aimed at one
+         * specific upstream. Only a downstream attach is possible;
+         * this launch never becomes an upstream in its own right,
+         * because it is not making a connection of its own to share.
+         */
+        can_upstream = false;
+        can_downstream = share_can_be_downstream;
+    } else {
+        /*
+         * Every other kind of launch - "New Session", "Duplicate
+         * Session", a saved session, a command line - dials its own
+         * connection and never reuses an existing one. It does let
+         * others reuse its connection, though.
+         */
+        can_upstream = share_can_be_upstream &&
+            conf_get_bool(conf, CONF_ssh_share_upstream);
+        can_downstream = false;
+    }
     if (!can_upstream && !can_downstream)
         return NULL;
 
-    if (conf_get_bool(conf, CONF_ssh_dial_fresh)) {
+    if (!can_downstream) {
         /*
-         * This launch (the GUI's "Duplicate Session") deliberately
-         * dials its own connection, so it must not attach downstream
-         * to an existing upstream. Nor can it claim the ordinary
-         * shared name: an upstream for the same target very likely
-         * holds it already, and the first pipe instance claims the
-         * name exclusively, so creating a listener there would fail
-         * outright and leave this session with no sharing at all.
-         * Give it only a dedicated listener instead, whose unique
-         * name the GUI hands to "Duplicate channel" launches so that
-         * they attach to this connection specifically.
+         * Dial our own connection, and publish a listening socket for
+         * it under a name unique to this session, so that a later
+         * "Duplicate channel" from this session can attach to _this_
+         * connection specifically. (The per-target shared name used
+         * by platform_ssh_share() would not do: it can only be
+         * claimed exclusively, so several sessions to the same target
+         * could not all offer themselves for reuse.)
          */
         Socket *sock = NULL;
         char *err = NULL;
         char *pipename;
-
-        if (!can_upstream)
-            return NULL;               /* nothing to share: just dial */
 
         sharestate = snew(struct ssh_sharing_state);
         memset(sharestate, 0, sizeof(*sharestate));
@@ -2172,8 +2206,10 @@ Socket *ssh_connection_sharing_init(
     sockname = ssh_share_sockname(host, port, conf);
 
     /*
-     * Create a data structure for the listening plug if we turn out
-     * to be an upstream.
+     * Create a data structure in case the platform routine wants to
+     * make us an upstream after all (it can, on platforms where the
+     * targeted attach is implemented by falling back to the ordinary
+     * per-target name).
      */
     sharestate = snew(struct ssh_sharing_state);
     sharestate->plug.vt = &ssh_sharing_listen_plugvt;
@@ -2185,10 +2221,10 @@ Socket *ssh_connection_sharing_init(
 
     /*
      * Now hand off to a per-platform routine that either connects to
-     * an existing upstream (using 'ssh' as the plug), establishes our
-     * own upstream (using 'sharestate' as the plug), or forks off a
-     * separate upstream and then connects to that. It will return a
-     * code telling us which kind of socket it put in 'sock'.
+     * the upstream we were aimed at (using 'ssh' as the plug), or
+     * establishes our own upstream (using 'sharestate' as the plug).
+     * It will return a code telling us which kind of socket it put in
+     * 'sock'.
      */
     sock = NULL;
     logtext = ds_err = us_err = NULL;

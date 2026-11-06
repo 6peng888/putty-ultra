@@ -684,13 +684,13 @@ int cmdline_process_param(CmdlineArg *arg, CmdlineArg *nextarg,
         RETURN(1);
         UNAVAILABLE_IN(TOOLTYPE_NONNETWORK);
         SAVEABLE(0);
-        conf_set_bool(conf, CONF_ssh_connection_sharing, true);
+        conf_set_bool(conf, CONF_ssh_share_upstream, true);
     }
     if (!strcmp(p, "-noshare")) {
         RETURN(1);
         UNAVAILABLE_IN(TOOLTYPE_NONNETWORK);
         SAVEABLE(0);
-        conf_set_bool(conf, CONF_ssh_connection_sharing, false);
+        conf_set_bool(conf, CONF_ssh_share_upstream, false);
     }
     if (!strcmp(p, "-A")) {
         RETURN(1);

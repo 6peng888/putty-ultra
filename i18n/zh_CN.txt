@@ -378,11 +378,6 @@ Remote command:=远程命令：
 Protocol options=协议选项
 Don't start a shell or command at all=完全不启动 shell 或命令
 Enable compression=启用压缩
-Sharing an SSH connection between PuTTY tools=在 PuTTY 工具之间共享 SSH 连接
-Share SSH connections if possible=尽可能共享 SSH 连接
-Permitted roles in a shared connection:=共享连接中允许的角色：
-Upstream (connecting to the real server)=上游（连接到真实服务器）
-Downstream (connecting to the upstream PuTTY)=下游（连接到上游 PuTTY）
 SSH protocol version:=SSH 协议版本：
 1 (INSECURE)=1（不安全）
 

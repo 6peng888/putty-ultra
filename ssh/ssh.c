@@ -789,10 +789,11 @@ static char *connect_to_host(
 
     /*
      * Try connection-sharing, in case that means we don't open a
-     * socket after all. ssh_connection_sharing_init will connect to a
-     * previously established upstream if it can, and failing that,
-     * establish a listening socket for _us_ to be the upstream. In
-     * the latter case it will return NULL just as if it had done
+     * socket after all. Only a launch aimed at a specific upstream by
+     * "Duplicate channel" does that; every other launch establishes
+     * its own listening socket instead, so that a later duplicate
+     * channel can reuse _this_ connection. In the latter case
+     * ssh_connection_sharing_init returns NULL just as if it had done
      * nothing, because here we only need to care if we're a
      * downstream and need to do our connection setup differently.
      */

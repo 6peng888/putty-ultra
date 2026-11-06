@@ -41,6 +41,7 @@ add_sources_from_current_dir(utils
   utils/version.c
   utils/win_strerror.c
   ../utils/i18n.c
+  i18n.c
   unicode.c)
 if(NOT HAVE_STRTOUMAX)
   add_sources_from_current_dir(utils utils/strtoumax.c)
@@ -64,7 +65,7 @@ add_sources_from_current_dir(otherbackends
 add_sources_from_current_dir(agent
   agent-client.c)
 add_sources_from_current_dir(guiterminal
-  dialog.c controls.c config.c printing.c jump-list.c sizetip.c i18n.c)
+  dialog.c controls.c config.c printing.c jump-list.c sizetip.c)
 add_dependencies(guiterminal generated_licence_h) # dialog.c uses licence.h
 
 # This object awkwardly needs to live in the network library as well

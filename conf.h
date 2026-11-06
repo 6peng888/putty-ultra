@@ -284,41 +284,29 @@ CONF_OPTION(ssh_share_pipe,
     /*
      * Set internally by the Windows GUI's "Duplicate channel" to the
      * platform socket name of one specific upstream's listening
-     * socket, so that this launch attaches to _that_ upstream rather
-     * than to whichever same-target upstream instance the OS happens
-     * to hand out. Never set by user configuration, or loaded,
+     * socket, so that this launch attaches to _that_ upstream.
+     *
+     * This is the only thing that ever makes a launch reuse an
+     * existing SSH connection: every other way of starting a session
+     * dials its own. Never set by user configuration, or loaded,
      * saved, or shown.
      */
     VALUE_TYPE(STR),
     DEFAULT_STR(""),
     NOT_SAVED,
 )
-CONF_OPTION(ssh_connection_sharing,
-    VALUE_TYPE(BOOL),
-    DEFAULT_BOOL(false),
-    SAVE_KEYWORD("ConnectionSharing"),
-)
-CONF_OPTION(ssh_connection_sharing_upstream,
-    VALUE_TYPE(BOOL),
-    DEFAULT_BOOL(true),
-    SAVE_KEYWORD("ConnectionSharingUpstream"),
-)
-CONF_OPTION(ssh_connection_sharing_downstream,
-    VALUE_TYPE(BOOL),
-    DEFAULT_BOOL(true),
-    SAVE_KEYWORD("ConnectionSharingDownstream"),
-)
-CONF_OPTION(ssh_dial_fresh,
+CONF_OPTION(ssh_share_upstream,
     /*
-     * Set internally by the Windows GUI's "Duplicate Session" to make
-     * this one launch dial its own connection instead of attaching to
-     * an existing shared upstream, without changing any of the saved
-     * settings (in particular "Share SSH connections if possible"
-     * keeps whatever value it had). Never set by user configuration,
-     * or loaded, saved, or shown.
+     * Whether this launch may act as an upstream, i.e. let a later
+     * "Duplicate channel" reuse its SSH connection.
+     *
+     * Enabled by default, and there is deliberately no user-visible
+     * setting for it. Only ever set internally, by the SSH-over-SSH
+     * proxy, whose single-channel connection must not be advertised
+     * for reuse. Never loaded, saved, or shown.
      */
     VALUE_TYPE(BOOL),
-    DEFAULT_BOOL(false),
+    DEFAULT_BOOL(true),
     NOT_SAVED,
 )
 CONF_OPTION(ssh_manual_hostkeys,

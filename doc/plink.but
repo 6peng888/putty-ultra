@@ -81,8 +81,8 @@ use Plink:
 \c   -agent    enable use of Pageant
 \c   -no-trivial-auth
 \c             disconnect if SSH authentication succeeds trivially
-\c   -noshare  disable use of connection sharing
-\c   -share    enable use of connection sharing
+\c   -noshare  don't offer this connection for reuse
+\c   -share    offer this connection for reuse
 \c   -hostkey keyid
 \c             manually specify a host key (may be repeated)
 \c   -sanitise-stderr, -sanitise-stdout, -no-sanitise-stderr, -no-sanitise-stdout
