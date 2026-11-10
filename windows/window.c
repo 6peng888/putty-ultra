@@ -4352,9 +4352,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                 FontSpec *prev_font = conf_get_fontspec(prev_conf,
                                                         CONF_font);
 
-                if (!strcmp(font->name, prev_font->name) ||
-                    !strcmp(conf_get_str(wgs->conf, CONF_line_codepage),
-                            conf_get_str(prev_conf, CONF_line_codepage)) ||
+                /*
+                 * Only a change that really affects the fonts may force
+                 * them to be reloaded. These tests used to be inverted
+                 * for the font name and the line codepage (comparing for
+                 * equality rather than difference), so every single
+                 * Apply - even one that changed nothing at all - threw
+                 * the fonts away and rebuilt them, and re-fitted the
+                 * window to the character grid as a side effect.
+                 */
+                if (strcmp(font->name, prev_font->name) ||
+                    strcmp(conf_get_str(wgs->conf, CONF_line_codepage),
+                           conf_get_str(prev_conf, CONF_line_codepage)) ||
                     font->isbold != prev_font->isbold ||
                     font->height != prev_font->height ||
                     font->charset != prev_font->charset ||
@@ -4364,6 +4373,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                     conf_get_int(prev_conf, CONF_vtmode) ||
                     conf_get_int(wgs->conf, CONF_bold_style) !=
                     conf_get_int(prev_conf, CONF_bold_style) ||
+                    conf_get_int(wgs->conf, CONF_window_border) !=
+                    conf_get_int(prev_conf, CONF_window_border) ||
                     resize_action == RESIZE_DISABLED ||
                     resize_action == RESIZE_EITHER ||
                     resize_action != conf_get_int(prev_conf,
@@ -4371,8 +4382,30 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                     init_lvl = 2;
             }
 
+            /*
+             * Nothing that affects the layout changed, so leave the
+             * window exactly as it is: an Apply that changed nothing
+             * must be a no-op on screen, not a re-fit of the terminal.
+             */
+            if (init_lvl > 1) {
+                reset_window(wgs, init_lvl);
+
+                /*
+                 * The terminal window is a child of the tab frame, which
+                 * owns the geometry of every session, so the resize
+                 * above (to the exact character grid, as reset_window
+                 * always does) must be undone by handing the window back
+                 * to the frame: that restores the terminal to the full
+                 * frame area, and the resulting WM_SIZE re-fits the
+                 * terminal (and the server-side pty size) to its new
+                 * font properly. Without this the session's panel would
+                 * come out slightly smaller than the frame every time
+                 * settings were applied.
+                 */
+                tab_relayout();
+            }
+
             InvalidateRect(hwnd, NULL, true);
-            reset_window(wgs, init_lvl);
 
             conf_free(prev_conf);
             break;
