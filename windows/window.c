@@ -154,6 +154,8 @@ static int message_box_i18n(HWND hwnd, const char *text, const char *caption,
 static WinGuiSeat *frame_current_seat(void);
 static void frame_sync_scrollbars(void);
 static bool frame_corner_hotspot(POINT *pt);
+static HWND frame_create(int width, int height);
+static void save_frame_placement(void);
 static void wgs_cleanup(WinGuiSeat *wgs);
 
 static struct sesslist sesslist;       /* for saved-session menu */
@@ -205,6 +207,12 @@ static int g_strip_h = 0;            /* height of the whole tab strip */
 static bool g_relayout_pending = false;  /* WM_TAB_RELAYOUT already posted */
 static HFONT g_tab_font = NULL;      /* label font, scaled to the DPI */
 static int g_tab_font_dpi = 0;       /* DPI g_tab_font was built for */
+
+/*
+ * Set by frame_create if the remembered geometry says the frame should
+ * come up maximised, and read back when the frame is first shown.
+ */
+static bool g_frame_start_maximised = false;
 
 /*
  * State of a tab drag, i.e. the left button held down on a tab. The
@@ -660,30 +668,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 
     {
     /*
-     * Create the tabbed frame window that hosts all sessions.
+     * Create the tabbed frame window that hosts all sessions, at the
+     * size and position it had when the application was last closed.
      */
     if (!tab_frame_hwnd) {
-        WNDCLASSW wcf;
-        memset(&wcf, 0, sizeof(wcf));
-        wcf.style = 0;
-        wcf.lpfnWndProc = FrameWndProc;
-        wcf.hInstance = hinst;
-        wcf.hIcon = LoadIcon(hinst, MAKEINTRESOURCE(IDI_MAINICON));
-        wcf.hCursor = LoadCursor(NULL, IDC_ARROW);
-        wcf.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-        wcf.lpszClassName = L"PuTTYTabFrame";
-        RegisterClassW(&wcf);
-        tab_frame_hwnd = CreateWindowExW(
-            0, L"PuTTYTabFrame", L"PuTTY",
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-            CW_USEDEFAULT, CW_USEDEFAULT,
-            guess_width, guess_height + TAB_H,
-            NULL, NULL, inst, NULL);
+        tab_frame_hwnd = frame_create(guess_width, guess_height + TAB_H);
         if (!tab_frame_hwnd)
             modalfatalbox("Unable to create frame window: %s",
                           win_strerror(GetLastError()));
         frame_build_menu();
-
     }
 
         int winmode = WS_CHILD | WS_VSCROLL;
@@ -945,6 +938,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     UpdateWindow(wgs->term_hwnd);
 
     gui_terminal_ready(wgs->term_hwnd, &wgs->seat, wgs->backend);
+
+    /*
+     * Come up maximised if that is how the application was closed, but
+     * only when the shell hasn't asked for some other initial state
+     * (such as starting minimised).
+     */
+    if (g_frame_start_maximised &&
+        (show == SW_SHOWNORMAL || show == SW_SHOWDEFAULT))
+        show = SW_SHOWMAXIMIZED;
 
     ShowWindow(tab_frame_hwnd, show);
     SetForegroundWindow(tab_frame_hwnd);
@@ -1730,6 +1732,200 @@ static void tab_strike_through(HDC hdc, const wchar_t *label,
     DeleteObject(pen);
 }
 
+/*
+ * The geometry of the frame - where it sits on the screen and how big it
+ * is - is remembered from one run of PuTTY to the next, so that starting
+ * the application again reopens the window where the user left it. The
+ * frame is the window that owns the position and size of the whole
+ * application (the terminal windows are children of it and simply fill
+ * it), so this is the geometry worth keeping.
+ *
+ * The restored rectangle and the maximised state are stored separately,
+ * rather than just the current window rectangle, because the restored
+ * rectangle of a maximised window is the size it would go back to if it
+ * were un-maximised: that is the size to create the window at, and then
+ * the flag says whether to maximise it afterwards.
+ */
+#define FRAME_POS_REG_KEY PUTTY_REG_POS "\\WindowPosition"
+
+static bool load_frame_placement(RECT *rect, bool *maximised)
+{
+    HKEY rkey;
+    DWORD x, y, w, h, maxed = 0;
+    bool ok;
+
+    rkey = open_regkey_ro(HKEY_CURRENT_USER, FRAME_POS_REG_KEY);
+    if (!rkey)
+        return false;
+
+    ok = (get_reg_dword(rkey, "X", &x) &&
+          get_reg_dword(rkey, "Y", &y) &&
+          get_reg_dword(rkey, "Width", &w) &&
+          get_reg_dword(rkey, "Height", &h));
+    get_reg_dword(rkey, "Maximised", &maxed);
+    close_regkey(rkey);
+
+    /*
+     * Refuse anything that obviously is not a window: a geometry left
+     * behind by a corrupt value must not stop us starting up.
+     */
+    if (!ok || w < 200 || h < 100 || w > 32767 || h > 32767)
+        return false;
+
+    rect->left = (LONG)x;
+    rect->top = (LONG)y;
+    rect->right = rect->left + (LONG)w;
+    rect->bottom = rect->top + (LONG)h;
+    *maximised = (maxed != 0);
+    return true;
+}
+
+/*
+ * Make sure a remembered rectangle is somewhere the user can actually
+ * reach it. Monitors get unplugged or rearranged between runs, and a
+ * window restored onto one that no longer exists would be invisible, so
+ * pull it onto the nearest monitor if too little of it would be visible.
+ * A window that is still substantially on screen is left exactly where
+ * the user put it, even if it straddles two monitors.
+ */
+static void clamp_frame_rect(RECT *rect)
+{
+#if defined(MONITOR_DEFAULTTONEAREST) && !defined(NO_MULTIMON)
+    MONITORINFO mi;
+    POINT centre;
+    RECT vis;
+    int w, h, x, y;
+
+    if (!p_MonitorFromPoint || !p_GetMonitorInfoA)
+        return;
+
+    centre.x = (rect->left + rect->right) / 2;
+    centre.y = (rect->top + rect->bottom) / 2;
+
+    mi.cbSize = sizeof(mi);
+    if (!p_GetMonitorInfoA(p_MonitorFromPoint(centre, MONITOR_DEFAULTTONEAREST),
+                          &mi))
+        return;
+
+    /* Still reachable: enough of it is on the monitor to grab hold of. */
+    if (IntersectRect(&vis, rect, &mi.rcWork) &&
+        vis.right - vis.left >= 100 && vis.bottom - vis.top >= 40)
+        return;
+
+    w = rect->right - rect->left;
+    h = rect->bottom - rect->top;
+    x = rect->left;
+    y = rect->top;
+
+    /*
+     * As when PuTTY sizes a window of its own, prefer getting the top
+     * left corner in bounds: a window larger than the monitor cannot be
+     * made to fit anyway.
+     */
+    if (x + w > mi.rcWork.right)
+        x = mi.rcWork.right - w;
+    if (x < mi.rcWork.left)
+        x = mi.rcWork.left;
+    if (y + h > mi.rcWork.bottom)
+        y = mi.rcWork.bottom - h;
+    if (y < mi.rcWork.top)
+        y = mi.rcWork.top;
+
+    rect->left = x;
+    rect->top = y;
+    rect->right = x + w;
+    rect->bottom = y + h;
+#endif
+}
+
+/*
+ * Create the frame window, at the size guessed from the session's rows
+ * and columns unless a geometry was remembered from the last run, in
+ * which case that wins.
+ */
+static HWND frame_create(int width, int height)
+{
+    static bool class_registered = false;
+    RECT saved;
+    bool maximised = false;
+    int x = CW_USEDEFAULT, y = CW_USEDEFAULT;
+
+    if (!class_registered) {
+        WNDCLASSW wcf;
+        memset(&wcf, 0, sizeof(wcf));
+        wcf.style = 0;
+        wcf.lpfnWndProc = FrameWndProc;
+        wcf.hInstance = hinst;
+        wcf.hIcon = LoadIcon(hinst, MAKEINTRESOURCE(IDI_MAINICON));
+        wcf.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wcf.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wcf.lpszClassName = L"PuTTYTabFrame";
+        RegisterClassW(&wcf);
+        class_registered = true;
+    }
+
+    if (load_frame_placement(&saved, &maximised)) {
+        clamp_frame_rect(&saved);
+        x = saved.left;
+        y = saved.top;
+        width = saved.right - saved.left;
+        height = saved.bottom - saved.top;
+        g_frame_start_maximised = maximised;
+    }
+
+    return CreateWindowExW(0, L"PuTTYTabFrame", L"PuTTY",
+                           WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                           x, y, width, height,
+                           NULL, NULL, hinst, NULL);
+}
+
+/*
+ * Remember the geometry of the frame so that the next run can put the
+ * window back where it is now. Called while the frame still exists, from
+ * its WM_DESTROY and from cleanup_exit (whichever comes first: the frame
+ * is not destroyed at all when the last session closes).
+ */
+static void save_frame_placement(void)
+{
+    WINDOWPLACEMENT wp;
+    HKEY rkey;
+
+    if (!tab_frame_hwnd || !IsWindow(tab_frame_hwnd))
+        return;
+
+    if (g_is_full_screen) {
+        /*
+         * In full screen the frame covers the whole monitor, which is
+         * not a geometry worth remembering; keep the windowed one that
+         * was saved on the way in, so that leaving the application from
+         * full screen does not make the next run start full-screen
+         * sized with no title bar.
+         */
+        wp = g_saved_placement;
+    } else {
+        wp.length = sizeof(wp);
+        if (!GetWindowPlacement(tab_frame_hwnd, &wp))
+            return;
+    }
+
+    /* A minimised window still reports its restored rectangle, which is
+     * the right thing to come back to. */
+    rkey = create_regkey(HKEY_CURRENT_USER, FRAME_POS_REG_KEY);
+    if (!rkey)
+        return;
+
+    put_reg_dword(rkey, "X", (DWORD)wp.rcNormalPosition.left);
+    put_reg_dword(rkey, "Y", (DWORD)wp.rcNormalPosition.top);
+    put_reg_dword(rkey, "Width",
+                  (DWORD)(wp.rcNormalPosition.right -
+                          wp.rcNormalPosition.left));
+    put_reg_dword(rkey, "Height",
+                  (DWORD)(wp.rcNormalPosition.bottom -
+                          wp.rcNormalPosition.top));
+    put_reg_dword(rkey, "Maximised", wp.showCmd == SW_SHOWMAXIMIZED);
+    close_regkey(rkey);
+}
+
 static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
                                      WPARAM wParam, LPARAM lParam)
 {
@@ -2297,6 +2493,15 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
 
       case WM_DESTROY:
 
+        /*
+         * Remember the window's geometry for the next run, while the
+         * window still exists to be asked. (When the last session is
+         * closed rather than the window, the frame is never destroyed
+         * and cleanup_exit does this instead.)
+         */
+        save_frame_placement();
+        tab_frame_hwnd = NULL;
+
         if (!g_quitting) {
             g_quitting = true;
             PostQuitMessage(0);
@@ -2427,25 +2632,11 @@ static void new_session_finish(WinGuiSeat *wgs)
 
     {
     /*
-     * Create the tabbed frame window that hosts all sessions.
+     * Create the tabbed frame window that hosts all sessions, at the
+     * size and position it had when the application was last closed.
      */
     if (!tab_frame_hwnd) {
-        WNDCLASSW wcf;
-        memset(&wcf, 0, sizeof(wcf));
-        wcf.style = 0;
-        wcf.lpfnWndProc = FrameWndProc;
-        wcf.hInstance = hinst;
-        wcf.hIcon = LoadIcon(hinst, MAKEINTRESOURCE(IDI_MAINICON));
-        wcf.hCursor = LoadCursor(NULL, IDC_ARROW);
-        wcf.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-        wcf.lpszClassName = L"PuTTYTabFrame";
-        RegisterClassW(&wcf);
-        tab_frame_hwnd = CreateWindowExW(
-            0, L"PuTTYTabFrame", L"PuTTY",
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-            CW_USEDEFAULT, CW_USEDEFAULT,
-            guess_width, guess_height + TAB_H,
-            NULL, NULL, hinst, NULL);
+        tab_frame_hwnd = frame_create(guess_width, guess_height + TAB_H);
         if (!tab_frame_hwnd)
             modalfatalbox("Unable to create frame window: %s",
                           win_strerror(GetLastError()));
@@ -2787,6 +2978,15 @@ static void setup_clipboards(Terminal *term, Conf *conf)
  */
 void cleanup_exit(int code)
 {
+
+    /*
+     * Remember the frame's geometry for the next run. This is the exit
+     * path taken when the last session closed and ended the application
+     * without the frame window itself ever being destroyed (which is
+     * where the geometry is normally saved); if the frame has already
+     * gone, this does nothing.
+     */
+    save_frame_placement();
 
     /*
      * Clean up.
