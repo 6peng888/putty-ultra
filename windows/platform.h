@@ -493,6 +493,12 @@ struct dlgparam {
     bool ended;                        /* has the dialog been ended? */
     int endresult;                     /* and if so, what was the result? */
     bool fixed_pitch_fonts;            /* are we constrained to fixed fonts? */
+    /*
+     * Tree list boxes only: the folder whose contents the user has just
+     * asked to have opened (the `Batch open' context menu entry). Set
+     * while the resulting EVENT_OPEN_FOLDER handler is running.
+     */
+    char *tree_folder;
 };
 
 /*

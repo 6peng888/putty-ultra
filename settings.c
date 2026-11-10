@@ -719,6 +719,50 @@ void settings_forget_loaded_session_name(void)
     loaded_session_name = NULL;
 }
 
+/*
+ * A queue of saved sessions that the configuration box wants opened in
+ * addition to the one it is about to launch, because the user picked
+ * `Batch open' on a folder in the session tree. The front end pops them
+ * one at a time, opening each in its own window or tab. The list is
+ * normally empty; the box fills it in only when it is about to close.
+ */
+static char **batch_open_names = NULL;
+static size_t batch_open_n = 0, batch_open_size = 0;
+
+void settings_batch_open_clear(void)
+{
+    size_t i;
+
+    for (i = 0; i < batch_open_n; i++)
+        sfree(batch_open_names[i]);
+    sfree(batch_open_names);
+    batch_open_names = NULL;
+    batch_open_n = batch_open_size = 0;
+}
+
+void settings_batch_open_add(const char *name)
+{
+    sgrowarray(batch_open_names, batch_open_size, batch_open_n);
+    batch_open_names[batch_open_n++] = dupstr(name);
+}
+
+bool settings_batch_open_pop(char **name)
+{
+    if (batch_open_n == 0)
+        return false;
+
+    *name = batch_open_names[0];
+    memmove(batch_open_names, batch_open_names + 1,
+            (batch_open_n - 1) * sizeof(*batch_open_names));
+    batch_open_n--;
+    if (batch_open_n == 0) {
+        sfree(batch_open_names);
+        batch_open_names = NULL;
+        batch_open_size = 0;
+    }
+    return true;
+}
+
 bool load_settings(const char *section, Conf *conf)
 {
     settings_r *sesskey;

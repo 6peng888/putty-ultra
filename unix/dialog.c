@@ -660,6 +660,15 @@ int dlg_listbox_getid(dlgcontrol *ctrl, dlgparam *dp, int index)
     return -1;                         /* placate dataflow analysis */
 }
 
+/*
+ * The GTK list boxes here don't offer a folder context menu, so there
+ * is never an EVENT_OPEN_FOLDER in progress and no folder to report.
+ */
+const char *dlg_listbox_get_folder(dlgcontrol *ctrl, dlgparam *dp)
+{
+    return NULL;
+}
+
 /* dlg_listbox_index returns <0 if no single element is selected. */
 int dlg_listbox_index(dlgcontrol *ctrl, dlgparam *dp)
 {

@@ -143,6 +143,7 @@ static int tab_find(WinGuiSeat *wgs);
 static void frame_set_title(WinGuiSeat *wgs);
 static void frame_build_saved_menu(void);
 static void open_new_session_dialog(void);
+static void open_pending_batch_sessions(void);
 static void close_tab(int idx);
 static void frame_build_menu(void);
 static void menu_add(HMENU menu, UINT flags, UINT_PTR id, const char *text);
@@ -948,6 +949,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     ShowWindow(tab_frame_hwnd, show);
     SetForegroundWindow(tab_frame_hwnd);
 
+    /*
+     * If the startup configuration box was used to ask for a whole
+     * folder of sessions to be opened, the first one is the session
+     * above; start the rest in their own tabs now that the frame is up.
+     */
+    open_pending_batch_sessions();
+
     while (1) {
         int n;
         DWORD timeout;
@@ -1541,8 +1549,33 @@ static void open_new_session_dialog(void)
         prepare_session(c);
         new_session(c, tab_name);
         sfree(tab_name);
+        /* ... and any others the box asked for (a batch open). */
+        open_pending_batch_sessions();
     } else {
         conf_free(c);
+    }
+}
+
+/*
+ * Open the saved sessions that the configuration box has queued up, each
+ * in its own tab. This is how `Batch open' on a folder of saved sessions
+ * ends up starting the whole folder.
+ */
+static void open_pending_batch_sessions(void)
+{
+    char *name;
+
+    while (settings_batch_open_pop(&name)) {
+        Conf *c = conf_new();
+        if (load_settings(name, c)) {
+            wchar_t *tab_name = tab_name_from_session(name);
+            prepare_session(c);
+            new_session(c, tab_name);
+            sfree(tab_name);
+        } else {
+            conf_free(c);
+        }
+        sfree(name);
     }
 }
 

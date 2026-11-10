@@ -2001,6 +2001,15 @@ void load_open_settings(settings_r *sesskey, Conf *conf);
 const char *settings_loaded_session_name(void);
 void settings_remember_loaded_session_name(const char *name);
 void settings_forget_loaded_session_name(void);
+/*
+ * Sessions that the configuration box has asked to have opened in
+ * addition to the one it launches (the `Batch open' context menu entry
+ * on a folder of saved sessions). The front end pops them from the queue
+ * and opens each one; the queue is empty if there was no such request.
+ */
+void settings_batch_open_clear(void);
+void settings_batch_open_add(const char *name);
+bool settings_batch_open_pop(char **name);   /* result must be freed */
 void get_sesslist(struct sesslist *, bool allocate);
 bool do_defaults(const char *, Conf *);
 void registry_cleanup(void);

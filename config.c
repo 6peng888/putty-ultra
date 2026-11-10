@@ -968,6 +968,50 @@ static void sessionsaver_handler(dlgcontrol *ctrl, dlgparam *dlg,
         } else if (ctrl == ssd->cancelbutton) {
             dlg_end(dlg, 0);
         }
+    } else if (event == EVENT_OPEN_FOLDER) {
+        /*
+         * The user asked for a whole folder of saved sessions to be
+         * opened at once, from the right-click menu of the session
+         * tree. The first session in the folder is loaded into the
+         * configuration being edited, so that the usual `launch this
+         * configuration' path starts it, and the rest are queued for
+         * the front end, which opens each in a new window or tab once
+         * this box has gone.
+         */
+        const char *folder = dlg_listbox_get_folder(ctrl, dlg);
+        const char *first = NULL;
+        size_t len;
+        int i;
+
+        if (!folder || ctrl != ssd->listbox || ssd->midsession) {
+            dlg_beep(dlg);
+            return;
+        }
+
+        /*
+         * The session list is sorted, so the sessions in one folder
+         * are consecutive and come out in the order the tree shows
+         * them.
+         */
+        len = strlen(folder);
+        settings_batch_open_clear();
+        for (i = 1; i < ssd->sesslist.nsessions; i++) {
+            const char *name = ssd->sesslist.sessions[i];
+            if (strncmp(name, folder, len) || name[len] != '/')
+                continue;
+            if (!first)
+                first = name;
+            else
+                settings_batch_open_add(name);
+        }
+
+        if (!first || !load_settings(first, conf)) {
+            settings_batch_open_clear();
+            dlg_beep(dlg);
+            return;
+        }
+
+        dlg_end(dlg, 1);               /* it's all over, and succeeded */
     }
 }
 

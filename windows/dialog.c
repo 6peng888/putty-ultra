@@ -128,15 +128,25 @@ static INT_PTR pds_default_dlgproc(PortableDialogStuff *pds, HWND hwnd,
             ret = 0;
         return ret;
       }
-      case WM_NOTIFY:
+      case WM_NOTIFY: {
         /*
          * Controls which report things via WM_NOTIFY (i.e. the tree
          * view used for saved sessions) get a look-in, once the dialog
          * is fully set up.
          */
-        if (pds->initialised && winctrl_handle_notify(pds->dp, wParam, lParam))
-            return 1;
-        return 0;
+        int ret = 0;
+        if (pds->initialised)
+            ret = winctrl_handle_notify(pds->dp, wParam, lParam) ? 1 : 0;
+        /*
+         * Handling a notification can end the dialog - for example,
+         * choosing `Open' in the saved-session context menu does. As
+         * in the WM_COMMAND case above, wait for any mouse capture the
+         * dialog still holds to be released first.
+         */
+        if (pds->dp->ended && GetCapture() != hwnd)
+            ShinyEndDialog(hwnd, pds->dp->endresult ? 1 : 0);
+        return ret;
+      }
 
       case WM_HELP:
         if (!winctrl_context_help(pds->dp,
@@ -821,6 +831,13 @@ bool do_config(Conf *conf)
     bool ret;
     PortableDialogStuff *pds = pds_new(2);
 
+    /*
+     * Anything queued for a batch open by an earlier configuration box
+     * has been dealt with by now, but make sure a stale request can't
+     * start sessions behind the user's back.
+     */
+    settings_batch_open_clear();
+
     setup_config_box(pds->ctrlbox, false, 0, 0);
     win_setup_config_box(pds->ctrlbox, &pds->dp->hwnd, has_help(), false, 0);
 
@@ -847,6 +864,9 @@ bool do_reconfig(HWND hwnd, Conf *conf, int protcfginfo)
     PortableDialogStuff *pds = pds_new(2);
 
     backup_conf = conf_copy(conf);
+
+    /* A mid-session box can't launch sessions, so this should be empty. */
+    settings_batch_open_clear();
 
     protocol = conf_get_int(conf, CONF_protocol);
     setup_config_box(pds->ctrlbox, true, protocol, protcfginfo);

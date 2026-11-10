@@ -2592,6 +2592,95 @@ bool winctrl_handle_command(struct dlgparam *dp, UINT msg,
 }
 
 /*
+ * ======================================================================
+ * Right-click menu for the items of a tree list box.
+ *
+ * The items of a tree list box are saved sessions and the folders they
+ * live in, so the commands are the two things one wants to do with
+ * them: `Open' starts the session (exactly as double-clicking it does),
+ * and `Batch open' asks for every session in a folder to be started at
+ * once. The latter is passed to the control's handler as an
+ * EVENT_OPEN_FOLDER, with the folder's path in dp->tree_folder.
+ * ======================================================================
+ */
+
+#define TREEMENU_CMD_OPEN 1
+
+static void treemenu_add(HMENU menu, UINT id, const char *text)
+{
+    wchar_t *wtext = i18n_lookup_w(text);
+    if (wtext) {
+        AppendMenuW(menu, MF_ENABLED, id, wtext);
+        sfree(wtext);
+    } else {
+        AppendMenu(menu, MF_ENABLED, id, text);
+    }
+}
+
+/*
+ * Handle a right-click in the tree `tv', which belongs to dialog
+ * control `ctrl'. Returns true if the dialog should consider the
+ * message dealt with.
+ */
+static bool treebox_context_menu(struct dlgparam *dp, dlgcontrol *ctrl,
+                                 HWND tv)
+{
+    TVHITTESTINFO ht;
+    POINT pt;
+    HMENU menu;
+    int cmd;
+    bool is_folder;
+
+    /*
+     * Find out which item the user clicked on. A right-click on the
+     * empty space below the tree has no meaning.
+     */
+    GetCursorPos(&pt);
+    ht.pt = pt;
+    ScreenToClient(tv, &ht.pt);
+    ht.flags = 0;
+    if (!TreeView_HitTest(tv, &ht) ||
+        !(ht.flags & (TVHT_ONITEM | TVHT_ONITEMRIGHT)))
+        return false;
+
+    TreeView_SelectItem(tv, ht.hItem);
+    is_folder = tree_index_of_item(tv, ht.hItem) < 0;
+
+    menu = CreatePopupMenu();
+    if (!menu)
+        return false;
+    treemenu_add(menu, TREEMENU_CMD_OPEN,
+                 is_folder ? "&Batch Open" : "&Open");
+    cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                         pt.x, pt.y, 0, dp->hwnd, NULL);
+    DestroyMenu(menu);
+
+    if (cmd != TREEMENU_CMD_OPEN)
+        return false;
+
+    if (!is_folder) {
+        /*
+         * Opening a session is the same as double-clicking it: the
+         * handler works it out from the tree's selection.
+         */
+        ctrl->handler(ctrl, dp, dp->data, EVENT_ACTION);
+        return true;
+    }
+
+    {
+        char *path = tree_item_path(tv, ht.hItem);
+        if (!path)
+            return false;
+        sfree(dp->tree_folder);
+        dp->tree_folder = path;
+        ctrl->handler(ctrl, dp, dp->data, EVENT_OPEN_FOLDER);
+        sfree(dp->tree_folder);
+        dp->tree_folder = NULL;
+        return true;
+    }
+}
+
+/*
  * The dialog-box procedure calls this function to let us handle the
  * notifications (WM_NOTIFY) sent by those of our controls which use
  * them, which currently means the tree view that saved sessions are
@@ -2653,6 +2742,13 @@ bool winctrl_handle_notify(struct dlgparam *dp, WPARAM wParam, LPARAM lParam)
       case TVN_SELCHANGED:
         ctrl->handler(ctrl, dp, dp->data, EVENT_SELCHANGE);
         break;
+
+      case NM_RCLICK:
+        /*
+         * Right-clicking an item offers a context menu: `Open' for a
+         * session, `Batch open' for a folder.
+         */
+        return treebox_context_menu(dp, ctrl, nh->hwndFrom);
 
       case TVN_ITEMEXPANDED: {
         /*
@@ -2960,6 +3056,12 @@ int dlg_listbox_index(dlgcontrol *ctrl, dlgparam *dp)
         return -1;
     else
         return ret;
+}
+
+const char *dlg_listbox_get_folder(dlgcontrol *ctrl, dlgparam *dp)
+{
+    (void)ctrl;
+    return dp->tree_folder;
 }
 
 bool dlg_listbox_issel(dlgcontrol *ctrl, dlgparam *dp, int index)
@@ -3310,6 +3412,7 @@ void dp_init(struct dlgparam *dp)
     dp->hwnd = NULL;
     dp->wintitle = dp->errtitle = NULL;
     dp->fixed_pitch_fonts = true;
+    dp->tree_folder = NULL;
 }
 
 void dp_add_tree(struct dlgparam *dp, struct winctrls *wc)
@@ -3322,4 +3425,5 @@ void dp_cleanup(struct dlgparam *dp)
 {
     sfree(dp->wintitle);
     sfree(dp->errtitle);
+    sfree(dp->tree_folder);
 }

@@ -109,6 +109,10 @@ Always=总是
 Never=从不
 Only on clean exit=仅在正常退出时
 
+# ===== 已保存会话树的右键菜单 =====
+&Open=打开(&O)
+&Batch Open=批量打开(&B)
+
 # ===== 会话 / 日志面板 =====
 Logging=日志
 Options controlling session logging=控制会话日志的选项

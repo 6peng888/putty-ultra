@@ -95,13 +95,18 @@ PREFIX intorptr CP(const void *p) { intorptr ret; ret.cp = p; return ret; }
  *  - the CALLBACK event, which happens after the handler routine
  *    has requested a subdialog (file selector, font selector,
  *    colour selector) and it has come back with information.
+ *  - the OPEN_FOLDER event, used only by tree list boxes, when the
+ *    user has asked for everything in one folder to be opened at
+ *    once (e.g. from a right-click menu). The handler should call
+ *    dlg_listbox_get_folder() to find out which folder.
  */
 enum {
     EVENT_REFRESH,
     EVENT_ACTION,
     EVENT_VALCHANGE,
     EVENT_SELCHANGE,
-    EVENT_CALLBACK
+    EVENT_CALLBACK,
+    EVENT_OPEN_FOLDER
 };
 typedef void (*handler_fn)(dlgcontrol *ctrl, dlgparam *dp,
                            void *data, int event);
@@ -590,6 +595,15 @@ void dlg_listbox_addwithid(dlgcontrol *ctrl, dlgparam *dp,
 int dlg_listbox_getid(dlgcontrol *ctrl, dlgparam *dp, int index);
 /* dlg_listbox_index returns <0 if no single element is selected. */
 int dlg_listbox_index(dlgcontrol *ctrl, dlgparam *dp);
+/*
+ * Tree list boxes only: after an EVENT_OPEN_FOLDER event, this returns
+ * the '/'-separated path of the folder the user asked to open, or NULL
+ * if no such event is in progress. The string belongs to the dialog and
+ * is only valid for the duration of the event handler; front ends which
+ * don't support folder context menus never send that event, and this
+ * function returns NULL for them.
+ */
+const char *dlg_listbox_get_folder(dlgcontrol *ctrl, dlgparam *dp);
 bool dlg_listbox_issel(dlgcontrol *ctrl, dlgparam *dp, int index);
 void dlg_listbox_select(dlgcontrol *ctrl, dlgparam *dp, int index);
 void dlg_text_set(dlgcontrol *ctrl, dlgparam *dp, char const *text);
