@@ -138,13 +138,14 @@ static void tab_add(WinGuiSeat *wgs);
 static void tab_activate(int idx);
 static wchar_t *tab_name_from_session(const char *sessname);
 static bool tab_switch_key(int vk);
+static bool tab_close_key(int vk, LPARAM lParam);
 static void tab_relayout(void);
 static int tab_find(WinGuiSeat *wgs);
 static void frame_set_title(WinGuiSeat *wgs);
 static void frame_build_saved_menu(void);
 static void open_new_session_dialog(void);
 static void open_pending_batch_sessions(void);
-static void close_tab(int idx);
+static void close_tab(int idx, bool always_warn);
 static void frame_build_menu(void);
 static void menu_add(HMENU menu, UINT flags, UINT_PTR id, const char *text);
 static void menu_insert(HMENU menu, UINT pos, UINT flags, UINT_PTR id,
@@ -1516,6 +1517,40 @@ static bool tab_switch_key(int vk)
     return true;
 }
 
+/*
+ * Ctrl+Shift+W closes the active tab. The chord is taken ahead of
+ * TranslateKey, so it never reaches the session. Plain Ctrl+W is
+ * deliberately left alone: that is the shell's `werase' (and the local
+ * line editor's delete-word), and stealing it would break ordinary
+ * terminal use.
+ *
+ * Alt is excluded so that Ctrl+Alt+Shift+W (which some keyboard
+ * layouts use for a character) stays out of the way.
+ *
+ * Returns true if the keystroke was consumed (i.e. it was
+ * Ctrl+Shift+W).
+ */
+static bool tab_close_key(int vk, LPARAM lParam)
+{
+    if (vk != 'W')
+        return false;
+    if (!(GetKeyState(VK_CONTROL) & 0x8000) ||
+        !(GetKeyState(VK_SHIFT) & 0x8000) ||
+        (GetKeyState(VK_MENU) & 0x8000))
+        return false;
+
+    /*
+     * Swallow key auto-repeat rather than acting on it: otherwise
+     * holding the chord down would close tab after tab as fast as the
+     * keyboard repeats.
+     */
+    if (lParam & (1 << 30))
+        return true;
+
+    close_tab(tab_active, true);
+    return true;
+}
+
 static void tab_add(WinGuiSeat *wgs)
 {
 
@@ -1581,13 +1616,22 @@ static void open_pending_batch_sessions(void)
     }
 }
 
-static void close_tab(int idx)
+/*
+ * Close the tab at `idx'. A session that is still connected is
+ * confirmed first when the user has "Warn before closing window"
+ * switched on, and always when `always_warn' is set: the Ctrl+Shift+W
+ * shortcut passes that, so a stray keystroke cannot silently drop a
+ * live connection even for someone who normally has the warning off.
+ * The close box on the tab and the terminal's own close box keep
+ * honouring the setting.
+ */
+static void close_tab(int idx, bool always_warn)
 {
     if (idx < 0 || idx >= tab_count)
         return;
     WinGuiSeat *w = tab_list[idx];
     if (w->backend && !w->session_closed &&
-        conf_get_bool(w->conf, CONF_warn_on_close)) {
+        (always_warn || conf_get_bool(w->conf, CONF_warn_on_close))) {
         /*
          * Warn the same way the terminal window's own close box does,
          * including the backend's note about any downstream
@@ -2219,7 +2263,7 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
                     RECT cr = g_tabrects[i];
                     cr.left = cr.right - tab_scale(TAB_CLOSE_W);
                     if (PtInRect(&cr, mpt(mx, my))) {
-                        close_tab(i);
+                        close_tab(i, false);
                     } else {
                         /*
                          * Clicking the body of a tab both activates it
@@ -5306,11 +5350,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
         noise_ultralight(NOISE_SOURCE_KEY, lParam);
 
         /*
-         * Ctrl+1..Ctrl+9 jump to the tab with that number. Intercepted
-         * ahead of TranslateKey so the keystroke never reaches the
-         * session at all, whether or not a tab with that number exists.
+         * Ctrl+1..Ctrl+9 jump to the tab with that number, and
+         * Ctrl+Shift+W closes the active one. Intercepted ahead of
+         * TranslateKey so the keystroke never reaches the session at
+         * all, whether or not a tab with that number exists.
          */
         if (message == WM_KEYDOWN && tab_switch_key((int)wParam))
+            return 0;
+        if (message == WM_KEYDOWN && tab_close_key((int)wParam, lParam))
             return 0;
 
         /*
