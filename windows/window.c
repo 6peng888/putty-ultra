@@ -887,6 +887,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
         }
 
         wgs->savedsess_menu = CreateMenu();
+        get_sesslist(&sesslist, false);   /* free any previous copy */
         get_sesslist(&sesslist, true);
         update_savedsess_menu(wgs);
 
@@ -1041,6 +1042,23 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 
 static void wgs_cleanup(WinGuiSeat *wgs)
 {
+    /*
+     * Drop everything that still holds a pointer to this session before
+     * the memory goes away. Two kinds of thing can be in flight when a
+     * tab is closed:
+     *
+     *  - a top-level callback (close_session, exit_callback) queued
+     *    while some modal window - the configuration box, say - was
+     *    holding up the main loop, and not yet run;
+     *  - the bell/flash timer scheduled with this session as its
+     *    context.
+     *
+     * Either would otherwise run against freed memory. The terminal and
+     * the backend do the same for their own contexts.
+     */
+    delete_callbacks_for_context(wgs);
+    expire_timer_context(wgs);
+
     if (wgs->ldisc) {
         ldisc_free(wgs->ldisc);
         wgs->ldisc = NULL;
@@ -2862,6 +2880,7 @@ static void new_session_finish(WinGuiSeat *wgs)
         }
 
         wgs->savedsess_menu = CreateMenu();
+        get_sesslist(&sesslist, false);   /* free any previous copy */
         get_sesslist(&sesslist, true);
         update_savedsess_menu(wgs);
 
@@ -4372,6 +4391,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                     if (!g_closing_all)
                         tab_activate(tab_active);
                 }
+
+                /*
+                 * Keep the cached strip layout in step with the tab list.
+                 * tab_activate above refreshes it in full; this covers
+                 * the case where there is nothing left to activate (or
+                 * where we are tearing everything down), so that a stray
+                 * WM_PAINT can never walk a tab list that no longer
+                 * describes a live session.
+                 */
+                if (g_tabcount > tab_count) {
+                    g_tabcount = (tab_count < MAX_TABS) ? tab_count : MAX_TABS;
+                    if (g_tabcount == 0) {
+                        g_plusrect.left = g_plusrect.top = 0;
+                        g_plusrect.right = g_plusrect.bottom = 0;
+                    }
+                }
             }
             wgs_cleanup(wgs);
             if (tab_count == 0 && !g_quitting) {
@@ -4410,7 +4445,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             }
             break;
           case IDM_SHOWLOG:
-            showeventlog(hwnd);
+            /*
+             * Own the event log window by the frame, not by this tab's
+             * terminal: the log covers every session, and closing the
+             * tab it was opened from would otherwise destroy it (and
+             * leave us holding a stale window handle).
+             */
+            showeventlog(tab_frame_hwnd ? tab_frame_hwnd : hwnd);
             break;
           case IDM_NEWSESS:
             open_new_session_dialog();

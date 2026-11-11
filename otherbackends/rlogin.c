@@ -318,12 +318,17 @@ static void rlogin_free(Backend *be)
 {
     Rlogin *rlogin = container_of(be, Rlogin, backend);
 
+    /*
+     * Close the socket before looking at rlogin->seat: if a proxy has
+     * the seat on loan, closing the socket hands it back (freeing the
+     * temporary seat). See the same note in raw_free().
+     */
+    if (rlogin->s)
+        sk_close(rlogin->s);
     if (is_tempseat(rlogin->seat))
         tempseat_free(rlogin->seat);
     if (rlogin->prompt)
         free_prompts(rlogin->prompt);
-    if (rlogin->s)
-        sk_close(rlogin->s);
     conf_free(rlogin->conf);
     sfree(rlogin->description);
     sfree(rlogin);

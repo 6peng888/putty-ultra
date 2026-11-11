@@ -403,6 +403,15 @@ static INT_PTR CALLBACK LogProc(HWND hwnd, UINT msg,
         SetActiveWindow(GetParent(hwnd));
         DestroyWindow(hwnd);
         return 0;
+
+      case WM_DESTROY:
+        /*
+         * The window can also go away without us being asked first -
+         * e.g. if its owner is destroyed - so make sure we never keep a
+         * handle to a window that no longer exists.
+         */
+        logbox = NULL;
+        break;
     }
     return 0;
 }

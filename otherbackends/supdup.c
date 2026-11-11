@@ -827,10 +827,15 @@ static void supdup_free(Backend *be)
 {
     Supdup *supdup = container_of(be, Supdup, backend);
 
-    if (is_tempseat(supdup->seat))
-        tempseat_free(supdup->seat);
+    /*
+     * Close the socket before looking at supdup->seat: if a proxy has
+     * the seat on loan, closing the socket hands it back (freeing the
+     * temporary seat). See the same note in raw_free().
+     */
     if (supdup->s)
         sk_close(supdup->s);
+    if (is_tempseat(supdup->seat))
+        tempseat_free(supdup->seat);
     if (supdup->pinger)
         pinger_free(supdup->pinger);
     conf_free(supdup->conf);

@@ -233,10 +233,18 @@ static void raw_free(Backend *be)
 {
     Raw *raw = container_of(be, Raw, backend);
 
-    if (is_tempseat(raw->seat))
-        tempseat_free(raw->seat);
+    /*
+     * Close the socket *before* looking at raw->seat. If a proxy (or
+     * any other Interactor) has our seat on loan, then closing the
+     * socket is what makes it hand the seat back - and handing it back
+     * frees the temporary seat and restores raw->seat. Freeing the
+     * tempseat here first would leave that hand-back operating on
+     * freed memory.
+     */
     if (raw->s)
         sk_close(raw->s);
+    if (is_tempseat(raw->seat))
+        tempseat_free(raw->seat);
     conf_free(raw->conf);
     sfree(raw->description);
     sfree(raw);

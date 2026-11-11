@@ -821,11 +821,16 @@ static void telnet_free(Backend *be)
 {
     Telnet *telnet = container_of(be, Telnet, backend);
 
+    /*
+     * Close the socket before looking at telnet->seat: if a proxy has
+     * the seat on loan, closing the socket hands it back (freeing the
+     * temporary seat). See the same note in raw_free().
+     */
+    if (telnet->s)
+        sk_close(telnet->s);
     if (is_tempseat(telnet->seat))
         tempseat_free(telnet->seat);
     strbuf_free(telnet->sb_buf);
-    if (telnet->s)
-        sk_close(telnet->s);
     if (telnet->pinger)
         pinger_free(telnet->pinger);
     conf_free(telnet->conf);
