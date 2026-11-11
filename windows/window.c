@@ -922,8 +922,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
         lp_eventlog(&wgs->logpolicy, "Running with restricted process ACL");
     }
 
-    winselgui_set_hwnd(wgs->term_hwnd);
-
+    /* Socket notifications go to the frame; see frame_create. */
     start_backend(wgs);
 
     /*
@@ -1478,7 +1477,6 @@ static void tab_activate(int idx)
         return;
     tab_active = idx;
     WinGuiSeat *w = tab_list[idx];
-    winselgui_set_hwnd(w->term_hwnd);
     frame_set_title(w);
     tab_relayout();
     SetFocus(w->term_hwnd);
@@ -1917,10 +1915,26 @@ static HWND frame_create(int width, int height)
         g_frame_start_maximised = maximised;
     }
 
-    return CreateWindowExW(0, L"PuTTYTabFrame", L"PuTTY",
-                           WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-                           x, y, width, height,
-                           NULL, NULL, hinst, NULL);
+    {
+        HWND hwnd = CreateWindowExW(0, L"PuTTYTabFrame", L"PuTTY",
+                                    WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                                    x, y, width, height,
+                                    NULL, NULL, hinst, NULL);
+
+        /*
+         * Network activity is reported to this frame, not to the active
+         * tab's terminal. WSAAsyncSelect ties each socket to whichever
+         * window was current when the socket was last (re)armed, so
+         * addressing it at a tab window would silently cut off every
+         * session that happened to be armed while that tab was current
+         * as soon as the tab was closed. The frame outlives all of the
+         * sessions, so it is always a safe target.
+         */
+        if (hwnd)
+            winselgui_set_hwnd(hwnd);
+
+        return hwnd;
+    }
 }
 
 /*
@@ -2041,6 +2055,16 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
       case WM_WINDOWPOSCHANGED:
         tab_relayout();
         return DefWindowProcW(hwnd, message, wParam, lParam);
+
+      case WM_NETEVENT:
+      case WM_DONE_WITH_SOCKET:
+        /*
+         * Network activity is reported to this frame rather than to the
+         * active tab's terminal window (see frame_create), so that
+         * closing a tab cannot cut off the sessions that are left.
+         */
+        winselgui_response(message, wParam, lParam);
+        return 0;
 
       case WM_TAB_RELAYOUT:
         /* A tab's caption changed (see frame_set_title): redo the strip
@@ -2873,8 +2897,7 @@ static void new_session_finish(WinGuiSeat *wgs)
         lp_eventlog(&wgs->logpolicy, "Running with restricted process ACL");
     }
 
-    winselgui_set_hwnd(wgs->term_hwnd);
-
+    /* Socket notifications go to the frame; see frame_create. */
     start_backend(wgs);
 
     set_input_locale(wgs, GetKeyboardLayout(0));
