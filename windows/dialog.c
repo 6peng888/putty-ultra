@@ -18,6 +18,7 @@
 #include "dialog.h"
 #include "licence.h"
 #include "i18n.h"
+#include "patchinfo.h"         /* generated from putty-ultra.cfg */
 
 #include <commctrl.h>
 #include <commdlg.h>
@@ -453,10 +454,22 @@ static INT_PTR CALLBACK AboutProc(HWND hwnd, UINT msg,
         SetWindowText(hwnd, str);
         sfree(str);
         char *buildinfo_text = buildinfo("\r\n");
+        /*
+         * Patch identification line, configured in putty-ultra.cfg and
+         * baked in at build time as patchinfo.h. It goes immediately
+         * below the release version line.
+         */
+        char *patched_text;
+        if (PATCH_VERSION[0] && PATCH_AUTHOR[0])
+            patched_text = dupprintf("patched %s by %s\r\n\r\n",
+                                     PATCH_VERSION, PATCH_AUTHOR);
+        else
+            patched_text = dupstr("");
         char *text = dupprintf(
-            "%s\r\n\r\n%s\r\n\r\n%s\r\n\r\n%s",
-            appname, ver, buildinfo_text,
+            "%s\r\n\r\n%s\r\n\r\n%s%s\r\n\r\n%s",
+            appname, ver, patched_text, buildinfo_text,
             "\251 " SHORT_COPYRIGHT_DETAILS ". All rights reserved.");
+        sfree(patched_text);
         sfree(buildinfo_text);
         SetDlgItemText(hwnd, IDA_TEXT, text);
         MakeDlgItemBorderless(hwnd, IDA_TEXT);

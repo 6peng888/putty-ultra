@@ -1,2 +1,4 @@
 cmake -S . -B build-static -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXE_LINKER_FLAGS="-static"
 cmake --build build-static -j 8
+
+补丁信息（About 对话框里的 patched <版本> by <作者>）在 putty-ultra.cfg 中修改，改完重新编译即可。

@@ -4,6 +4,7 @@ project(putty LANGUAGES C)
 set(CMAKE_C_STANDARD 99)
 
 include(cmake/setup.cmake)
+include(cmake/patchinfo.cmake)
 
 # Scan the docs directory first, so that when we start calling
 # installed_program(), we'll know if we have man pages available
