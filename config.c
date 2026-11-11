@@ -780,6 +780,46 @@ static void sshbug_handler_manual_only(dlgcontrol *ctrl, dlgparam *dlg,
     }
 }
 
+/*
+ * Compare two saved-session names for equality, ignoring the case of
+ * ASCII letters. Names live in file names, which on Windows are
+ * case-insensitive, and in any case two sessions whose names differ
+ * only by case would be confusing.
+ */
+static bool session_name_equal(const char *a, const char *b)
+{
+    while (*a && *b) {
+        char ca = *a++, cb = *b++;
+        if (ca >= 'A' && ca <= 'Z')
+            ca += 'a' - 'A';
+        if (cb >= 'A' && cb <= 'Z')
+            cb += 'a' - 'A';
+        if (ca != cb)
+            return false;
+    }
+    return *a == *b;
+}
+
+/*
+ * If `name' is a session inside the folder `oldfolder', return the
+ * name it has inside the folder `newfolder' instead; otherwise return
+ * NULL. The result, if any, must be freed.
+ */
+static char *reparent_session_name(const char *name,
+                                   const char *oldfolder,
+                                   const char *newfolder)
+{
+    size_t len;
+
+    if (!name)
+        return NULL;
+    len = strlen(oldfolder);
+    if (strncmp(name, oldfolder, len) || name[len] != '/')
+        return NULL;
+
+    return dupcat(newfolder, name + len);
+}
+
 struct sessionsaver_data {
     dlgcontrol *editbox, *listbox, *loadbutton, *savebutton, *delbutton;
     dlgcontrol *okbutton, *cancelbutton;
@@ -1012,6 +1052,137 @@ static void sessionsaver_handler(dlgcontrol *ctrl, dlgparam *dlg,
         }
 
         dlg_end(dlg, 1);               /* it's all over, and succeeded */
+    } else if (event == EVENT_RENAME) {
+        /*
+         * The user asked to rename a saved session, or a folder of them,
+         * from the right-click menu of the session tree. The front end
+         * has already asked them for the new name, and done the
+         * in-place editing of the tree label; here we check the new
+         * name is usable, and move the stored session (or the folder
+         * containing a whole bundle of them).
+         */
+        const char *newname = dlg_listbox_get_rename(ctrl, dlg);
+        const char *folder = dlg_listbox_get_folder(ctrl, dlg);
+        const char *oldname;
+        char *errmsg;
+        int i, j;
+
+        if (ctrl != ssd->listbox || !newname || !*newname) {
+            dlg_beep(dlg);
+            return;
+        }
+
+        if (folder) {
+            /*
+             * A folder is being renamed, which takes every session
+             * inside it along: no session name has to be validated
+             * here, because the folder just moves as a whole. The
+             * storage layer refuses to overwrite an existing folder or
+             * session.
+             */
+            char *moved;
+
+            if (!strcmp(folder, newname))
+                return;                /* nothing to do */
+
+            errmsg = rename_settings(folder, newname);
+            if (errmsg) {
+                dlg_error_msg(dlg, errmsg);
+                sfree(errmsg);
+                return;
+            }
+
+            /*
+             * The session loaded into the box, and the name a new
+             * tab will be captioned with, may have been inside the
+             * folder that moved.
+             */
+            if ((moved = reparent_session_name(ssd->savedsession,
+                                               folder, newname)) != NULL) {
+                sfree(ssd->savedsession);
+                ssd->savedsession = moved;
+                dlg_refresh(ssd->editbox, dlg);
+            }
+            if (!ssd->midsession) {
+                const char *loaded = settings_loaded_session_name();
+                if (loaded &&
+                    (moved = reparent_session_name(loaded,
+                                                   folder, newname)) != NULL) {
+                    settings_remember_loaded_session_name(moved);
+                    sfree(moved);
+                }
+            }
+
+            get_sesslist(&ssd->sesslist, false);
+            get_sesslist(&ssd->sesslist, true);
+            dlg_refresh(ssd->listbox, dlg);
+            return;
+        }
+
+        i = dlg_listbox_index(ssd->listbox, dlg);
+        if (i <= 0) {
+            /* Item 0 is `Default Settings', which isn't a real session. */
+            dlg_beep(dlg);
+            return;
+        }
+        oldname = ssd->sesslist.sessions[i];
+
+        if (!strcmp(newname, oldname))
+            return;                    /* nothing to do */
+
+        /*
+         * Refuse a name that another session already has. The comparison
+         * ignores case, because on Windows the file system would too, and
+         * because two sessions whose names differ only in case would
+         * otherwise be very confusing to tell apart.
+         */
+        for (j = 0; j < ssd->sesslist.nsessions; j++) {
+            if (j != i && session_name_equal(newname, ssd->sesslist.sessions[j])) {
+                dlg_error_msg(dlg, "Another saved session already has "
+                              "that name.");
+                return;
+            }
+        }
+
+        errmsg = rename_settings(oldname, newname);
+        if (errmsg) {
+            dlg_error_msg(dlg, errmsg);
+            sfree(errmsg);
+            return;
+        }
+
+        /*
+         * If the session being renamed is the one whose settings are
+         * currently in the edit box, keep that in step.
+         */
+        if (ssd->savedsession && !strcmp(ssd->savedsession, oldname)) {
+            sfree(ssd->savedsession);
+            ssd->savedsession = dupstr(newname);
+            dlg_refresh(ssd->editbox, dlg);
+        }
+
+        /*
+         * Likewise keep in step the name the front end captions a new
+         * session's tab with. (Only in the initial configuration box:
+         * renaming a session must not rename the tab of a running one.)
+         */
+        if (!ssd->midsession) {
+            const char *loaded = settings_loaded_session_name();
+            if (loaded && !strcmp(loaded, oldname))
+                settings_remember_loaded_session_name(newname);
+        }
+
+        get_sesslist(&ssd->sesslist, false);
+        get_sesslist(&ssd->sesslist, true);
+        dlg_refresh(ssd->listbox, dlg);
+
+        /* Select the renamed session, wherever it has ended up. */
+        for (j = 0; j < ssd->sesslist.nsessions; j++) {
+            if (!strcmp(newname, ssd->sesslist.sessions[j])) {
+                dlg_listbox_select(ssd->listbox, dlg, j);
+                break;
+            }
+        }
     }
 }
 

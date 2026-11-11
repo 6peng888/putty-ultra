@@ -150,6 +150,8 @@ int dlg_listbox_getid(dlgcontrol *ctrl, dlgparam *dp, int index)
 int dlg_listbox_index(dlgcontrol *ctrl, dlgparam *dp) { return -1; }
 const char *dlg_listbox_get_folder(dlgcontrol *ctrl, dlgparam *dp)
 { return NULL; }
+const char *dlg_listbox_get_rename(dlgcontrol *ctrl, dlgparam *dp)
+{ return NULL; }
 bool dlg_listbox_issel(dlgcontrol *ctrl, dlgparam *dp, int index)
 { return false; }
 void dlg_listbox_select(dlgcontrol *ctrl, dlgparam *dp, int index) { }

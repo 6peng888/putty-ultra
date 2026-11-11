@@ -99,6 +99,11 @@ PREFIX intorptr CP(const void *p) { intorptr ret; ret.cp = p; return ret; }
  *    user has asked for everything in one folder to be opened at
  *    once (e.g. from a right-click menu). The handler should call
  *    dlg_listbox_get_folder() to find out which folder.
+ *  - the RENAME event, used only by tree list boxes, when the user
+ *    has asked to rename the selected session (or the folder
+ *    containing it). The handler should call dlg_listbox_get_rename()
+ *    to find out the new name, and dlg_listbox_get_folder() to find
+ *    out whether a folder was meant, and which one.
  */
 enum {
     EVENT_REFRESH,
@@ -106,7 +111,8 @@ enum {
     EVENT_VALCHANGE,
     EVENT_SELCHANGE,
     EVENT_CALLBACK,
-    EVENT_OPEN_FOLDER
+    EVENT_OPEN_FOLDER,
+    EVENT_RENAME
 };
 typedef void (*handler_fn)(dlgcontrol *ctrl, dlgparam *dp,
                            void *data, int event);
@@ -597,13 +603,23 @@ int dlg_listbox_getid(dlgcontrol *ctrl, dlgparam *dp, int index);
 int dlg_listbox_index(dlgcontrol *ctrl, dlgparam *dp);
 /*
  * Tree list boxes only: after an EVENT_OPEN_FOLDER event, this returns
- * the '/'-separated path of the folder the user asked to open, or NULL
- * if no such event is in progress. The string belongs to the dialog and
- * is only valid for the duration of the event handler; front ends which
- * don't support folder context menus never send that event, and this
- * function returns NULL for them.
+ * the '/'-separated path of the folder the user asked to open. After an
+ * EVENT_RENAME event, it returns the path of the folder being renamed,
+ * or NULL if the item being renamed is a session rather than a folder.
+ * It returns NULL if neither event is in progress. The string belongs
+ * to the dialog and is only valid for the duration of the event
+ * handler; front ends which don't support folder context menus never
+ * send those events, and this function returns NULL for them.
  */
 const char *dlg_listbox_get_folder(dlgcontrol *ctrl, dlgparam *dp);
+/*
+ * Tree list boxes only: after an EVENT_RENAME event, this returns the
+ * full new name the user has asked for (a session's name, or a
+ * folder's path), or NULL if no such event is in progress. The string
+ * belongs to the dialog and is only valid for the duration of the
+ * event handler.
+ */
+const char *dlg_listbox_get_rename(dlgcontrol *ctrl, dlgparam *dp);
 bool dlg_listbox_issel(dlgcontrol *ctrl, dlgparam *dp, int index);
 void dlg_listbox_select(dlgcontrol *ctrl, dlgparam *dp, int index);
 void dlg_text_set(dlgcontrol *ctrl, dlgparam *dp, char const *text);

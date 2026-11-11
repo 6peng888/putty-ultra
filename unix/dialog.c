@@ -669,6 +669,15 @@ const char *dlg_listbox_get_folder(dlgcontrol *ctrl, dlgparam *dp)
     return NULL;
 }
 
+/*
+ * Likewise, the GTK list boxes never offer to rename a session, so
+ * there is never an EVENT_RENAME and no new name to report.
+ */
+const char *dlg_listbox_get_rename(dlgcontrol *ctrl, dlgparam *dp)
+{
+    return NULL;
+}
+
 /* dlg_listbox_index returns <0 if no single element is selected. */
 int dlg_listbox_index(dlgcontrol *ctrl, dlgparam *dp)
 {

@@ -542,6 +542,45 @@ void del_settings(const char *sessionname)
     sfree(filename);
 }
 
+char *rename_settings(const char *oldname, const char *newname)
+{
+    char *oldfilename, *newfilename;
+    char *errmsg = NULL;
+    struct stat st_old, st_new;
+    bool exists, same;
+
+    if (!newname || !*newname)
+        return dupstr("A session cannot be given an empty name");
+
+    oldfilename = make_filename(INDEX_SESSION, oldname);
+    newfilename = make_filename(INDEX_SESSION, newname);
+
+    /*
+     * rename() would silently replace an existing session, so check for
+     * one first. A destination which is the same file as the source (a
+     * rename changing only the case, on a case-insensitive file system)
+     * doesn't count.
+     */
+    exists = (stat(newfilename, &st_new) == 0);
+    same = (exists && stat(oldfilename, &st_old) == 0 &&
+            st_old.st_dev == st_new.st_dev && st_old.st_ino == st_new.st_ino);
+
+    if (!strcmp(oldfilename, newfilename) || same) {
+        /* Nothing to do, or nothing that rename() would change. */
+    } else if (exists) {
+        errmsg = dupprintf("Unable to rename session \"%s\" to \"%s\":\n"
+                           "a session of that name already exists",
+                           oldname, newname);
+    } else if (rename(oldfilename, newfilename) < 0) {
+        errmsg = dupprintf("Unable to rename session \"%s\" to \"%s\":\n%s",
+                           oldname, newname, strerror(errno));
+    }
+
+    sfree(oldfilename);
+    sfree(newfilename);
+    return errmsg;
+}
+
 struct settings_e {
     DIR *dp;
 };

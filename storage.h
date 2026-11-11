@@ -68,6 +68,18 @@ void close_settings_r(settings_r *handle);
 void del_settings(const char *sessionname);
 
 /*
+ * Change the name of a saved session, or of a folder of them. A '/' in
+ * either name still denotes a folder, so renaming can also move a
+ * session from one folder to another. If `oldname' names a folder
+ * rather than a session, every session inside it is renamed, so that
+ * they all end up inside the folder now called `newname'.
+ *
+ * Returns NULL on success, or a dynamically allocated error message
+ * which the caller must free.
+ */
+char *rename_settings(const char *oldname, const char *newname);
+
+/*
  * Enumerate all saved sessions.
  */
 settings_e *enum_settings_start(void);

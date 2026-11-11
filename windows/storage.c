@@ -794,6 +794,123 @@ void del_settings(const char *sessionname)
     remove_session_from_jumplist(sessionname);
 }
 
+/*
+ * Move a session file (or a folder of them) to a new name. Windows
+ * refuses to rename something to a name which differs from its own only
+ * in case, on the grounds that the destination already exists, so in
+ * that situation we go via a temporary name instead.
+ */
+static bool rename_session_file(const char *oldpath, const char *newpath)
+{
+    char *tmp;
+    DWORD err;
+
+    if (MoveFileEx(oldpath, newpath, 0))
+        return true;
+
+    err = GetLastError();
+    if (err != ERROR_ALREADY_EXISTS && err != ERROR_FILE_EXISTS &&
+        err != ERROR_ACCESS_DENIED)
+        return false;
+
+    tmp = dupcat(oldpath, ".renaming");
+    if (!MoveFileEx(oldpath, tmp, 0)) {
+        sfree(tmp);
+        return false;
+    }
+    if (!MoveFileEx(tmp, newpath, 0)) {
+        /* Put it back where it came from, so the session isn't lost. */
+        MoveFileEx(tmp, oldpath, 0);
+        sfree(tmp);
+        return false;
+    }
+    sfree(tmp);
+    return true;
+}
+
+char *rename_settings(const char *oldname, const char *newname)
+{
+    char *oldpath, *newpath, *errmsg = NULL;
+    bool is_folder;
+
+    if (!newname || !*newname)
+        return dupstr("A session cannot be given an empty name");
+
+    oldpath = session_name_to_path(oldname, &errmsg);
+    if (!oldpath)
+        return errmsg ? errmsg : dupstr("Invalid session name");
+
+    newpath = session_name_to_path(newname, &errmsg);
+    if (!newpath) {
+        sfree(oldpath);
+        return errmsg ? errmsg : dupstr("Invalid session name");
+    }
+
+    /*
+     * A folder of sessions is stored as a directory, so renaming one
+     * just means moving the directory, which takes all the sessions
+     * inside it along at once.
+     */
+    is_folder = path_is_dir(oldpath);
+
+    if (!is_folder && !path_exists(oldpath)) {
+        errmsg = dupprintf("Unable to rename \"%s\":\n"
+                           "there is no session or folder of that name",
+                           oldname);
+        goto out;
+    }
+
+    /*
+     * If the two names are the same but for their case, then a rename
+     * changing only the case is meant, and the destination appearing to
+     * exist is not a collision: it is the very thing being renamed.
+     */
+    {
+        bool case_only = (stricmp(oldpath, newpath) == 0);
+
+        if (!case_only && path_is_dir(newpath)) {
+            errmsg = dupprintf("Unable to rename \"%s\" to \"%s\":\n"
+                               "a folder of that name already exists",
+                               oldname, newname);
+            goto out;
+        }
+
+        /* Refuse to overwrite another session. */
+        if (!case_only && path_exists(newpath)) {
+            errmsg = dupprintf("Unable to rename \"%s\" to \"%s\":\n"
+                               "a session of that name already exists",
+                               oldname, newname);
+            goto out;
+        }
+    }
+
+    if (!create_parent_dirs(newpath)) {
+        errmsg = dupprintf("Unable to create the folder for \"%s\":\n%s",
+                           newname, win_strerror(GetLastError()));
+        goto out;
+    }
+
+    if (!rename_session_file(oldpath, newpath)) {
+        errmsg = dupprintf("Unable to rename \"%s\" to \"%s\":\n%s",
+                           oldname, newname, win_strerror(GetLastError()));
+        goto out;
+    }
+
+    /*
+     * Tidy away the folder the session used to be in, if that has been
+     * left empty. (For a folder rename this is the folder's own parent,
+     * not the folder itself.)
+     */
+    prune_empty_dirs(oldpath);
+    if (!is_folder)
+        remove_session_from_jumplist(oldname);
+
+  out:
+    sfree(oldpath);
+    sfree(newpath);
+    return errmsg;
+}
+
 struct settings_e {
     char **names;                      /* names of all the sessions */
     int nnames;

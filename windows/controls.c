@@ -2593,18 +2593,305 @@ bool winctrl_handle_command(struct dlgparam *dp, UINT msg,
 
 /*
  * ======================================================================
+ * Renaming the item of a tree list box in place.
+ *
+ * Choosing `Rename' in the context menu puts an edit box over the
+ * item's label, in the same way that renaming a file works in Explorer.
+ * Enter, or clicking somewhere else in the dialog, commits the new
+ * name; Escape abandons it. A committed name is passed to the control's
+ * handler as an EVENT_RENAME, with the full new name (folder path
+ * included) in dp->tree_newname. If a folder was renamed, the folder's
+ * old path is in dp->tree_folder, as for an EVENT_OPEN_FOLDER.
+ * ======================================================================
+ */
+
+struct rename_edit {
+    HWND edit;                   /* the edit box overlaying the label */
+    WNDPROC oldproc;             /* the edit box's previous window proc */
+    struct dlgparam *dp;
+    dlgcontrol *ctrl;
+    HTREEITEM item;
+    bool done;                   /* commit or cancel has already happened */
+};
+
+/* The text typed into the rename box, trimmed, or NULL if it's empty. */
+static char *rename_edit_text(HWND edit)
+{
+    int len = GetWindowTextLengthW(edit);
+    wchar_t *wtext;
+    char *text, *start;
+    size_t taillen;
+
+    if (len <= 0)
+        return NULL;
+
+    wtext = snewn(len + 1, wchar_t);
+    GetWindowTextW(edit, wtext, len + 1);
+    text = dup_wc_to_mb(DEFAULT_CODEPAGE, wtext, "?");
+    sfree(wtext);
+
+    /* A session name can neither start nor end with a space. */
+    start = text;
+    while (*start == ' ')
+        start++;
+    taillen = strlen(start);
+    while (taillen > 0 && start[taillen-1] == ' ')
+        taillen--;
+
+    if (taillen == 0) {
+        sfree(text);
+        return NULL;
+    }
+
+    memmove(text, start, taillen);
+    text[taillen] = '\0';
+    return text;
+}
+
+/*
+ * The name that a session or folder with the '/'-separated path
+ * `oldpath' would have if its last component became `leaf'. So
+ * "prod/web-01" becomes "prod/<leaf>", and "prod" becomes "<leaf>".
+ */
+static char *rename_new_name(const char *oldpath, const char *leaf)
+{
+    const char *slash = strrchr(oldpath, '/');
+    strbuf *sb;
+    char *ret;
+
+    if (!slash)
+        return dupstr(leaf);
+
+    sb = strbuf_new();
+    put_data(sb, oldpath, slash - oldpath);
+    put_byte(sb, '/');
+    put_dataz(sb, leaf);
+    ret = strbuf_to_str(sb);
+    return ret;
+}
+
+static void rename_edit_finish(struct rename_edit *re, bool commit)
+{
+    HWND edit = re->edit;
+    HWND tv = GetParent(edit);
+    struct dlgparam *dp = re->dp;
+    dlgcontrol *ctrl = re->ctrl;
+    HTREEITEM item = re->item;
+    bool is_folder = tree_index_of_item(tv, item) < 0;
+    bool hadfocus = (GetFocus() == edit);
+    char *leaf = NULL, *oldname = NULL, *newname = NULL;
+
+    if (re->done)
+        return;
+    re->done = true;
+
+    if (commit) {
+        leaf = rename_edit_text(edit);
+        if (leaf) {
+            oldname = tree_item_path(tv, item);
+            if (oldname)
+                newname = rename_new_name(oldname, leaf);
+            sfree(leaf);
+        }
+    }
+
+    /*
+     * Put the edit box's own window procedure back before destroying
+     * it, so that the destruction messages don't come back here and
+     * the state block can be freed.
+     */
+    SetWindowLongPtr(edit, GWLP_WNDPROC, (LONG_PTR)re->oldproc);
+    sfree(re);
+    DestroyWindow(edit);
+
+    if (hadfocus && IsWindow(tv))
+        SetFocus(tv);
+
+    if (!newname) {
+        /* Cancelled, nothing typed, or no name could be worked out. */
+        sfree(oldname);
+        return;
+    }
+
+    if (!IsWindow(tv)) {
+        /* The dialog went away under us; there's nothing to rename. */
+        sfree(oldname);
+        sfree(newname);
+        return;
+    }
+
+    /*
+     * Make sure the portable layer sees the item being renamed as the
+     * selected one. A click which moved the focus away has probably
+     * selected something else in the tree already, and the rename must
+     * apply to the item the user asked to rename.
+     */
+    TreeView_SelectItem(tv, item);
+
+    sfree(dp->tree_newname);
+    dp->tree_newname = newname;
+    if (is_folder) {
+        /*
+         * For a folder, the old path has to be reported too, since the
+         * selection can't stand for it (folders have no listbox index).
+         */
+        sfree(dp->tree_folder);
+        dp->tree_folder = oldname;
+        oldname = NULL;
+
+        /*
+         * If the folder was open, it should stay open under its new
+         * name when the tree is rebuilt below. (If the rename turns out
+         * to be refused, this simply records a path that doesn't exist,
+         * which does no harm.)
+         */
+        if (folder_is_expanded(dp->tree_folder))
+            set_folder_expanded(newname, true);
+    }
+    ctrl->handler(ctrl, dp, dp->data, EVENT_RENAME);
+    sfree(dp->tree_newname);
+    dp->tree_newname = NULL;
+    sfree(dp->tree_folder);
+    dp->tree_folder = NULL;
+    sfree(oldname);
+}
+
+static LRESULT CALLBACK rename_edit_proc(HWND hwnd, UINT msg,
+                                         WPARAM wParam, LPARAM lParam)
+{
+    struct rename_edit *re = (struct rename_edit *)GetWindowLongPtr(
+        hwnd, GWLP_USERDATA);
+    WNDPROC oldproc;
+
+    if (!re)
+        return DefWindowProc(hwnd, msg, wParam, lParam);
+
+    oldproc = re->oldproc;
+
+    switch (msg) {
+      case WM_GETDLGCODE:
+        /*
+         * Claim Enter and Escape for ourselves: here they mean `commit'
+         * and `cancel', not `press the default button' and `close the
+         * dialog'. Everything else is left to the edit box, so that
+         * typing, the arrow keys and Tab all work normally.
+         */
+        if (lParam) {
+            MSG *m = (MSG *)lParam;
+            if (m->message == WM_KEYDOWN &&
+                (m->wParam == VK_RETURN || m->wParam == VK_ESCAPE))
+                return DLGC_WANTMESSAGE;
+        }
+        break;
+
+      case WM_KEYDOWN:
+        if (wParam == VK_RETURN || wParam == VK_ESCAPE) {
+            rename_edit_finish(re, wParam == VK_RETURN);
+            return 0;
+        }
+        break;
+
+      case WM_CHAR:
+        /* Swallow the characters of the keys handled above. */
+        if (wParam == '\r' || wParam == '\n' || wParam == 27)
+            return 0;
+        break;
+
+      case WM_KILLFOCUS:
+        /*
+         * Clicking elsewhere commits the new name, as when renaming a
+         * file in Explorer - unless the dialog is closing, in which
+         * case there is nothing to commit it to.
+         */
+        rename_edit_finish(re, !re->dp->ended);
+        return 0;
+
+      case WM_NCDESTROY:
+        /*
+         * The edit box is being destroyed by someone else (probably
+         * because the dialog is going away), so just tidy up.
+         */
+        SetWindowLongPtr(hwnd, GWLP_USERDATA, 0);
+        sfree(re);
+        return CallWindowProc(oldproc, hwnd, msg, wParam, lParam);
+    }
+
+    return CallWindowProc(oldproc, hwnd, msg, wParam, lParam);
+}
+
+/* Put an edit box over the label of `item', and let the user type. */
+static void treebox_rename_item(struct dlgparam *dp, dlgcontrol *ctrl,
+                                HWND tv, HTREEITEM item)
+{
+    struct rename_edit *re;
+    RECT r;
+    char *text;
+    wchar_t *wtext;
+    HWND edit;
+    HFONT font;
+    int width;
+
+    if (!TreeView_GetItemRect(tv, item, &r, TRUE))
+        return;
+
+    text = tree_item_text(tv, item);
+    if (!text)
+        return;
+    wtext = dup_mb_to_wc(DEFAULT_CODEPAGE, text);
+    sfree(text);
+    if (!wtext)
+        return;
+
+    /* A little extra room, so that a short label doesn't cramp typing. */
+    width = r.right - r.left + 20;
+
+    edit = CreateWindowEx(0, "EDIT", NULL,
+                          WS_CHILD | ES_AUTOHSCROLL | ES_LEFT,
+                          r.left, r.top, width, r.bottom - r.top,
+                          tv, NULL, hinst, NULL);
+    if (!edit) {
+        sfree(wtext);
+        return;
+    }
+
+    font = (HFONT)SendMessage(tv, WM_GETFONT, 0, 0);
+    if (font)
+        SendMessage(edit, WM_SETFONT, (WPARAM)font, MAKELPARAM(true, 0));
+    SetWindowTextW(edit, wtext);
+    sfree(wtext);
+
+    re = snew(struct rename_edit);
+    re->edit = edit;
+    re->dp = dp;
+    re->ctrl = ctrl;
+    re->item = item;
+    re->done = false;
+    SetWindowLongPtr(edit, GWLP_USERDATA, (LONG_PTR)re);
+    re->oldproc = (WNDPROC)SetWindowLongPtr(
+        edit, GWLP_WNDPROC, (LONG_PTR)rename_edit_proc);
+
+    ShowWindow(edit, SW_SHOW);
+    SetFocus(edit);
+    SendMessage(edit, EM_SETSEL, 0, -1);
+}
+
+/*
+ * ======================================================================
  * Right-click menu for the items of a tree list box.
  *
  * The items of a tree list box are saved sessions and the folders they
- * live in, so the commands are the two things one wants to do with
- * them: `Open' starts the session (exactly as double-clicking it does),
- * and `Batch open' asks for every session in a folder to be started at
- * once. The latter is passed to the control's handler as an
- * EVENT_OPEN_FOLDER, with the folder's path in dp->tree_folder.
+ * live in, so the commands are the things one wants to do with them:
+ * `Open' starts the session (exactly as double-clicking it does),
+ * `Rename' changes a session's name, or a folder's (passed to the
+ * handler as an EVENT_RENAME, with the new name in dp->tree_newname and
+ * the old folder path, if any, in dp->tree_folder), and `Batch open'
+ * asks for every session in a folder to be started at once (an
+ * EVENT_OPEN_FOLDER, with the folder's path in dp->tree_folder).
  * ======================================================================
  */
 
 #define TREEMENU_CMD_OPEN 1
+#define TREEMENU_CMD_RENAME 2
 
 static void treemenu_add(HMENU menu, UINT id, const char *text)
 {
@@ -2628,7 +2915,7 @@ static bool treebox_context_menu(struct dlgparam *dp, dlgcontrol *ctrl,
     TVHITTESTINFO ht;
     POINT pt;
     HMENU menu;
-    int cmd;
+    int cmd, index;
     bool is_folder;
 
     /*
@@ -2644,16 +2931,33 @@ static bool treebox_context_menu(struct dlgparam *dp, dlgcontrol *ctrl,
         return false;
 
     TreeView_SelectItem(tv, ht.hItem);
-    is_folder = tree_index_of_item(tv, ht.hItem) < 0;
+    index = tree_index_of_item(tv, ht.hItem);
+    is_folder = index < 0;
 
     menu = CreatePopupMenu();
     if (!menu)
         return false;
-    treemenu_add(menu, TREEMENU_CMD_OPEN,
-                 is_folder ? "&Batch Open" : "&Open");
+    if (is_folder) {
+        treemenu_add(menu, TREEMENU_CMD_OPEN, "&Batch Open");
+        treemenu_add(menu, TREEMENU_CMD_RENAME, "&Rename");
+    } else {
+        treemenu_add(menu, TREEMENU_CMD_OPEN, "&Open");
+        /*
+         * Item 0 is the synthetic `Default Settings' entry, which
+         * doesn't stand for a stored session, so there is nothing to
+         * rename.
+         */
+        if (index > 0)
+            treemenu_add(menu, TREEMENU_CMD_RENAME, "&Rename");
+    }
     cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                          pt.x, pt.y, 0, dp->hwnd, NULL);
     DestroyMenu(menu);
+
+    if (cmd == TREEMENU_CMD_RENAME) {
+        treebox_rename_item(dp, ctrl, tv, ht.hItem);
+        return true;
+    }
 
     if (cmd != TREEMENU_CMD_OPEN)
         return false;
@@ -3064,6 +3368,12 @@ const char *dlg_listbox_get_folder(dlgcontrol *ctrl, dlgparam *dp)
     return dp->tree_folder;
 }
 
+const char *dlg_listbox_get_rename(dlgcontrol *ctrl, dlgparam *dp)
+{
+    (void)ctrl;
+    return dp->tree_newname;
+}
+
 bool dlg_listbox_issel(dlgcontrol *ctrl, dlgparam *dp, int index)
 {
     struct winctrl *c = dlg_findbyctrl(dp, ctrl);
@@ -3413,6 +3723,7 @@ void dp_init(struct dlgparam *dp)
     dp->wintitle = dp->errtitle = NULL;
     dp->fixed_pitch_fonts = true;
     dp->tree_folder = NULL;
+    dp->tree_newname = NULL;
 }
 
 void dp_add_tree(struct dlgparam *dp, struct winctrls *wc)
@@ -3426,4 +3737,5 @@ void dp_cleanup(struct dlgparam *dp)
     sfree(dp->wintitle);
     sfree(dp->errtitle);
     sfree(dp->tree_folder);
+    sfree(dp->tree_newname);
 }

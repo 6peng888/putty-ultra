@@ -118,6 +118,8 @@ struct FontSpec *fontspec_new(
 #define SetWindowLongPtr SetWindowLong
 #undef  GWLP_USERDATA
 #define GWLP_USERDATA GWL_USERDATA
+#undef  GWLP_WNDPROC
+#define GWLP_WNDPROC GWL_WNDPROC
 #undef  DWLP_MSGRESULT
 #define DWLP_MSGRESULT DWL_MSGRESULT
 /* Since we've clobbered the above functions, we should clobber the
@@ -499,6 +501,12 @@ struct dlgparam {
      * while the resulting EVENT_OPEN_FOLDER handler is running.
      */
     char *tree_folder;
+    /*
+     * Tree list boxes only: the new name the user has just typed for
+     * the selected session (the `Rename' context menu entry). Set while
+     * the resulting EVENT_RENAME handler is running.
+     */
+    char *tree_newname;
 };
 
 /*

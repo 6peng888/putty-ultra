@@ -112,6 +112,7 @@ Only on clean exit=仅在正常退出时
 # ===== 已保存会话树的右键菜单 =====
 &Open=打开(&O)
 &Batch Open=批量打开(&B)
+&Rename=重命名(&R)
 
 # ===== 会话 / 日志面板 =====
 Logging=日志
