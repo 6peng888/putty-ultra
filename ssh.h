@@ -204,6 +204,14 @@ char *share_ensure_dedicated_listener(ssh_sharing_state *state);
  */
 SshChannel *ssh_open_session_channel(Backend *be, Channel *chan);
 
+/*
+ * How much data is still queued for sending on a channel of ours, i.e.
+ * how much of what we have handed to the SSH layer has not yet left the
+ * machine. A frontend that writes to a channel of its own uses this to
+ * pace itself, and to report honest progress.
+ */
+size_t ssh_channel_backlog(Backend *be, SshChannel *sc);
+
 void ssh_connshare_log(Ssh *ssh, int event, const char *logtext,
                        const char *ds_err, const char *us_err);
 void share_setup_x11_channel(ssh_sharing_connstate *cs, share_channel *chan,
@@ -307,6 +315,15 @@ struct ConnectionLayerVtable {
     /* Query the size of the backlog on standard _input_ */
     size_t (*stdin_backlog)(ConnectionLayer *cl);
 
+    /*
+     * Query how much data is still queued for sending on a particular
+     * channel. A frontend that writes to a channel of its own (rather
+     * than to the terminal) needs this to pace itself: without it, it
+     * has no way of telling how much of what it has handed over has
+     * actually left the machine.
+     */
+    size_t (*channel_backlog)(ConnectionLayer *cl, SshChannel *sc);
+
     /* Tell the connection layer that the SSH connection itself has
      * backed up, so it should tell all currently open channels to
      * cease reading from their local input sources if they can. (Or
@@ -394,6 +411,8 @@ static inline void ssh_stdout_unthrottle(ConnectionLayer *cl, size_t bufsize)
 { cl->vt->stdout_unthrottle(cl, bufsize); }
 static inline size_t ssh_stdin_backlog(ConnectionLayer *cl)
 { return cl->vt->stdin_backlog(cl); }
+static inline size_t ssh_cl_channel_backlog(ConnectionLayer *cl, SshChannel *sc)
+{ return cl->vt->channel_backlog ? cl->vt->channel_backlog(cl, sc) : 0; }
 static inline void ssh_throttle_all_channels(ConnectionLayer *cl, bool thr)
 { cl->vt->throttle_all_channels(cl, thr); }
 static inline bool ssh_ldisc_option(ConnectionLayer *cl, int option)

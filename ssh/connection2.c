@@ -55,6 +55,7 @@ static bool ssh2_agent_forwarding_permitted(ConnectionLayer *cl);
 static void ssh2_terminal_size(ConnectionLayer *cl, int width, int height);
 static void ssh2_stdout_unthrottle(ConnectionLayer *cl, size_t bufsize);
 static size_t ssh2_stdin_backlog(ConnectionLayer *cl);
+static size_t ssh2_channel_backlog(ConnectionLayer *cl, SshChannel *sc);
 static void ssh2_throttle_all_channels(ConnectionLayer *cl, bool throttled);
 static bool ssh2_ldisc_option(ConnectionLayer *cl, int option);
 static void ssh2_set_ldisc_option(ConnectionLayer *cl, int option, bool value);
@@ -82,6 +83,7 @@ static const ConnectionLayerVtable ssh2_connlayer_vtable = {
     .terminal_size = ssh2_terminal_size,
     .stdout_unthrottle = ssh2_stdout_unthrottle,
     .stdin_backlog = ssh2_stdin_backlog,
+    .channel_backlog = ssh2_channel_backlog,
     .throttle_all_channels = ssh2_throttle_all_channels,
     .ldisc_option = ssh2_ldisc_option,
     .set_ldisc_option = ssh2_set_ldisc_option,
@@ -1677,6 +1679,23 @@ static size_t ssh2_stdin_backlog(ConnectionLayer *cl)
     c = container_of(s->mainchan_sc, struct ssh2_channel, sc);
     return s->mainchan ?
         bufchain_size(&c->outbuffer) + bufchain_size(&c->errbuffer) : 0;
+}
+
+/*
+ * How much is still queued for sending on one particular channel.
+ *
+ * The frontend may have channels of its own open (the file transfer
+ * window opens one), and the backlog of those is not covered by
+ * stdin_backlog, which only looks at the terminal's channel.
+ */
+static size_t ssh2_channel_backlog(ConnectionLayer *cl, SshChannel *sc)
+{
+    struct ssh2_channel *c;
+
+    if (!sc)
+        return 0;
+    c = container_of(sc, struct ssh2_channel, sc);
+    return bufchain_size(&c->outbuffer) + bufchain_size(&c->errbuffer);
 }
 
 static void ssh2_throttle_all_channels(ConnectionLayer *cl, bool throttled)

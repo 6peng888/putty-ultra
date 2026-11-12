@@ -1317,6 +1317,24 @@ SshChannel *ssh_open_session_channel(Backend *be, Channel *chan)
     return ssh_session_open(ssh->cl, chan);
 }
 
+size_t ssh_channel_backlog(Backend *be, SshChannel *sc)
+{
+    Ssh *ssh = container_of(be, Ssh, backend);
+    size_t backlog;
+
+    if (!ssh || !ssh->s || !ssh->cl || !sc)
+        return 0;
+    backlog = ssh_cl_channel_backlog(ssh->cl, sc);
+    /*
+     * Data that has already been packed into packets but not yet
+     * written to the socket is queued in the protocol layers below us;
+     * it counts as backlog too, because it hasn't left the machine.
+     */
+    if (ssh->base_layer)
+        backlog += ssh_ppl_queued_data_size(ssh->base_layer);
+    return backlog;
+}
+
 const BackendVtable ssh_backend = {
     .init = ssh_init,
     .free = ssh_free,

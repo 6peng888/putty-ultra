@@ -53,8 +53,12 @@
 #define SG_ID_CANCEL     1123
 #define SG_ID_PROGRESS   1130
 #define SG_ID_STATUS     1131
+#define SG_ID_PROGTEXT   1132
 
 #define SG_CLASSNAME L"PuTTYSftpWindow"
+
+/* Timer that keeps the transfer readout ticking while a batch runs. */
+#define SG_TIMER_PROGRESS 1
 
 /*
  * Messages the channel implementation posts to the window. The
@@ -243,6 +247,12 @@ struct SftpGui {
     struct SgPane lcl, rmt;     /* local and remote panes */
     HWND btn_upload, btn_download, btn_cancel;
     HWND prog, status;
+    HWND progtext;              /* "12.3 MB / 45.6 MB   1.2 MB/s" */
+
+    /* Realtime transfer rate, smoothed over successive samples. */
+    double speed;               /* bytes per second */
+    uint64_t speed_mark;        /* done_bytes at the last sample */
+    DWORD speed_tick;           /* GetTickCount() at the last sample */
 
     /* Reassembly buffer for incoming SFTP data. */
     char *inbuf;
@@ -1738,8 +1748,16 @@ static void sg_set_busy(SftpGui *g, bool busy)
     EnableWindow(g->btn_cancel, busy);
     EnableWindow(g->rmt.up, !busy);
     EnableWindow(g->lcl.up, !busy);
+
+    /* The progress readout is driven by this timer while a transfer
+     * runs, so that it keeps ticking whatever the data flow does. */
+    if (busy)
+        SetTimer(g->hwnd, SG_TIMER_PROGRESS, 250, NULL);
+    else
+        KillTimer(g->hwnd, SG_TIMER_PROGRESS);
 }
 
+/* Advance the progress bar. Cheap enough to call per chunk of data. */
 static void sg_progress(SftpGui *g)
 {
     int permille = 0;
@@ -1749,6 +1767,56 @@ static void sg_progress(SftpGui *g)
     if (permille > 1000)
         permille = 1000;
     SendMessageW(g->prog, PBM_SETPOS, (WPARAM)permille, 0);
+}
+
+/*
+ * Refresh the "transferred / total   rate" text.
+ *
+ * This runs off a timer rather than off incoming data, because SCP
+ * hands a whole burst to the SSH layer in one go: keyed to the data, the
+ * figure would never update while that burst is draining. On a timer it
+ * stays live for both protocols, and the smoothing makes the rate read
+ * as a rate instead of jittering with every sample.
+ */
+static void sg_progress_refresh(SftpGui *g)
+{
+    DWORD now = GetTickCount();
+    DWORD dt = now - g->speed_tick;
+    char done[32], total[32], spd[32], text[160];
+
+    if (dt >= 100) {
+        double instant = (double)(g->done_bytes - g->speed_mark) * 1000.0 / dt;
+
+        if (g->speed <= 0.0)
+            g->speed = instant;
+        else
+            g->speed = g->speed * 0.35 + instant * 0.65;
+        g->speed_mark = g->done_bytes;
+        g->speed_tick = now;
+    }
+
+    sg_fmt_size(done, sizeof(done), g->done_bytes);
+    sg_fmt_size(total, sizeof(total), g->total_bytes);
+    if (g->speed >= 1024.0) {
+        sg_fmt_size(spd, sizeof(spd), (uint64_t)g->speed);
+        snprintf(text, sizeof(text), "%s / %s   %s/s", done, total, spd);
+    } else {
+        snprintf(text, sizeof(text), "%s / %s", done, total);
+    }
+    sg_set_text(g->progtext, text);
+    sg_progress(g);
+}
+
+/* The final figures, with no rate: shown once a batch has ended. */
+static void sg_progress_final(SftpGui *g)
+{
+    char done[32], total[32], text[96];
+
+    g->speed = 0.0;
+    sg_fmt_size(done, sizeof(done), g->done_bytes);
+    sg_fmt_size(total, sizeof(total), g->total_bytes);
+    snprintf(text, sizeof(text), "%s / %s", done, total);
+    sg_set_text(g->progtext, text);
 }
 
 /* ----------------------------------------------------------------------
@@ -1804,6 +1872,7 @@ static void sg_xfer_finish(SftpGui *g, const char *msg)
     g->at_eof = false;
     sg_tasks_free(g);
     sg_set_busy(g, false);
+    sg_progress_final(g);
     sg_status(g, msg);
     sg_remote_refresh(g);
     sg_local_refresh(g);
@@ -1827,6 +1896,7 @@ static void sg_xfer_fail(SftpGui *g, const char *why)
     g->handle = NULL;
     sg_tasks_free(g);
     sg_set_busy(g, false);
+    sg_progress_final(g);
     sg_status(g, why);
     sg_remote_refresh(g);
     sg_local_refresh(g);
@@ -2134,10 +2204,15 @@ static void sg_start_batch(SftpGui *g, bool uploading)
 {
     g->uploading = uploading;
     g->cancel = false;
+    /* total_bytes was worked out while queueing the selection, so it
+     * must not be cleared here. */
     g->done_bytes = 0;
-    g->total_bytes = 0;
     g->any_error = false;
+    g->speed = 0.0;
+    g->speed_mark = 0;
+    g->speed_tick = GetTickCount();
     SendMessageW(g->prog, PBM_SETPOS, 0, 0);
+    sg_set_text(g->progtext, "");
     sg_set_busy(g, true);
     sg_xfer_next(g);
 }
@@ -2273,7 +2348,8 @@ static void sg_scp_ul_pump(SftpGui *g)
          * it is what caps the amount of data in flight, and hence the
          * achievable throughput on a link with any real round trip.
          */
-        if (g->be && backend_sendbuffer(g->be) > 512 * 1024) {
+        if (g->be && g->exec_chan &&
+            ssh_channel_backlog(g->be, g->exec_chan->sc) > 512 * 1024) {
             PostMessage(g->hwnd, WM_SG_NOTIFY, SG_CH_PUMP, 0);
             return;
         }
@@ -2284,7 +2360,7 @@ static void sg_scp_ul_pump(SftpGui *g)
         sg_exec_write(g, buf, got);
         g->scp_sent += got;
         g->done_bytes += got;
-        sg_progress(g);
+        sg_progress_refresh(g);
     }
 
     /* End of the file body. */
@@ -2578,7 +2654,7 @@ static void sg_scp_rx(SftpGui *g, struct SgChan *c)
             sg_exec_consume(c, take);
             g->scp_remaining -= take;
             g->done_bytes += take;
-            sg_progress(g);
+            sg_progress_refresh(g);
             again = true;
             break;
           }
@@ -2786,7 +2862,7 @@ static void sg_handle_read_reply(SftpGui *g, struct sftp_request *req,
             return;
         }
         g->done_bytes += n;
-        sg_progress(g);
+        sg_progress_refresh(g);
     }
     sfree(ctx->buf);
     sfree(ctx);
@@ -2818,7 +2894,7 @@ static void sg_handle_write_reply(SftpGui *g, struct sftp_request *req,
     }
     g->done_bytes += ctx->len;
     sfree(ctx);
-    sg_progress(g);
+    sg_progress_refresh(g);
 
     if (g->cancel) {
         g->at_eof = true;
@@ -3170,6 +3246,9 @@ static void sg_enqueue_selection(SftpGui *g, bool from_local)
     int n = sg_lv_collect(lv, &idxs);
     int count = 0;
 
+    /* Sizes are accumulated here; the batch starts with none. */
+    g->total_bytes = 0;
+
     for (int i = 0; i < n; i++) {
         struct SgEntry *e;
         char *lpath, *rpath;
@@ -3379,6 +3458,9 @@ static void sg_create_controls(SftpGui *g)
     g->prog = sg_child(g, PROGRESS_CLASSW, "", 0, 0, SG_ID_PROGRESS);
     SendMessageW(g->prog, PBM_SETRANGE32, 0, 1000);
 
+    g->progtext = sg_child(g, L"STATIC", "", SS_RIGHT | SS_CENTERIMAGE, 0,
+                           SG_ID_PROGTEXT);
+
     g->status = sg_child(g, L"STATIC", "", SS_LEFT | SS_ENDELLIPSIS, 0,
                          SG_ID_STATUS);
 
@@ -3434,7 +3516,10 @@ static void sg_layout(SftpGui *g)
     by += row + gap * 2;
     sg_place(g->btn_cancel, bx, by, midw, row);
 
-    sg_place(g->prog, left_x, prog_y, total_w, prog_h);
+    /* The bar, with the transferred/total bytes and the rate beside it. */
+    sg_place(g->prog, left_x, prog_y, total_w - 300, prog_h);
+    sg_place(g->progtext, left_x + total_w - 296, prog_y - 2, 296,
+             prog_h + 4);
     sg_place(g->status, left_x, status_y, total_w, row);
 
     /*
@@ -3576,6 +3661,13 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       case WM_SIZE:
         if (g)
             sg_layout(g);
+        return 0;
+
+      case WM_TIMER:
+        if (g && wParam == SG_TIMER_PROGRESS) {
+            if (g->busy)
+                sg_progress_refresh(g);
+        }
         return 0;
 
       case WM_GETMINMAXINFO: {
