@@ -43,6 +43,7 @@ Local=本地
 Remote=远端
 Name=名称
 Size=大小
+Type=类型
 Modified=修改时间
 Upload ->=上传 ->
 <- Download=<- 下载

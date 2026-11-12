@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <ctype.h>
 #include <time.h>
 #include <wchar.h>
 
@@ -32,6 +33,7 @@
 #include "sftpgui.h"
 
 #include <commctrl.h>
+#include <shellapi.h>          /* SHGetFileInfoW: the system file icons */
 
 /* ----------------------------------------------------------------------
  * UI identifiers.
@@ -636,6 +638,106 @@ static void sg_place(HWND h, int x, int y, int w, int hgt)
     MoveWindow(h, x, y, w, hgt, TRUE);
 }
 
+/*
+ * The system's small-icon list, so the panes show the same folder and
+ * file icons as Explorer rather than a plain list of names. Asking
+ * shell32 for it once is enough; it is shared by every window in the
+ * process and must not be destroyed.
+ */
+static HIMAGELIST sg_sys_small_icons(void)
+{
+    static HIMAGELIST list;
+    static bool tried;
+
+    if (!tried) {
+        SHFILEINFOW sfi;
+        tried = true;
+        list = (HIMAGELIST)SHGetFileInfoW(
+            L"C:\\", FILE_ATTRIBUTE_DIRECTORY, &sfi, sizeof(sfi),
+            SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES);
+    }
+    return list;
+}
+
+/*
+ * Which icon to use for a name. SHGFI_USEFILEATTRIBUTES makes shell32
+ * work from the extension alone, without touching the file system,
+ * which is what lets it answer for remote names too.
+ */
+static int sg_icon_index(const char *name, bool is_dir)
+{
+    SHFILEINFOW sfi;
+    wchar_t *wname = sg_w(name);
+    DWORD attr = is_dir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+    int ret = -1;
+
+    if (SHGetFileInfoW(wname, attr, &sfi, sizeof(sfi),
+                       SHGFI_SYSICONINDEX | SHGFI_SMALLICON |
+                       SHGFI_USEFILEATTRIBUTES))
+        ret = sfi.iIcon;
+    sfree(wname);
+    return ret;
+}
+
+static const struct {
+    const char *ext;
+    const char *desc;
+} sg_types[] = {
+    { "zip", "压缩文件" },   { "7z", "压缩文件" },
+    { "rar", "压缩文件" },   { "tar", "压缩文件" },
+    { "gz", "压缩文件" },    { "xz", "压缩文件" },
+    { "bz2", "压缩文件" },
+    { "exe", "应用程序" },   { "msi", "安装程序" },  { "com", "应用程序" },
+    { "bat", "批处理文件" }, { "cmd", "批处理文件" },
+    { "dll", "应用程序扩展" }, { "sys", "系统文件" },
+    { "txt", "文本文档" },   { "log", "日志文件" },  { "md", "Markdown 文档" },
+    { "pdf", "PDF 文档" },
+    { "doc", "Word 文档" },  { "docx", "Word 文档" },
+    { "xls", "Excel 表格" }, { "xlsx", "Excel 表格" },
+    { "ppt", "演示文稿" },   { "pptx", "演示文稿" },
+    { "png", "PNG 图片" },   { "jpg", "JPEG 图片" },
+    { "jpeg", "JPEG 图片" }, { "gif", "GIF 图片" },
+    { "bmp", "BMP 图片" },   { "ico", "图标" },      { "svg", "SVG 图片" },
+    { "mp3", "音频文件" },   { "wav", "音频文件" },  { "flac", "音频文件" },
+    { "mp4", "视频文件" },   { "avi", "视频文件" },  { "mkv", "视频文件" },
+    { "mov", "视频文件" },
+    { "c", "C 源文件" },     { "h", "C 头文件" },    { "cpp", "C++ 源文件" },
+    { "py", "Python 源文件" }, { "sh", "Shell 脚本" }, { "pl", "Perl 脚本" },
+    { "js", "JavaScript 文件" }, { "java", "Java 源文件" }, { "go", "Go 源文件" },
+    { "rs", "Rust 源文件" },
+    { "html", "HTML 文档" }, { "htm", "HTML 文档" },
+    { "xml", "XML 文档" },   { "json", "JSON 文件" },
+    { "ini", "配置文件" },   { "conf", "配置文件" }, { "cfg", "配置文件" },
+};
+
+/* The text for the "Type" column. Caller frees. */
+static char *sg_type_name(const char *name, bool is_dir)
+{
+    const char *dot, *ext;
+    char upper[32];
+    size_t i;
+
+    if (!strcmp(name, ".."))
+        return dupstr("上级目录");
+    if (is_dir)
+        return dupstr("文件夹");
+
+    dot = strrchr(name, '.');
+    if (!dot || dot == name || !dot[1])
+        return dupstr("文件");
+    ext = dot + 1;
+
+    for (i = 0; i < lenof(sg_types); i++)
+        if (!stricmp(ext, sg_types[i].ext))
+            return dupstr(sg_types[i].desc);
+
+    /* Unknown extension: show it in the way Explorer does. */
+    for (i = 0; i < lenof(upper) - 1 && ext[i]; i++)
+        upper[i] = (char)toupper((unsigned char)ext[i]);
+    upper[i] = '\0';
+    return dupprintf("%s 文件", upper);
+}
+
 static void sg_lv_fill(HWND lv, struct SgEntry *ents, int n)
 {
     LVITEMW item;
@@ -645,18 +747,23 @@ static void sg_lv_fill(HWND lv, struct SgEntry *ents, int n)
     SendMessageW(lv, LVM_DELETEALLITEMS, 0, 0);
 
     for (int i = 0; i < n; i++) {
-        wchar_t *wname, *wsize, *wtime;
-        int idx;
+        wchar_t *wname, *wsize, *wtype, *wtime;
+        char *type;
+        int idx, icon;
 
         if (ents[i].is_dir)
             sizebuf[0] = '\0';
         else
             sg_fmt_size(sizebuf, sizeof(sizebuf), ents[i].size);
         sg_fmt_time(timebuf, sizeof(timebuf), ents[i].mtime);
+        type = sg_type_name(ents[i].name, ents[i].is_dir);
 
         wname = ents[i].wname ? sg_dupw(ents[i].wname) : sg_w(ents[i].name);
         wsize = sg_w(sizebuf);
+        wtype = sg_w(type);
         wtime = sg_w(timebuf);
+        icon = sg_icon_index(ents[i].name, ents[i].is_dir);
+        sfree(type);
 
         memset(&item, 0, sizeof(item));
         item.mask = LVIF_TEXT | LVIF_PARAM;
@@ -664,6 +771,10 @@ static void sg_lv_fill(HWND lv, struct SgEntry *ents, int n)
         item.iSubItem = 0;
         item.pszText = wname;
         item.lParam = (LPARAM)i;
+        if (icon >= 0) {
+            item.mask |= LVIF_IMAGE;
+            item.iImage = icon;
+        }
         idx = (int)SendMessageW(lv, LVM_INSERTITEMW, 0, (LPARAM)&item);
 
         item.mask = LVIF_TEXT;
@@ -672,11 +783,15 @@ static void sg_lv_fill(HWND lv, struct SgEntry *ents, int n)
         item.pszText = wsize;
         SendMessageW(lv, LVM_SETITEMTEXTW, idx, (LPARAM)&item);
         item.iSubItem = 2;
+        item.pszText = wtype;
+        SendMessageW(lv, LVM_SETITEMTEXTW, idx, (LPARAM)&item);
+        item.iSubItem = 3;
         item.pszText = wtime;
         SendMessageW(lv, LVM_SETITEMTEXTW, idx, (LPARAM)&item);
 
         sfree(wname);
         sfree(wsize);
+        sfree(wtype);
         sfree(wtime);
     }
 
@@ -2978,14 +3093,23 @@ static HWND sg_child(SftpGui *g, const wchar_t *cls, const char *text,
 
 static void sg_lv_columns(HWND lv)
 {
-    static const char *const titles[3] = { "Name", "Size", "Modified" };
+    static const char *const titles[] = { "Name", "Size", "Type", "Modified" };
+    static const int widths[] = { 200, 84, 88, 112 };
     LVCOLUMNW col;
+    HIMAGELIST icons = sg_sys_small_icons();
 
-    for (int i = 0; i < 3; i++) {
+    /*
+     * Report view draws the small image list beside the first column,
+     * which is what puts the folder/file icon in front of each name.
+     */
+    if (icons)
+        SendMessageW(lv, LVM_SETIMAGELIST, LVSIL_SMALL, (LPARAM)icons);
+
+    for (int i = 0; i < (int)lenof(titles); i++) {
         wchar_t *w = sg_w(i18n_or(titles[i]));
         memset(&col, 0, sizeof(col));
         col.mask = LVCF_TEXT | LVCF_WIDTH;
-        col.cx = (i == 0 ? 200 : i == 1 ? 76 : 128);
+        col.cx = widths[i];
         col.pszText = w;
         SendMessageW(lv, LVM_INSERTCOLUMNW, i, (LPARAM)&col);
         sfree(w);
@@ -3040,7 +3164,7 @@ static void sg_create_controls(SftpGui *g)
 static void sg_layout(SftpGui *g)
 {
     RECT rc;
-    int W, H, m = 8, gap = 6, row = 24, midw = 116, prog_h = 16;
+    int W, H, m = 8, gap = 6, row = 24, midw = 96, prog_h = 16;
     int pane_w, left_x, right_x, list_y, list_h, prog_y, status_y, bx, by;
     int namew, total_w;
     int i;
@@ -3084,14 +3208,23 @@ static void sg_layout(SftpGui *g)
     sg_place(g->prog, left_x, prog_y, total_w, prog_h);
     sg_place(g->status, left_x, status_y, total_w, row);
 
-    namew = pane_w - 76 - 128;
-    if (namew < 60)
-        namew = 60;
+    /*
+     * Size, Type and Modified are fixed; Name takes whatever is left.
+     * Size the name column from the list view's real width minus room
+     * for the vertical scrollbar, so a horizontal scrollbar does not
+     * appear the moment the list is long enough to scroll.
+     */
     for (i = 0; i < 2; i++) {
         HWND lv = i ? g->rmt.list : g->lcl.list;
+
+        GetClientRect(lv, &rc);
+        namew = (rc.right - rc.left) - 22 - 84 - 88 - 112;
+        if (namew < 90)
+            namew = 90;
         SendMessageW(lv, LVM_SETCOLUMNWIDTH, 0, MAKELPARAM(namew, 0));
-        SendMessageW(lv, LVM_SETCOLUMNWIDTH, 1, MAKELPARAM(76, 0));
-        SendMessageW(lv, LVM_SETCOLUMNWIDTH, 2, MAKELPARAM(128, 0));
+        SendMessageW(lv, LVM_SETCOLUMNWIDTH, 1, MAKELPARAM(84, 0));
+        SendMessageW(lv, LVM_SETCOLUMNWIDTH, 2, MAKELPARAM(88, 0));
+        SendMessageW(lv, LVM_SETCOLUMNWIDTH, 3, MAKELPARAM(112, 0));
     }
 }
 
@@ -3211,8 +3344,9 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
 
       case WM_GETMINMAXINFO: {
         MINMAXINFO *mmi = (MINMAXINFO *)lParam;
-        mmi->ptMinTrackSize.x = 560;
-        mmi->ptMinTrackSize.y = 340;
+        /* Wide enough for both panes' four columns plus the buttons. */
+        mmi->ptMinTrackSize.x = 1024;
+        mmi->ptMinTrackSize.y = 420;
         return 0;
       }
 
@@ -3345,7 +3479,7 @@ static void sg_open(HWND parent, Backend *be, bool scp)
     title = sg_w(i18n_or(scp ? "SCP File Transfer" : "SFTP File Transfer"));
     hwnd = CreateWindowExW(0, SG_CLASSNAME, title,
                            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 880, 540,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 1200, 640,
                            parent, NULL, inst, be);
     sfree(title);
 
