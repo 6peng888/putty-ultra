@@ -34,6 +34,7 @@
 
 #include <commctrl.h>
 #include <shellapi.h>          /* SHGetFileInfoW: the system file icons */
+#include <shlobj.h>            /* SHGetFolderPathW: the shell's folders */
 
 /* ----------------------------------------------------------------------
  * UI identifiers.
@@ -67,6 +68,8 @@
 #define SG_CH_SUBSYS_BAD  3     /* the server refused the subsystem */
 #define SG_CH_EXEC_DONE   4     /* an exec channel has finished */
 #define SG_CH_PUMP        5     /* carry on feeding an SCP upload */
+#define SG_CH_PICK_LOCAL  6     /* a local drop-down item was chosen */
+#define SG_CH_PICK_REMOTE 7     /* a remote drop-down item was chosen */
 
 /*
  * State of the single SFTP request the window has outstanding outside
@@ -150,6 +153,14 @@ struct SgPane {
     char *cwd;                  /* UTF-8 */
     struct SgEntry *ents;
     int nents, entsize;
+
+    /* The path box is an editable combo box with a drop-down history of
+     * places worth jumping to (see sg_local_combo_build and
+     * sg_remote_combo_build). 'edit' is the combo's real edit control,
+     * which is what the keyboard subclass is installed on. */
+    HWND edit;
+    char **cbpath;              /* the full path behind each drop item */
+    int ncbpath, cbcap;
 };
 
 /* What to do next in a transfer batch. */
@@ -208,6 +219,12 @@ struct SftpGui {
     bool exec_ok;
     char *exec_out, *exec_err;
     size_t exec_outlen, exec_errlen;
+
+    /*
+     * A path picked from a drop-down, waiting to be navigated to once
+     * the combo box has finished updating its own edit field.
+     */
+    char *pick;
 
     /* SCP: state of the interactive scp session in progress. */
     int scp_state;
@@ -736,6 +753,196 @@ static char *sg_type_name(const char *name, bool is_dir)
         upper[i] = (char)toupper((unsigned char)ext[i]);
     upper[i] = '\0';
     return dupprintf("%s 文件", upper);
+}
+
+/* ----------------------------------------------------------------------
+ * The path boxes.
+ *
+ * Each pane's path box is an editable combo box: the text stays a
+ * normal path box that can be typed into, but the drop-down lists the
+ * places worth jumping to - the shell's folders and the drives on the
+ * local side, the components of the current path on the remote side -
+ * so a far-away directory is two clicks away instead of a typed path.
+ */
+
+static void sg_combo_reset(struct SgPane *p)
+{
+    for (int i = 0; i < p->ncbpath; i++)
+        sfree(p->cbpath[i]);
+    p->ncbpath = 0;
+    SendMessageW(p->path, CB_RESETCONTENT, 0, 0);
+}
+
+static void sg_combo_add(struct SgPane *p, const char *display,
+                         const char *path, int icon)
+{
+    wchar_t *w = sg_w(display);
+    int idx = (int)SendMessageW(p->path, CB_ADDSTRING, 0, (LPARAM)w);
+
+    sfree(w);
+    if (idx < 0 || idx == CB_ERRSPACE)
+        return;
+    SendMessageW(p->path, CB_SETITEMDATA, idx, (LPARAM)icon);
+
+    if (p->ncbpath >= p->cbcap) {
+        p->cbcap = p->cbcap ? p->cbcap * 2 : 16;
+        p->cbpath = sresize(p->cbpath, p->cbcap, char *);
+    }
+    p->cbpath[p->ncbpath++] = dupstr(path);
+}
+
+/* The icon for a path that really exists (a drive or a folder). */
+static int sg_icon_for_path(const wchar_t *wpath)
+{
+    SHFILEINFOW sfi;
+
+    if (SHGetFileInfoW(wpath, 0, &sfi, sizeof(sfi),
+                       SHGFI_SYSICONINDEX | SHGFI_SMALLICON))
+        return sfi.iIcon;
+    return -1;
+}
+
+static void sg_local_combo_build(SftpGui *g)
+{
+    static const struct { int csidl; const char *label; } shell[] = {
+        { CSIDL_PERSONAL,         "我的文档" },
+        { CSIDL_DESKTOPDIRECTORY, "桌面" },
+        { CSIDL_PROFILE,          "用户目录" },
+    };
+    wchar_t buf[MAX_PATH + 1];
+    wchar_t drives[512];
+
+    sg_combo_reset(&g->lcl);
+
+    /* A few of the shell's own folders first, like Explorer's address
+     * bar does, since those are what people reach for most often. */
+    for (size_t i = 0; i < lenof(shell); i++) {
+        if (SHGetFolderPathW(NULL, shell[i].csidl, NULL, 0, buf) == S_OK) {
+            char *u = sg_to_utf8(buf);
+
+            sg_combo_add(&g->lcl, shell[i].label, u, sg_icon_for_path(buf));
+            sfree(u);
+        }
+    }
+
+    if (GetLogicalDriveStringsW(lenof(drives) - 1, drives)) {
+        for (wchar_t *p = drives; *p; p += wcslen(p) + 1) {
+            wchar_t label[MAX_PATH + 1] = L"";
+            const char *kind;
+            char *u, *disp;
+            int icon;
+
+            switch (GetDriveTypeW(p)) {
+              case DRIVE_REMOVABLE: kind = "可移动磁盘"; break;
+              case DRIVE_FIXED:     kind = "本地磁盘"; break;
+              case DRIVE_REMOTE:    kind = "网络驱动器"; break;
+              case DRIVE_CDROM:     kind = "光盘驱动器"; break;
+              case DRIVE_RAMDISK:   kind = "内存盘"; break;
+              default:              kind = "驱动器"; break;
+            }
+
+            if (GetVolumeInformationW(p, label, lenof(label) - 1,
+                                      NULL, NULL, NULL, NULL, 0) &&
+                label[0]) {
+                char *ul = sg_to_utf8(label);
+                disp = dupprintf("%c: %s (%s)", (char)p[0], kind, ul);
+                sfree(ul);
+            } else {
+                disp = dupprintf("%c: %s", (char)p[0], kind);
+            }
+
+            u = sg_to_utf8(p);
+            icon = sg_icon_for_path(p);
+            sg_combo_add(&g->lcl, disp, u, icon);
+            sfree(disp);
+            sfree(u);
+        }
+    }
+
+    /* CB_RESETCONTENT took the text out of the edit field with it. */
+    sg_set_text(g->lcl.path, g->lcl.cwd);
+}
+
+static void sg_remote_combo_build(SftpGui *g)
+{
+    const char *cwd = g->rmt.cwd;
+    const char *p;
+    int icon = sg_icon_index("folder", true);
+
+    sg_combo_reset(&g->rmt);
+
+    /* The root, then one entry per path component, each of which is a
+     * complete path in its own right. */
+    sg_combo_add(&g->rmt, "/", "/", icon);
+
+    for (p = cwd; *p; ) {
+        char *prefix;
+        size_t n;
+
+        while (*p == '/')
+            p++;
+        if (!*p)
+            break;
+        while (*p && *p != '/')
+            p++;
+
+        n = (size_t)(p - cwd);
+        prefix = snewn(n + 1, char);
+        memcpy(prefix, cwd, n);
+        prefix[n] = '\0';
+        sg_combo_add(&g->rmt, prefix, prefix, icon);
+        sfree(prefix);
+    }
+
+    /* Highlight the entry we are currently in, and put the full path
+     * back in the edit field afterwards (CB_RESETCONTENT empties it). */
+    for (int i = 0; i < g->rmt.ncbpath; i++) {
+        if (!strcmp(g->rmt.cbpath[i], cwd)) {
+            SendMessageW(g->rmt.path, CB_SETCURSEL, i, 0);
+            break;
+        }
+    }
+    sg_set_text(g->rmt.path, g->rmt.cwd);
+}
+
+/* Draw one drop-down entry: its icon, then its text. */
+static void sg_combo_draw(const DRAWITEMSTRUCT *dis)
+{
+    wchar_t text[512];
+    HDC dc = dis->hDC;
+    RECT rc = dis->rcItem;
+    HIMAGELIST icons = sg_sys_small_icons();
+    COLORREF bk, fg;
+    int icon = -1, x;
+
+    /* The selection field of an editable combo keeps its own edit
+     * control, which paints (and scrolls) the text itself. */
+    if (dis->itemID == (UINT)-1)
+        return;
+
+    text[0] = L'\0';
+    SendMessageW(dis->hwndItem, CB_GETLBTEXT, dis->itemID, (LPARAM)text);
+    icon = (int)SendMessageW(dis->hwndItem, CB_GETITEMDATA, dis->itemID, 0);
+
+    if (dis->itemState & ODS_SELECTED) {
+        bk = GetSysColor(COLOR_HIGHLIGHT);
+        fg = GetSysColor(COLOR_HIGHLIGHTTEXT);
+    } else {
+        bk = GetSysColor(COLOR_WINDOW);
+        fg = GetSysColor(COLOR_WINDOWTEXT);
+    }
+    SetBkColor(dc, bk);
+    SetTextColor(dc, fg);
+    ExtTextOutW(dc, rc.left, rc.top, ETO_OPAQUE, &rc, NULL, 0, NULL);
+
+    x = rc.left + 2;
+    if (icons && icon >= 0) {
+        ImageList_Draw(icons, icon, dc, x, rc.top + 2, ILD_TRANSPARENT);
+        x += 18;
+    }
+    rc.left = x;
+    DrawTextW(dc, text, -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+              DT_END_ELLIPSIS | DT_NOPREFIX);
 }
 
 static void sg_lv_fill(HWND lv, struct SgEntry *ents, int n)
@@ -3058,9 +3265,9 @@ static void sg_edit_enter(HWND hwnd)
         return;
     GetWindowTextW(hwnd, buf, lenof(buf));
     path = sg_to_utf8(buf);
-    if (hwnd == g->lcl.path)
+    if (hwnd == g->lcl.edit)
         sg_local_goto(g, path);
-    else if (hwnd == g->rmt.path)
+    else if (hwnd == g->rmt.edit)
         sg_remote_goto(g, path);
     sfree(path);
 }
@@ -3116,23 +3323,40 @@ static void sg_lv_columns(HWND lv)
     }
 }
 
+/*
+ * A path box is an editable combo box. Its real edit control is a child
+ * window, and that is where the Return key has to be intercepted, so
+ * subclass it rather than the combo.
+ */
+static void sg_subclass_combo(struct SgPane *p)
+{
+    COMBOBOXINFO ci;
+
+    memset(&ci, 0, sizeof(ci));
+    ci.cbSize = sizeof(ci);
+    if (GetComboBoxInfo(p->path, &ci) && ci.hwndItem) {
+        p->edit = ci.hwndItem;
+        sg_edit_origproc = (WNDPROC)SetWindowLongPtrW(
+            p->edit, GWLP_WNDPROC, (LONG_PTR)sg_edit_proc);
+    }
+}
+
 static void sg_create_controls(SftpGui *g)
 {
+    const DWORD combo_style = CBS_DROPDOWN | CBS_AUTOHSCROLL |
+        CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP;
+
     g->lcl.label = sg_child(g, L"STATIC", "Local", SS_LEFT, 0, SG_ID_L_LABEL);
-    g->lcl.path = sg_child(g, L"EDIT", "", WS_BORDER | ES_AUTOHSCROLL, 0,
-                           SG_ID_L_PATH);
-    sg_edit_origproc = (WNDPROC)SetWindowLongPtrW(
-        g->lcl.path, GWLP_WNDPROC, (LONG_PTR)sg_edit_proc);
+    g->lcl.path = sg_child(g, L"COMBOBOX", "", combo_style, 0, SG_ID_L_PATH);
+    sg_subclass_combo(&g->lcl);
     g->lcl.up = sg_child(g, L"BUTTON", "..", BS_PUSHBUTTON, 0, SG_ID_L_UP);
     g->lcl.list = sg_child(g, WC_LISTVIEWW, "",
                            LVS_REPORT | LVS_SHOWSELALWAYS, WS_EX_CLIENTEDGE,
                            SG_ID_L_LIST);
 
     g->rmt.label = sg_child(g, L"STATIC", "Remote", SS_LEFT, 0, SG_ID_R_LABEL);
-    g->rmt.path = sg_child(g, L"EDIT", "", WS_BORDER | ES_AUTOHSCROLL, 0,
-                           SG_ID_R_PATH);
-    sg_edit_origproc = (WNDPROC)SetWindowLongPtrW(
-        g->rmt.path, GWLP_WNDPROC, (LONG_PTR)sg_edit_proc);
+    g->rmt.path = sg_child(g, L"COMBOBOX", "", combo_style, 0, SG_ID_R_PATH);
+    sg_subclass_combo(&g->rmt);
     g->rmt.up = sg_child(g, L"BUTTON", "..", BS_PUSHBUTTON, 0, SG_ID_R_UP);
     g->rmt.list = sg_child(g, WC_LISTVIEWW, "",
                            LVS_REPORT | LVS_SHOWSELALWAYS, WS_EX_CLIENTEDGE,
@@ -3187,13 +3411,18 @@ static void sg_layout(SftpGui *g)
     if (list_h < 60)
         list_h = 60;
 
+    /*
+     * The path boxes are combo boxes: the height given here is the
+     * height of the drop-down list, not of the closed box (Windows
+     * sizes that from the font).
+     */
     sg_place(g->lcl.label, left_x, m, 46, row);
-    sg_place(g->lcl.path, left_x + 48, m, pane_w - 48 - 30, row);
+    sg_place(g->lcl.path, left_x + 48, m, pane_w - 48 - 30, row + 220);
     sg_place(g->lcl.up, left_x + pane_w - 28, m, 28, row);
     sg_place(g->lcl.list, left_x, list_y, pane_w, list_h);
 
     sg_place(g->rmt.label, right_x, m, 46, row);
-    sg_place(g->rmt.path, right_x + 48, m, pane_w - 48 - 30, row);
+    sg_place(g->rmt.path, right_x + 48, m, pane_w - 48 - 30, row + 220);
     sg_place(g->rmt.up, right_x + pane_w - 28, m, 28, row);
     sg_place(g->rmt.list, right_x, list_y, pane_w, list_h);
 
@@ -3258,9 +3487,16 @@ static void sg_free(SftpGui *g, bool channel_still_ours)
     sg_entries_free(g->lcl.ents, g->lcl.nents);
     sg_entries_free(g->rmt.ents, g->rmt.nents);
     sg_entries_free(g->rents, g->nrents);
+    for (int i = 0; i < g->lcl.ncbpath; i++)
+        sfree(g->lcl.cbpath[i]);
+    sfree(g->lcl.cbpath);
+    for (int i = 0; i < g->rmt.ncbpath; i++)
+        sfree(g->rmt.cbpath[i]);
+    sfree(g->rmt.cbpath);
     sfree(g->lcl.cwd);
     sfree(g->rmt.cwd);
     sfree(g->target_path);
+    sfree(g->pick);
     sfree(g->inbuf);
     sfree(g->exec_out);
     sfree(g->exec_err);
@@ -3374,6 +3610,24 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             if (g->pend == SG_P_SCP_UPLOAD && g->scp_state == SG_SU_DATA)
                 sg_scp_ul_pump(g);
             break;
+          case SG_CH_PICK_LOCAL: {
+            char *p = g->pick;
+            g->pick = NULL;
+            if (p) {
+                sg_local_goto(g, p);
+                sfree(p);
+            }
+            break;
+          }
+          case SG_CH_PICK_REMOTE: {
+            char *p = g->pick;
+            g->pick = NULL;
+            if (p) {
+                sg_remote_goto(g, p);
+                sfree(p);
+            }
+            break;
+          }
           case SG_CH_OPENFAILED: {
             char *text = (char *)lParam;
             sg_fatal(g, text);
@@ -3412,8 +3666,61 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             sfree(p);
             return 0;
           }
+
+          case SG_ID_L_PATH:
+            /* Refill the list every time it is opened, so a drive that
+             * was plugged in a moment ago is already there. */
+            if (HIWORD(wParam) == CBN_DROPDOWN) {
+                sg_local_combo_build(g);
+            } else if (HIWORD(wParam) == CBN_SELCHANGE) {
+                int i = (int)SendMessageW(g->lcl.path, CB_GETCURSEL, 0, 0);
+                if (i >= 0 && i < g->lcl.ncbpath) {
+                    sfree(g->pick);
+                    g->pick = dupstr(g->lcl.cbpath[i]);
+                    /*
+                     * Navigate from a posted message rather than here:
+                     * the combo box overwrites the edit field with the
+                     * item's display text after this notification
+                     * returns, which would replace the path we set.
+                     */
+                    PostMessage(hwnd, WM_SG_NOTIFY, SG_CH_PICK_LOCAL, 0);
+                }
+            }
+            return 0;
+
+          case SG_ID_R_PATH:
+            if (HIWORD(wParam) == CBN_DROPDOWN) {
+                sg_remote_combo_build(g);
+            } else if (HIWORD(wParam) == CBN_SELCHANGE) {
+                int i = (int)SendMessageW(g->rmt.path, CB_GETCURSEL, 0, 0);
+                if (i >= 0 && i < g->rmt.ncbpath) {
+                    sfree(g->pick);
+                    g->pick = dupstr(g->rmt.cbpath[i]);
+                    PostMessage(hwnd, WM_SG_NOTIFY, SG_CH_PICK_REMOTE, 0);
+                }
+            }
+            return 0;
         }
         break;
+
+      case WM_MEASUREITEM: {
+        MEASUREITEMSTRUCT *mis = (MEASUREITEMSTRUCT *)lParam;
+        if (mis->CtlType == ODT_COMBOBOX) {
+            mis->itemHeight = 20;
+            return TRUE;
+        }
+        break;
+      }
+
+      case WM_DRAWITEM: {
+        DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT *)lParam;
+        if (dis->CtlType == ODT_COMBOBOX &&
+            (dis->CtlID == SG_ID_L_PATH || dis->CtlID == SG_ID_R_PATH)) {
+            sg_combo_draw(dis);
+            return TRUE;
+        }
+        break;
+      }
 
       case WM_NOTIFY: {
         NMHDR *nm = (NMHDR *)lParam;

@@ -119,6 +119,9 @@ add_dependencies(putty generated_licence_h)
 target_link_libraries(putty
   guiterminal guimisc eventloop sshclient otherbackends settings network crypto
   utils
+  # The transfer window draws its drop-down icons with the image-list
+  # calls, which live in the common controls library.
+  comctl32
   ${platform_libraries})
 set_target_properties(putty PROPERTIES WIN32_EXECUTABLE ON)
 installed_program(putty)
