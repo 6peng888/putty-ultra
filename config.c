@@ -2146,20 +2146,21 @@ void setup_config_box(struct controlbox *b, bool midsession,
     ssd->listbox->column = 0;
     /*
      * Show the sessions as a folder hierarchy (a session whose name
-     * contains '/' is inside the folder named before the slash), and
-     * make the list tall enough to show all of them, within reason -
-     * so that a large collection of sessions doesn't need endless
-     * scrolling.
+     * contains '/' is inside the folder named before the slash).
+     *
+     * Make the list tall enough to fill the panel all the way down to
+     * the bottom of the category tree on the left, rather than sizing
+     * it to the number of sessions: a short list left a blank strip
+     * down the right-hand side of the box, which looked untidy and
+     * made the two sides of the dialog fail to line up. Extra sessions
+     * that don't fit simply scroll.
+     *
+     * A mid-session box has no destination group above the list, so
+     * the list has to be correspondingly taller (six list lines' worth)
+     * to reach the same place.
      */
     ssd->listbox->listbox.tree = true;
-    {
-        int lines = ssd->sesslist.nsessions + 1;
-        if (lines < 10)
-            lines = 10;
-        if (lines > 13)
-            lines = 13;
-        ssd->listbox->listbox.height = lines;
-    }
+    ssd->listbox->listbox.height = midsession ? 19 : 13;
     if (!midsession) {
         ssd->loadbutton = ctrl_pushbutton(s, "Load", 'l',
                                           HELPCTX(session_saved),
