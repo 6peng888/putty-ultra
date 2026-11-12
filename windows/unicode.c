@@ -1251,7 +1251,17 @@ bool BinarySink_put_wc_to_mb(
     if (!wclen)
         return true;
 
-    reverse_mapping *rmap = get_reverse_mapping(codepage);
+    /*
+     * Never use the single-byte reverse-mapping table for UTF-8. Such a
+     * table *does* get built for code page 65001 when the terminal is
+     * configured with a UTF-8 line character set (init_ucs calls
+     * make_reverse_mapping for the line code page), but it can only
+     * hold one byte per character, which is meaningless for UTF-8 and
+     * turns every non-Latin character into the substitute character.
+     * Fall through to WideCharToMultiByte instead, which does it right.
+     */
+    reverse_mapping *rmap = (codepage == CP_UTF8 ? NULL :
+                             get_reverse_mapping(codepage));
 
     if (rmap) {
         size_t defchr_len = 0;

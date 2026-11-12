@@ -312,7 +312,7 @@ SshChannel *ssh2_session_open(ConnectionLayer *cl, Channel *chan)
     c->halfopen = true;
     c->chan = chan;
 
-    ppl_logevent("Opening main session channel");
+    ppl_logevent("Opening session channel");
 
     pktout = ssh2_chanopen_init(c, "session");
     pq_push(s->ppl.out_pq, pktout);

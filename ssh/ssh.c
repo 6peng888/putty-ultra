@@ -1298,6 +1298,25 @@ char *backend_get_dedicated_share_pipe(Backend *be)
     return share_ensure_dedicated_listener(ssh->connshare);
 }
 
+SshChannel *ssh_open_session_channel(Backend *be, Channel *chan)
+{
+    Ssh *ssh;
+
+    if (be->vt != &ssh_backend && be->vt != &sshconn_backend)
+        return NULL;
+    ssh = container_of(be, Ssh, backend);
+
+    /*
+     * Only SSH-2 has the session channels we need, and the connection
+     * layer has to be up already: a channel opened while the protocol
+     * version is still being negotiated has nowhere to be sent.
+     */
+    if (ssh->version != 2 || !ssh->session_started || !ssh->cl)
+        return NULL;
+
+    return ssh_session_open(ssh->cl, chan);
+}
+
 const BackendVtable ssh_backend = {
     .init = ssh_init,
     .free = ssh_free,

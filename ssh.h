@@ -187,6 +187,23 @@ int share_ndownstreams(ssh_sharing_state *state);
  */
 char *share_ensure_dedicated_listener(ssh_sharing_state *state);
 
+/*
+ * Open an extra 'session'-type channel on an already-running SSH-2
+ * connection, so that a frontend feature can use a subsystem without
+ * dialling a second connection or asking for credentials again (the
+ * Windows GUI's SFTP browser is the only user of this).
+ *
+ * 'chan' is the caller's Channel implementation: it receives the
+ * channel's data and its open/close notifications, and is freed by the
+ * connection layer when the channel goes away. The caller sends
+ * whatever channel requests it needs (e.g. sshfwd_start_subsystem from
+ * its open_confirmation method).
+ *
+ * Returns NULL if 'be' is not a live SSH-2 connection with its
+ * connection layer up.
+ */
+SshChannel *ssh_open_session_channel(Backend *be, Channel *chan);
+
 void ssh_connshare_log(Ssh *ssh, int event, const char *logtext,
                        const char *ds_err, const char *us_err);
 void share_setup_x11_channel(ssh_sharing_connstate *cs, share_channel *chan,

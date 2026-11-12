@@ -21,6 +21,7 @@
 #include "putty-rc.h"
 #include "security-api.h"
 #include "win-gui-seat.h"
+#include "sftpgui.h"
 #include "tree234.h"
 
 #ifdef NO_MULTIMON
@@ -53,6 +54,9 @@
 #define IDM_PASTE     0x01A0
 #define IDM_RECONNECT 0x01B0
 #define IDM_DUPCHANNEL 0x01C0
+#define IDM_XFER      0x01D0     /* "File Transfer" submenu header */
+#define IDM_XFER_SFTP 0x01E0
+#define IDM_XFER_SCP  0x01F0     /* placeholder, not implemented yet */
 #define IDM_SPECIALSEP 0x0200
 
 #define IDM_SPECIAL_MIN 0x0400
@@ -143,6 +147,7 @@ static void tab_relayout(void);
 static int tab_find(WinGuiSeat *wgs);
 static void frame_set_title(WinGuiSeat *wgs);
 static void frame_build_saved_menu(void);
+static void frame_update_xfer_menu(void);
 static void open_new_session_dialog(void);
 static void open_pending_batch_sessions(void);
 static void close_tab(int idx, bool always_warn);
@@ -201,6 +206,9 @@ static int tab_active = -1;
 static bool g_quitting = false;
 static bool g_closing_all = false;   /* true while tearing down every tab on exit */
 static HMENU frame_savedsess_menu = NULL;
+static HMENU frame_xfer_menu = NULL;
+static int frame_xfer_menu_pos = -1;   /* position of the submenu in the
+                                        * frame's system menu */
 static RECT g_tabrects[MAX_TABS];
 static RECT g_plusrect;
 static int g_tabcount = 0;
@@ -1498,6 +1506,7 @@ static void tab_activate(int idx)
     frame_set_title(w);
     tab_relayout();
     SetFocus(w->term_hwnd);
+    frame_update_xfer_menu();
 }
 
 /*
@@ -2420,9 +2429,12 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
              * actually offering itself for reuse - which rules out a
              * tab that is itself a downstream of another one.
              */
+            bool live_ssh = (tab_active >= 0 &&
+                             tab_list[tab_active]->backend &&
+                             tab_list[tab_active]->backend->vt->protocol ==
+                             PROT_SSH);
             bool candup = false;
-            if (tab_active >= 0 && tab_list[tab_active]->backend &&
-                tab_list[tab_active]->backend->vt->protocol == PROT_SSH) {
+            if (live_ssh) {
                 char *pipename = backend_get_dedicated_share_pipe(
                     tab_list[tab_active]->backend);
                 candup = (pipename != NULL);
@@ -2430,6 +2442,8 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
             }
             EnableMenuItem((HMENU)wParam, IDM_DUPCHANNEL, MF_BYCOMMAND |
                            (candup ? MF_ENABLED : MF_GRAYED));
+            /* File transfer reuses the active session's SSH connection. */
+            frame_update_xfer_menu();
         }
         break;
 
@@ -2526,6 +2540,21 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
             }
             return 0;
         }
+        if ((wParam & ~0xF) == IDM_XFER)
+            return 0;   /* submenu header */
+        if ((wParam & ~0xF) == IDM_XFER_SFTP) {
+            /*
+             * Open the two-pane SFTP window on the active session's own
+             * SSH connection: it adds an extra channel to it rather
+             * than dialling again, so no new login is needed.
+             */
+            if (tab_active >= 0 && tab_list[tab_active]->backend &&
+                tab_list[tab_active]->backend->vt->protocol == PROT_SSH)
+                sftp_gui_open(tab_frame_hwnd, tab_list[tab_active]->backend);
+            return 0;
+        }
+        if ((wParam & ~0xF) == IDM_XFER_SCP)
+            return 0;   /* SCP transfer is not implemented yet */
         if (wParam >= IDM_SAVED_MIN && wParam < IDM_SAVED_MAX) {
             int p = (int)((wParam - IDM_SAVED_MIN) / MENU_SAVED_STEP);
             if (p + 1 < sesslist.nsessions) {
@@ -2648,6 +2677,35 @@ static int message_box_i18n(HWND hwnd, const char *text, const char *caption,
     return r;
 }
 
+/*
+ * Grey out the file-transfer submenu unless the active session is a
+ * live SSH connection, since the SFTP window borrows that connection
+ * rather than dialling a new one.
+ *
+ * The submenu itself has to be toggled by position. A popup item's
+ * stored identifier is the submenu handle, not the id passed to
+ * AppendMenu, so EnableMenuItem(..., MF_BYCOMMAND) would never find it
+ * and the item would stay greyed for ever.
+ */
+static void frame_update_xfer_menu(void)
+{
+    bool live_ssh = (tab_active >= 0 && tab_list[tab_active]->backend &&
+                     tab_list[tab_active]->backend->vt->protocol == PROT_SSH);
+    DWORD flags = live_ssh ? MF_ENABLED : MF_GRAYED;
+    HMENU sm;
+
+    if (frame_xfer_menu)
+        EnableMenuItem(frame_xfer_menu, IDM_XFER_SFTP,
+                       MF_BYCOMMAND | flags);
+
+    if (frame_xfer_menu_pos < 0 || !tab_frame_hwnd)
+        return;
+    sm = GetSystemMenu(tab_frame_hwnd, false);
+    if (sm)
+        EnableMenuItem(sm, (UINT)frame_xfer_menu_pos,
+                       MF_BYPOSITION | flags);
+}
+
 static void frame_build_menu(void)
 {
     HMENU sm = GetSystemMenu(tab_frame_hwnd, false);
@@ -2666,6 +2724,22 @@ static void frame_build_menu(void)
     /* Enabled on demand in WM_INITMENUPOPUP: only when the active
      * session is a live SSH connection it can share. */
     menu_add(sm, MF_GRAYED, IDM_DUPCHANNEL, "Duplicate channel");
+    /*
+     * File transfer submenu. Also enabled on demand in
+     * WM_INITMENUPOPUP, because both entries need a live SSH session.
+     */
+    frame_xfer_menu = CreateMenu();
+    menu_add(frame_xfer_menu, MF_ENABLED, IDM_XFER_SFTP, "&SFTP Transfer...");
+    /* SCP is a placeholder for now: greyed out until it exists. */
+    menu_add(frame_xfer_menu, MF_GRAYED, IDM_XFER_SCP, "S&CP Transfer");
+    menu_add(sm, MF_POPUP | MF_GRAYED, (UINT_PTR)frame_xfer_menu,
+             "&File Transfer");
+    /*
+     * Remember where we put it. A popup item's identifier is the
+     * submenu handle rather than the id we passed, so it has to be
+     * enabled by position instead of by command.
+     */
+    frame_xfer_menu_pos = (int)GetMenuItemCount(sm) - 1;
     AppendMenu(sm, MF_SEPARATOR, 0, 0);
     menu_add(sm, MF_ENABLED, IDM_COPY, "&Copy");
     menu_add(sm, MF_ENABLED, IDM_PASTE, "&Paste");

@@ -105,6 +105,13 @@ add_executable(putty
   window.c
   putty.c
   help.c
+  sftpgui.c
+  # The SFTP protocol code the GUI window drives. ssh/sftp.c is also
+  # built into psftp/pscp via the sftpclient library, but those also
+  # pull in windows/sftp.c and conflict with the GUI front end, so the
+  # two generic files are compiled in here directly.
+  ${CMAKE_SOURCE_DIR}/ssh/sftp.c
+  ${CMAKE_SOURCE_DIR}/ssh/sftpcommon.c
   ${CMAKE_SOURCE_DIR}/stubs/no-console.c
   putty.rc)
 be_list(putty PuTTY SSH SERIAL OTHERBACKENDS)
@@ -131,6 +138,7 @@ add_executable(puttytel
   window.c
   putty.c
   help.c
+  no-sftpgui.c
   ${CMAKE_SOURCE_DIR}/stubs/no-gss.c
   ${CMAKE_SOURCE_DIR}/stubs/no-ca-config.c
   ${CMAKE_SOURCE_DIR}/stubs/no-console.c

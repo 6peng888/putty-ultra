@@ -32,6 +32,27 @@ Rese&t Terminal=重置终端(&T)
 &About PuTTYtel=关于 PuTTYtel(&A)
 C&opy All to Clipboard=全部复制到剪贴板(&O)
 &Restart Session=重新启动会话(&R)
+&File Transfer=文件传输(&F)
+&SFTP Transfer...=SFTP 传输(&S)...
+S&CP Transfer=SCP 传输(&C)
+
+# ===== SFTP 传输窗口 =====
+SFTP File Transfer=SFTP 文件传输
+Local=本地
+Remote=远端
+Name=名称
+Size=大小
+Modified=修改时间
+Upload ->=上传 ->
+<- Download=<- 下载
+Cancel Transfer=取消传输
+Connecting...=正在连接...
+Connected.=已连接。
+Transfer finished.=传输完成。
+Transfer cancelled.=传输已取消。
+Cancelling...=正在取消...
+Select the files to transfer first.=请先选择要传输的文件。
+Please wait for the current operation to finish.=请等待当前操作完成。
 
 # ===== 对话框标题与提示 =====
 PuTTY Configuration=PuTTY 配置
