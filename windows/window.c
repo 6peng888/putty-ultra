@@ -2553,8 +2553,15 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
                 sftp_gui_open(tab_frame_hwnd, tab_list[tab_active]->backend);
             return 0;
         }
-        if ((wParam & ~0xF) == IDM_XFER_SCP)
-            return 0;   /* SCP transfer is not implemented yet */
+        if ((wParam & ~0xF) == IDM_XFER_SCP) {
+            /* SCP shares the same two-pane window, but drives it with
+             * the classic SCP protocol and shell commands instead of
+             * the SFTP subsystem. */
+            if (tab_active >= 0 && tab_list[tab_active]->backend &&
+                tab_list[tab_active]->backend->vt->protocol == PROT_SSH)
+                scp_gui_open(tab_frame_hwnd, tab_list[tab_active]->backend);
+            return 0;
+        }
         if (wParam >= IDM_SAVED_MIN && wParam < IDM_SAVED_MAX) {
             int p = (int)((wParam - IDM_SAVED_MIN) / MENU_SAVED_STEP);
             if (p + 1 < sesslist.nsessions) {
@@ -2694,9 +2701,12 @@ static void frame_update_xfer_menu(void)
     DWORD flags = live_ssh ? MF_ENABLED : MF_GRAYED;
     HMENU sm;
 
-    if (frame_xfer_menu)
+    if (frame_xfer_menu) {
         EnableMenuItem(frame_xfer_menu, IDM_XFER_SFTP,
                        MF_BYCOMMAND | flags);
+        EnableMenuItem(frame_xfer_menu, IDM_XFER_SCP,
+                       MF_BYCOMMAND | flags);
+    }
 
     if (frame_xfer_menu_pos < 0 || !tab_frame_hwnd)
         return;
@@ -2730,8 +2740,7 @@ static void frame_build_menu(void)
      */
     frame_xfer_menu = CreateMenu();
     menu_add(frame_xfer_menu, MF_ENABLED, IDM_XFER_SFTP, "&SFTP Transfer...");
-    /* SCP is a placeholder for now: greyed out until it exists. */
-    menu_add(frame_xfer_menu, MF_GRAYED, IDM_XFER_SCP, "S&CP Transfer");
+    menu_add(frame_xfer_menu, MF_ENABLED, IDM_XFER_SCP, "S&CP Transfer...");
     menu_add(sm, MF_POPUP | MF_GRAYED, (UINT_PTR)frame_xfer_menu,
              "&File Transfer");
     /*

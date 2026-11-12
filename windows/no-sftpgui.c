@@ -11,3 +11,9 @@ void sftp_gui_open(HWND parent, Backend *be)
     (void)parent;
     (void)be;
 }
+
+void scp_gui_open(HWND parent, Backend *be)
+{
+    (void)parent;
+    (void)be;
+}

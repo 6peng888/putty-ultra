@@ -34,10 +34,11 @@ C&opy All to Clipboard=全部复制到剪贴板(&O)
 &Restart Session=重新启动会话(&R)
 &File Transfer=文件传输(&F)
 &SFTP Transfer...=SFTP 传输(&S)...
-S&CP Transfer=SCP 传输(&C)
+S&CP Transfer...=SCP 传输(&C)...
 
-# ===== SFTP 传输窗口 =====
+# ===== 文件传输窗口 =====
 SFTP File Transfer=SFTP 文件传输
+SCP File Transfer=SCP 文件传输
 Local=本地
 Remote=远端
 Name=名称

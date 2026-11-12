@@ -63,6 +63,8 @@
 #define SG_CH_OPENFAILED  1     /* lParam is a malloc'd error message */
 #define SG_CH_SUBSYS_OK   2     /* the sftp subsystem is running */
 #define SG_CH_SUBSYS_BAD  3     /* the server refused the subsystem */
+#define SG_CH_EXEC_DONE   4     /* an exec channel has finished */
+#define SG_CH_PUMP        5     /* carry on feeding an SCP upload */
 
 /*
  * State of the single SFTP request the window has outstanding outside
@@ -85,6 +87,40 @@ enum {
     SG_P_DOWNLOAD,         /* bulk transfer, requests carry a context */
     SG_P_UPLOAD,
     SG_P_CLOSE_FILE,
+    /* SCP: a one-shot command (directory listing or mkdir) is running */
+    SG_P_SCP_EXEC,
+    /* SCP: an interactive scp session is in progress */
+    SG_P_SCP_UPLOAD,
+    SG_P_SCP_DOWNLOAD,
+};
+
+/*
+ * What an exec channel was started for. Anything that is not an
+ * interactive scp session simply accumulates its output and is dealt
+ * with when the channel closes.
+ */
+#define SG_EXEC_LS       1      /* cd + pwd + ls -lA */
+#define SG_EXEC_MKDIR    2      /* mkdir -p */
+#define SG_EXEC_SCP_UL   3      /* scp -t: we are the source */
+#define SG_EXEC_SCP_DL   4      /* scp -f: we are the sink */
+
+/* Which kind of channel a struct SgChan is. */
+#define SG_CHAN_SFTP     1
+#define SG_CHAN_SENTINEL 2      /* holds a session channel open so that we
+                                 * notice the connection dying */
+#define SG_CHAN_EXEC     3
+
+/* Sub-states of an interactive scp session started as the source. */
+enum {
+    SG_SU_BANNER = 0,       /* waiting for the sink's first NUL */
+    SG_SU_HDRACK,           /* waiting for the ack of the C record */
+    SG_SU_DATA,             /* streaming the file body */
+    SG_SU_DATAACK,          /* waiting for the ack after the body */
+    SG_SU_FINAL,            /* waiting for the ack of the final NUL */
+    /* and as the sink: */
+    SG_SD_RECORD,           /* waiting for a control record */
+    SG_SD_DATA,             /* receiving file data */
+    SG_SD_DATAEND,          /* waiting for the trailing NUL */
 };
 
 /* Tag telling the reply handler what a bulk-transfer request was. */
@@ -139,14 +175,51 @@ struct SgChan {
     Channel chan;
     SftpGui *g;                 /* NULL once the window has gone away */
     SshChannel *sc;
+    int kind;                   /* SG_CHAN_* */
+    int exec_kind;              /* SG_EXEC_* when kind == SG_CHAN_EXEC */
+    bool interactive;           /* the SCP state machine drives this one */
+    bool failed;                /* open or exec request was refused */
+    bool got_exit;
+    int exit_status;
+    char *command;              /* exec command, or subsystem name */
+    char *out;                  /* accumulated stdout */
+    size_t outlen, outcap;
+    char *err;                  /* accumulated stderr */
+    size_t errlen, errcap;
 };
 
 struct SftpGui {
     HWND hwnd;
 
-    SshChannel *sc;
-    struct SgChan *schan;
+    bool scp;                   /* SCP mode instead of SFTP */
+    Backend *be;                /* cleared when the session goes away */
+
+    SshChannel *sc;             /* the SFTP subsystem channel */
+    struct SgChan *schan;       /* its Channel wrapper */
     bool chan_open, subsys_ok;
+
+    /* SCP: the one exec channel that may be running. */
+    struct SgChan *exec_chan;
+    int exec_kind;
+    bool exec_walk;             /* the listing is part of a transfer, not
+                                 * the browser pane */
+    bool exec_ok;
+    char *exec_out, *exec_err;
+    size_t exec_outlen, exec_errlen;
+
+    /* SCP: state of the interactive scp session in progress. */
+    int scp_state;
+    uint64_t scp_sent;
+    uint64_t scp_remaining;
+
+    /*
+     * SCP: the run of files being moved by the current scp process.
+     * One process per directory's worth of files rather than one per
+     * file, because starting a remote shell is by far the most
+     * expensive part of a transfer.
+     */
+    struct SgBatchItem { char *local, *remote; uint64_t size; } *batch;
+    int nbatch, batch_pos;
 
     struct SgPane lcl, rmt;     /* local and remote panes */
     HWND btn_upload, btn_download, btn_cancel;
@@ -193,6 +266,7 @@ struct SftpGui {
 
 static SftpGui *sg_instance;
 static const char *sg_startup_error;
+static bool sg_pending_scp;     /* mode for the window being created */
 
 /* ----------------------------------------------------------------------
  * Forward declarations for the mutually recursive parts.
@@ -206,6 +280,14 @@ static void sg_xfer_next(SftpGui *g);
 static void sg_set_busy(SftpGui *g, bool busy);
 static void sg_lv_fill(HWND lv, struct SgEntry *ents, int n);
 static void sg_entries_free(struct SgEntry *ents, int n);
+static void sg_remote_fill(SftpGui *g);
+static void sg_scp_ul_begin(SftpGui *g);
+static void sg_scp_dl_begin(SftpGui *g);
+static void sg_scp_rx(SftpGui *g, struct SgChan *c);
+static void sg_exec_done(SftpGui *g);
+static void sg_scp_ul_pump(SftpGui *g);
+static void sg_abort_exec(SftpGui *g);
+static void sg_batch_free(SftpGui *g);
 static LRESULT CALLBACK SgWndProc(HWND, UINT, WPARAM, LPARAM);
 
 /* ----------------------------------------------------------------------
@@ -349,6 +431,14 @@ static char *sg_join(const char *dir, const char *name, char sep)
     memcpy(ret + p, name, nl);
     ret[p + nl] = '\0';
     return ret;
+}
+
+/* The last component of a remote path. */
+static char *sg_basename_remote(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+
+    return dupstr(slash ? slash + 1 : path);
 }
 
 static char *sg_parent_remote(const char *path)
@@ -632,6 +722,7 @@ static void sg_transport_lost(SftpGui *g)
 {
     g->chan_open = false;
     g->sc = NULL;
+    g->be = NULL;               /* the backend is being torn down */
     PostMessage(g->hwnd, WM_SG_NOTIFY, SG_CH_LOST, 0);
 }
 
@@ -640,22 +731,67 @@ static void sg_chan_free(Channel *chan)
     struct SgChan *c = container_of(chan, struct SgChan, chan);
     SftpGui *g = c->g;
 
+    if (c->kind == SG_CHAN_EXEC) {
+        /*
+         * The command has finished. Only the one we are still waiting
+         * for matters; anything else is a straggler we have already
+         * moved on from.
+         */
+        if (g && g->exec_chan == c) {
+            bool ok = !c->failed &&
+                (!c->got_exit || c->exit_status == 0);
+
+            g->exec_chan = NULL;
+            sfree(g->exec_out);
+            sfree(g->exec_err);
+            g->exec_out = c->out;
+            g->exec_outlen = c->outlen;
+            g->exec_err = c->err;
+            g->exec_errlen = c->errlen;
+            g->exec_ok = ok;
+            c->out = c->err = NULL;
+            PostMessage(g->hwnd, WM_SG_NOTIFY, SG_CH_EXEC_DONE, 0);
+        }
+        sfree(c->out);
+        sfree(c->err);
+        sfree(c->command);
+        sfree(c);
+        return;
+    }
+
     if (g) {
         g->schan = NULL;
         sg_transport_lost(g);
     }
+    sfree(c->command);
     sfree(c);
 }
 
 static void sg_chan_open_confirmation(Channel *chan)
 {
     struct SgChan *c = container_of(chan, struct SgChan, chan);
+    SftpGui *g = c->g;
 
-    if (!c->g)
+    if (!g)
         return;
-    c->g->chan_open = true;
-    /* Now that the channel exists, ask the server for the subsystem. */
-    sshfwd_start_subsystem(c->sc, true, "sftp");
+    g->chan_open = true;
+
+    switch (c->kind) {
+      case SG_CHAN_SFTP:
+        /* Now that the channel exists, ask for the subsystem. */
+        sshfwd_start_subsystem(c->sc, true, "sftp");
+        break;
+
+      case SG_CHAN_SENTINEL:
+        /* SCP needs no persistent channel; this one just keeps us
+         * informed if the session dies. */
+        PostMessage(g->hwnd, WM_SG_NOTIFY, SG_CH_SUBSYS_OK, 0);
+        break;
+
+      case SG_CHAN_EXEC:
+        sshfwd_start_command(c->sc, true, c->command);
+        break;
+    }
 }
 
 static void sg_chan_open_failed(Channel *chan, const char *errtext)
@@ -665,7 +801,9 @@ static void sg_chan_open_failed(Channel *chan, const char *errtext)
 
     if (!c->g)
         return;
-    msg = dupprintf("SFTP: %s", errtext);
+    c->failed = true;
+    msg = dupprintf("%s: %s", c->kind == SG_CHAN_EXEC ? "SCP" : "SFTP",
+                    errtext);
     PostMessage(c->g->hwnd, WM_SG_NOTIFY, SG_CH_OPENFAILED, (LPARAM)msg);
 }
 
@@ -675,7 +813,31 @@ static size_t sg_chan_send(Channel *chan, bool is_stderr,
     struct SgChan *c = container_of(chan, struct SgChan, chan);
     SftpGui *g = c->g;
 
-    if (!g || is_stderr)
+    if (!g)
+        return len;
+
+    if (c->kind != SG_CHAN_SFTP) {
+        char **buf = is_stderr ? &c->err : &c->out;
+        size_t *blen = is_stderr ? &c->errlen : &c->outlen;
+        size_t *bcap = is_stderr ? &c->errcap : &c->outcap;
+
+        if (*blen + len + 1 > *bcap) {
+            size_t want = *bcap ? *bcap : 4096;
+            while (want < *blen + len + 1)
+                want *= 2;
+            *buf = sresize(*buf, want, char);
+            *bcap = want;
+        }
+        memcpy(*buf + *blen, data, len);
+        *blen += len;
+        (*buf)[*blen] = '\0';
+
+        if (c->interactive && g->exec_chan == c)
+            sg_scp_rx(g, c);
+        return len;
+    }
+
+    if (is_stderr)
         return len;                     /* nothing useful in stderr */
     if (g->inlen + len > g->incap) {
         size_t want = g->incap ? g->incap : 16384;
@@ -703,14 +865,19 @@ static void sg_chan_set_input_wanted(Channel *chan, bool wanted)
 
 static char *sg_chan_log_close_msg(Channel *chan)
 {
-    (void)chan;
+    struct SgChan *c = container_of(chan, struct SgChan, chan);
+
+    if (c->kind == SG_CHAN_EXEC)
+        return dupstr("Transfer command finished");
     return dupstr("SFTP channel closed");
 }
 
 static bool sg_chan_rcvd_exit_status(Channel *chan, int status)
 {
-    (void)chan;
-    (void)status;
+    struct SgChan *c = container_of(chan, struct SgChan, chan);
+
+    c->got_exit = true;
+    c->exit_status = status;
     return true;
 }
 
@@ -720,6 +887,25 @@ static void sg_chan_request_response(Channel *chan, bool success)
 
     if (!c->g)
         return;
+
+    if (c->kind == SG_CHAN_EXEC) {
+        if (!success) {
+            /* The server would not run the command. */
+            c->failed = true;
+            if (c->g->exec_chan == c)
+                sshfwd_initiate_close(c->sc, NULL);
+        } else if (c->interactive && c->exec_kind == SG_EXEC_SCP_DL) {
+            /*
+             * In SCP the sink always speaks first: one NUL byte tells
+             * the source that it may start sending. We are the sink
+             * here, so this has to go out before we can expect a
+             * control record.
+             */
+            sshfwd_write(c->sc, "", 1);
+        }
+        return;
+    }
+
     PostMessage(c->g->hwnd, WM_SG_NOTIFY,
                 success ? SG_CH_SUBSYS_OK : SG_CH_SUBSYS_BAD, 0);
 }
@@ -781,6 +967,322 @@ bool sftp_recvdata(char *data, size_t len)
      * as they arrive instead of blocking for them.
      */
     return false;
+}
+
+/* ----------------------------------------------------------------------
+ * SCP transport.
+ *
+ * SCP has no directory service at all, so the remote side is driven by
+ * running ordinary shell commands on the same SSH connection:
+ *
+ *   - "cd DIR && pwd && ls -lA" lists a directory (and canonicalises
+ *     it, so a failed cd is detectable);
+ *   - "mkdir -p DIR" creates one;
+ *   - "scp -t -d DIR" and "scp -f FILE" are the SCP protocol itself.
+ *
+ * Every one of those is a separate exec channel; they are used one at a
+ * time, which keeps the state machine single-threaded.
+ */
+
+/* Quote a string for the remote shell. */
+static char *sg_shquote(const char *s)
+{
+    size_t n = 3;                       /* two quotes and the NUL */
+    char *ret, *q;
+
+    for (const char *p = s; *p; p++)
+        n += (*p == '\'') ? 4 : 1;
+    ret = snewn(n, char);
+    q = ret;
+    *q++ = '\'';
+    for (const char *p = s; *p; p++) {
+        if (*p == '\'') {
+            memcpy(q, "'\\''", 4);
+            q += 4;
+        } else {
+            *q++ = *p;
+        }
+    }
+    *q++ = '\'';
+    *q = '\0';
+    return ret;
+}
+
+static void sg_exec_write(SftpGui *g, const void *data, size_t len)
+{
+    if (g->exec_chan && g->exec_chan->sc)
+        sshfwd_write(g->exec_chan->sc, data, len);
+}
+
+/* Drop the first n bytes of an exec channel's captured stdout. */
+static void sg_exec_consume(struct SgChan *c, size_t n)
+{
+    if (n >= c->outlen) {
+        c->outlen = 0;
+    } else {
+        memmove(c->out, c->out + n, c->outlen - n);
+        c->outlen -= n;
+    }
+    if (c->out)
+        c->out[c->outlen] = '\0';
+}
+
+static bool sg_exec_start(SftpGui *g, int kind, bool interactive,
+                          const char *cmd)
+{
+    struct SgChan *c;
+
+    if (!g->be || g->exec_chan)
+        return false;
+
+    c = snew(struct SgChan);
+    memset(c, 0, sizeof(*c));
+    c->chan.vt = &SgChan_vt;
+    c->chan.initial_fixed_window_size = 0;
+    c->g = g;
+    c->kind = SG_CHAN_EXEC;
+    c->exec_kind = kind;
+    c->interactive = interactive;
+    c->command = dupstr(cmd);
+
+    c->sc = ssh_open_session_channel(g->be, &c->chan);
+    if (!c->sc) {
+        sfree(c->command);
+        sfree(c);
+        return false;
+    }
+    g->exec_chan = c;
+    g->exec_kind = kind;
+    return true;
+}
+
+static void sg_abort_exec(SftpGui *g)
+{
+    struct SgChan *c = g->exec_chan;
+
+    g->exec_chan = NULL;
+    if (c && c->sc)
+        sshfwd_initiate_close(c->sc, NULL);
+}
+
+/* ----------------------------------------------------------------------
+ * Parsing "pwd" + "ls -lA" output.
+ */
+
+static int sg_month_index(const char *s)
+{
+    static const char *const names[12] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+
+    for (int i = 0; i < 12; i++)
+        if (!strncmp(s, names[i], 3))
+            return i;
+    return -1;
+}
+
+/*
+ * Parse one "ls -l" line into an entry. Returns false if the line
+ * carries no file (the "total N" header, blank lines, ...).
+ */
+static bool sg_parse_ls_line(char *line, struct SgEntry *e)
+{
+    char *tok[10];
+    int ntok = 0;
+    char *p = line, *name, *arrow;
+    char type;
+
+    memset(e, 0, sizeof(*e));
+
+    /* Split off enough leading fields; the name is whatever is left. */
+    while (ntok < 10) {
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (!*p)
+            break;
+        tok[ntok++] = p;
+        while (*p && *p != ' ' && *p != '\t')
+            p++;
+        if (!*p)
+            break;
+        *p++ = '\0';
+        /* A device has "major, minor" in the size column. */
+        if (ntok == 5 && tok[4][strlen(tok[4]) - 1] == ',')
+            continue;
+        if (ntok >= 8)
+            break;
+    }
+    if (ntok < 8)
+        return false;
+
+    type = tok[0][0];
+    if (!strchr("d-lbcps", type) || strlen(tok[0]) < 10)
+        return false;
+
+    /*
+     * After the eighth field we consumed exactly one space; the rest of
+     * the line is the name, spaces and all.
+     */
+    name = p;
+    if (!*name)
+        return false;
+    if (type == 'l' && (arrow = strstr(name, " -> ")) != NULL)
+        *arrow = '\0';
+
+    e->is_dir = (type == 'd');
+    e->name = dupstr(name);
+    e->wname = NULL;
+    if (type == 'd' || type == '-' || type == 'l')
+        e->size = strtoull(tok[4], NULL, 10);
+
+    /* Date: either "Mon DD HH:MM" (this year) or "Mon DD YYYY". */
+    {
+        int mon = sg_month_index(tok[5]);
+        int day = atoi(tok[6]);
+        struct tm tm;
+        memset(&tm, 0, sizeof(tm));
+        if (mon >= 0 && day > 0) {
+            tm.tm_mon = mon;
+            tm.tm_mday = day;
+            if (strchr(tok[7], ':')) {
+                time_t now = time(NULL);
+                struct tm *nowtm = localtime(&now);
+                int hh = 0, mm = 0;
+                if (sscanf(tok[7], "%d:%d", &hh, &mm) == 2) {
+                    tm.tm_hour = hh;
+                    tm.tm_min = mm;
+                }
+                if (nowtm)
+                    tm.tm_year = nowtm->tm_year;
+            } else {
+                tm.tm_year = atoi(tok[7]) - 1900;
+            }
+            tm.tm_isdst = -1;
+            e->mtime = mktime(&tm);
+        }
+    }
+    return true;
+}
+
+/*
+ * Turn the output of "cd DIR && pwd && ls -lA" into a canonical path
+ * plus a list of entries. Either output pointer may be NULL. 'out' is
+ * modified in place.
+ */
+static void sg_parse_ls(char *out, char **canon_p,
+                        struct SgEntry **ents_p, int *nents_p)
+{
+    struct SgEntry *ents = NULL;
+    int n = 0, size = 0;
+    char *p = out, *canon = NULL;
+    bool first = true;
+
+    while (p && *p) {
+        char *line = p;
+        char *nl = strchr(p, '\n');
+
+        if (nl) {
+            *nl = '\0';
+            p = nl + 1;
+        } else {
+            p = line + strlen(line);
+        }
+        if (*line && line[strlen(line) - 1] == '\r')
+            line[strlen(line) - 1] = '\0';
+
+        if (first) {
+            /* The first line is pwd's output. */
+            first = false;
+            if (*line)
+                canon = dupstr(line);
+            continue;
+        }
+        if (!*line)
+            continue;
+
+        struct SgEntry e;
+        if (sg_parse_ls_line(line, &e)) {
+            if (n >= size) {
+                size = size ? size * 2 : 64;
+                ents = sresize(ents, size, struct SgEntry);
+            }
+            ents[n++] = e;
+        }
+    }
+
+    if (canon_p)
+        *canon_p = canon;
+    else
+        sfree(canon);
+    if (ents_p) {
+        *ents_p = ents;
+        *nents_p = n;
+    } else {
+        sg_entries_free(ents, n);
+    }
+}
+
+/*
+ * Start listing a remote directory. When 'walk' is set the result feeds
+ * a transfer instead of the browser pane, and the directory in question
+ * is the remote side of g->walk_*.
+ */
+static void sg_scp_ls_start(SftpGui *g, const char *dir, bool walk)
+{
+    char *q, *cmd;
+
+    if (dir && *dir) {
+        q = sg_shquote(dir);
+        cmd = dupprintf("cd %s && pwd && LC_ALL=C ls -lA", q);
+        sfree(q);
+    } else {
+        /* No directory given: start where the login puts us. */
+        cmd = dupstr("pwd && LC_ALL=C ls -lA");
+    }
+
+    g->exec_walk = walk;
+    g->pend = SG_P_SCP_EXEC;
+    if (!sg_exec_start(g, SG_EXEC_LS, false, cmd)) {
+        sfree(cmd);
+        sg_status(g, "无法在会话上打开通道");
+        g->pend = SG_P_NONE;
+        if (walk)
+            sg_xfer_next(g);
+        return;
+    }
+    sfree(cmd);
+}
+
+/* Move the remote pane to a directory (NULL means the login directory). */
+static void sg_scp_goto(SftpGui *g, const char *dir)
+{
+    sg_scp_ls_start(g, dir, false);
+}
+
+/* Create a remote directory for a tree upload. */
+static void sg_scp_mkdir_start(SftpGui *g, const char *local,
+                               const char *remote)
+{
+    char *q = sg_shquote(remote);
+    char *cmd = dupprintf("mkdir -p %s", q);
+
+    sfree(q);
+    sfree(g->walk_local);
+    sfree(g->walk_remote);
+    g->walk_local = dupstr(local);
+    g->walk_remote = dupstr(remote);
+
+    g->exec_walk = true;
+    g->pend = SG_P_SCP_EXEC;
+    if (!sg_exec_start(g, SG_EXEC_MKDIR, false, cmd)) {
+        sfree(cmd);
+        sg_status(g, "无法在会话上打开通道");
+        g->pend = SG_P_NONE;
+        sg_xfer_next(g);
+        return;
+    }
+    sfree(cmd);
 }
 
 /* ----------------------------------------------------------------------
@@ -868,6 +1370,13 @@ static void sg_remote_refresh(SftpGui *g)
     g->nrents = g->rents_size = 0;
 
     sg_set_text(g->rmt.path, g->rmt.cwd);
+
+    if (g->scp) {
+        if (g->subsys_ok)
+            sg_scp_goto(g, g->rmt.cwd);
+        return;
+    }
+
     g->pend = SG_P_OPENDIR;
     req = fxp_opendir_send(g->rmt.cwd);
     sftp_register(req);
@@ -880,6 +1389,13 @@ static void sg_remote_goto(SftpGui *g, const char *path)
 
     if (g->pend != SG_P_NONE || !g->subsys_ok)
         return;
+
+    if (g->scp) {
+        sfree(g->target_path);
+        g->target_path = dupstr(path);
+        sg_scp_goto(g, path);
+        return;
+    }
 
     sfree(g->target_path);
     g->target_path = dupstr(path);
@@ -955,6 +1471,8 @@ static void sg_tasks_free(SftpGui *g)
 
 static void sg_xfer_finish(SftpGui *g, const char *msg)
 {
+    sg_abort_exec(g);
+    sg_batch_free(g);
     if (g->lfh != INVALID_HANDLE_VALUE) {
         CloseHandle(g->lfh);
         g->lfh = INVALID_HANDLE_VALUE;
@@ -973,6 +1491,8 @@ static void sg_xfer_finish(SftpGui *g, const char *msg)
 static void sg_xfer_fail(SftpGui *g, const char *why)
 {
     g->any_error = true;
+    sg_abort_exec(g);
+    sg_batch_free(g);
     if (g->lfh != INVALID_HANDLE_VALUE) {
         CloseHandle(g->lfh);
         g->lfh = INVALID_HANDLE_VALUE;
@@ -1232,6 +1752,19 @@ static void sg_xfer_next(SftpGui *g)
             sg_xfer_finish(g, i18n_or("Transfer cancelled."));
             return;
         }
+
+        /*
+         * In SCP mode the file handlers take over a whole run of
+         * consecutive files, so they consume the list themselves.
+         */
+        if (g->scp && t->kind == SG_T_FILE) {
+            if (g->uploading)
+                sg_scp_ul_begin(g);
+            else
+                sg_scp_dl_begin(g);
+            return;
+        }
+
         g->task_head++;
 
         switch (t->kind) {
@@ -1250,11 +1783,25 @@ static void sg_xfer_next(SftpGui *g)
             return;
 
           case SG_T_LDIR:
-            sg_ul_dir_begin(g, t->local, t->remote);
+            if (g->scp)
+                sg_scp_mkdir_start(g, t->local, t->remote);
+            else
+                sg_ul_dir_begin(g, t->local, t->remote);
             return;
 
           case SG_T_RDIR:
-            sg_dl_dir_begin(g, t->local, t->remote);
+            if (g->scp) {
+                wchar_t *w = sg_w(t->local);
+                CreateDirectoryW(w, NULL);
+                sfree(w);
+                sfree(g->walk_local);
+                sfree(g->walk_remote);
+                g->walk_local = dupstr(t->local);
+                g->walk_remote = dupstr(t->remote);
+                sg_scp_ls_start(g, t->remote, true);
+            } else {
+                sg_dl_dir_begin(g, t->local, t->remote);
+            }
             return;
         }
     }
@@ -1271,6 +1818,565 @@ static void sg_start_batch(SftpGui *g, bool uploading)
     SendMessageW(g->prog, PBM_SETPOS, 0, 0);
     sg_set_busy(g, true);
     sg_xfer_next(g);
+}
+
+/* ----------------------------------------------------------------------
+ * SCP: one scp process per directory's worth of files
+ *
+ * Starting a remote shell is by far the most expensive part of an SCP
+ * transfer, so a run of files that all live in the same remote
+ * directory is moved by a single "scp -t" / "scp -f" process: several
+ * C records in one session, exactly as the protocol intends. That
+ * keeps the driver at one level - no D/E record nesting - while making
+ * a directory of many small files roughly as fast as one big file.
+ *
+ * Trees are walked above this, with mkdir -p and ls -lA doing the
+ * non-file work.
+ */
+
+static void sg_batch_free(SftpGui *g)
+{
+    for (int i = 0; i < g->nbatch; i++) {
+        sfree(g->batch[i].local);
+        sfree(g->batch[i].remote);
+    }
+    sfree(g->batch);
+    g->batch = NULL;
+    g->nbatch = g->batch_pos = 0;
+}
+
+/*
+ * Take the run of file tasks at the head of the work list that all go
+ * into the same remote directory. Consumes them from the list.
+ */
+static void sg_batch_collect(SftpGui *g)
+{
+    char *dir;
+    int size = 0;
+
+    sg_batch_free(g);
+    if (g->task_head >= g->ntasks ||
+        g->tasks[g->task_head].kind != SG_T_FILE)
+        return;
+
+    dir = sg_parent_remote(g->tasks[g->task_head].remote);
+
+    while (g->task_head < g->ntasks && g->nbatch < 64) {
+        struct SgTask *t = &g->tasks[g->task_head];
+        char *d;
+        bool same;
+
+        if (t->kind != SG_T_FILE)
+            break;
+        d = sg_parent_remote(t->remote);
+        same = !strcmp(d, dir);
+        sfree(d);
+        if (!same)
+            break;
+
+        if (g->nbatch >= size) {
+            size = size ? size * 2 : 16;
+            g->batch = sresize(g->batch, size, struct SgBatchItem);
+        }
+        g->batch[g->nbatch].local = dupstr(t->local);
+        g->batch[g->nbatch].remote = dupstr(t->remote);
+        g->batch[g->nbatch].size = t->size;
+        g->nbatch++;
+        g->task_head++;
+    }
+    g->batch_pos = 0;
+    sfree(dir);
+}
+
+/* End the current scp session and move on to the next task. */
+static void sg_scp_done(SftpGui *g)
+{
+    struct SgChan *c = g->exec_chan;
+
+    g->exec_chan = NULL;               /* stop routing data here */
+    if (g->lfh != INVALID_HANDLE_VALUE) {
+        CloseHandle(g->lfh);
+        g->lfh = INVALID_HANDLE_VALUE;
+    }
+    if (c && c->sc)
+        sshfwd_initiate_close(c->sc, NULL);
+    sg_batch_free(g);
+    g->pend = SG_P_NONE;
+    sg_xfer_next(g);
+}
+
+/* The remote end said something other than "ok". */
+static void sg_scp_proto_error(SftpGui *g, struct SgChan *c)
+{
+    char *msg = NULL;
+    size_t n = 1;
+
+    while (n < c->outlen && c->out[n] != '\n')
+        n++;
+    if (n > 1) {
+        msg = snewn(n, char);
+        memcpy(msg, c->out + 1, n - 1);
+        msg[n-1] = '\0';
+    }
+    if (msg && *msg)
+        sg_xfer_fail(g, msg);
+    else
+        sg_xfer_fail(g, "远端 scp 报告了错误");
+    sfree(msg);
+}
+
+/*
+ * Feed the next block of the local file into the scp session. Called
+ * whenever the sink acknowledges the previous record, and again from the
+ * event loop while the SSH layer's write backlog drains.
+ */
+static void sg_scp_ul_pump(SftpGui *g)
+{
+    char buf[16384];
+
+    if (!g->exec_chan)
+        return;                        /* the session has gone */
+
+    while (g->scp_sent < g->cur_size) {
+        uint64_t left = g->cur_size - g->scp_sent;
+        DWORD want = (DWORD)(left > sizeof(buf) ? sizeof(buf) : left);
+        DWORD got = 0;
+
+        if (g->cancel) {
+            sg_scp_done(g);
+            return;
+        }
+        /*
+         * Let the socket catch up. The limit is deliberately generous:
+         * it is what caps the amount of data in flight, and hence the
+         * achievable throughput on a link with any real round trip.
+         */
+        if (g->be && backend_sendbuffer(g->be) > 512 * 1024) {
+            PostMessage(g->hwnd, WM_SG_NOTIFY, SG_CH_PUMP, 0);
+            return;
+        }
+        if (!ReadFile(g->lfh, buf, want, &got, NULL) || got == 0) {
+            sg_xfer_fail(g, "读取本地文件失败");
+            return;
+        }
+        sg_exec_write(g, buf, got);
+        g->scp_sent += got;
+        g->done_bytes += got;
+        sg_progress(g);
+    }
+
+    /* End of the file body. */
+    sg_exec_write(g, "", 1);
+    g->scp_state = SG_SU_DATAACK;
+}
+
+/* Open the batch entry's local file and send its C record. */
+static void sg_scp_ul_next_file(SftpGui *g)
+{
+    struct SgBatchItem *b = &g->batch[g->batch_pos];
+    wchar_t *w = sg_w(b->local);
+    char *base, *hdr;
+    LARGE_INTEGER sz;
+
+    if (g->lfh != INVALID_HANDLE_VALUE) {
+        CloseHandle(g->lfh);
+        g->lfh = INVALID_HANDLE_VALUE;
+    }
+    g->lfh = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ, NULL,
+                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    sfree(w);
+    if (g->lfh == INVALID_HANDLE_VALUE) {
+        sg_statusf(g, "%s: 无法打开本地文件", b->local);
+        sg_scp_done(g);
+        return;
+    }
+    if (!GetFileSizeEx(g->lfh, &sz)) {
+        sg_statusf(g, "%s: 无法读取本地文件大小", b->local);
+        sg_scp_done(g);
+        return;
+    }
+    b->size = (uint64_t)sz.QuadPart;
+    g->cur_size = b->size;
+    g->scp_sent = 0;
+
+    sfree(g->cur_local);
+    sfree(g->cur_remote);
+    g->cur_local = dupstr(b->local);
+    g->cur_remote = dupstr(b->remote);
+    sg_statusf(g, "正在上传 %s", b->remote);
+
+    base = sg_basename_remote(b->remote);
+    hdr = dupprintf("C%04o %llu %s\n", 0644,
+                    (unsigned long long)b->size, base);
+    sg_exec_write(g, hdr, strlen(hdr));
+    sfree(hdr);
+    sfree(base);
+
+    g->scp_state = SG_SU_HDRACK;
+}
+
+static void sg_scp_ul_begin(SftpGui *g)
+{
+    struct SgBatchItem *b;
+    char *dir, *q, *cmd;
+
+    sg_batch_collect(g);
+    if (g->nbatch == 0) {
+        sg_xfer_next(g);
+        return;
+    }
+    b = &g->batch[0];
+    sfree(g->cur_local);
+    sfree(g->cur_remote);
+    g->cur_local = dupstr(b->local);
+    g->cur_remote = dupstr(b->remote);
+    g->cur_size = b->size;
+    g->scp_sent = 0;
+    g->scp_state = SG_SU_BANNER;
+
+    dir = sg_parent_remote(b->remote);
+    q = sg_shquote(dir);
+    cmd = dupprintf("scp -t -d %s", q);
+    sfree(q);
+    sfree(dir);
+
+    g->pend = SG_P_SCP_UPLOAD;
+    if (!sg_exec_start(g, SG_EXEC_SCP_UL, true, cmd)) {
+        sfree(cmd);
+        sg_xfer_fail(g, "无法在会话上启动 scp 命令");
+        return;
+    }
+    sfree(cmd);
+}
+
+static void sg_scp_dl_begin(SftpGui *g)
+{
+    char *cmd, *q;
+    size_t len;
+
+    sg_batch_collect(g);
+    if (g->nbatch == 0) {
+        sg_xfer_next(g);
+        return;
+    }
+    sfree(g->cur_local);
+    sfree(g->cur_remote);
+    g->cur_local = dupstr(g->batch[0].local);
+    g->cur_remote = dupstr(g->batch[0].remote);
+    g->scp_remaining = 0;
+    g->scp_state = SG_SD_RECORD;
+
+    /* "scp -f 'a' 'b' ..." sends one C record per file, in order. */
+    len = 16;
+    for (int i = 0; i < g->nbatch; i++) {
+        char *sq = sg_shquote(g->batch[i].remote);
+        len += strlen(sq) + 1;
+        sfree(sq);
+    }
+    cmd = snewn(len + 16, char);
+    strcpy(cmd, "scp -f");
+    for (int i = 0; i < g->nbatch; i++) {
+        q = sg_shquote(g->batch[i].remote);
+        strcat(cmd, " ");
+        strcat(cmd, q);
+        sfree(q);
+    }
+
+    g->pend = SG_P_SCP_DOWNLOAD;
+    if (!sg_exec_start(g, SG_EXEC_SCP_DL, true, cmd)) {
+        sfree(cmd);
+        sg_xfer_fail(g, "无法在会话上启动 scp 命令");
+        return;
+    }
+    sfree(cmd);
+}
+
+/* Drive the scp protocol as far as the buffered data allows. */
+static void sg_scp_rx(SftpGui *g, struct SgChan *c)
+{
+    bool again = true;
+
+    while (again && g->exec_chan == c) {
+        again = false;
+
+        switch (g->scp_state) {
+          case SG_SU_BANNER:
+            if (c->outlen < 1)
+                return;
+            if (c->out[0] != 0) {
+                sg_scp_proto_error(g, c);
+                return;
+            }
+            sg_exec_consume(c, 1);
+            sg_scp_ul_next_file(g);
+            break;
+
+          case SG_SU_HDRACK:
+            if (c->outlen < 1)
+                return;
+            if (c->out[0] != 0) {
+                sg_scp_proto_error(g, c);
+                return;
+            }
+            sg_exec_consume(c, 1);
+            g->scp_state = SG_SU_DATA;
+            sg_scp_ul_pump(g);
+            return;
+
+          case SG_SU_DATAACK:
+            if (c->outlen < 1)
+                return;
+            if (c->out[0] != 0) {
+                sg_scp_proto_error(g, c);
+                return;
+            }
+            sg_exec_consume(c, 1);
+            g->batch_pos++;
+            if (g->batch_pos < g->nbatch) {
+                sg_scp_ul_next_file(g);
+                again = true;
+                break;
+            }
+            /*
+             * That was the last file. There is no separate "end of
+             * transfer" byte to send here: the sender simply stops
+             * after the last file's data terminator has been
+             * acknowledged, and the receiver exits when it sees EOF on
+             * the channel. (Verified against pscp's wire trace, and
+             * ssh/scpserver.c's protocol notes say the final EOF is
+             * sent without waiting for an ack anyway.)
+             */
+            sg_scp_done(g);
+            return;
+
+          case SG_SU_DATA:
+            /* Nothing should arrive while we are streaming. */
+            return;
+
+          case SG_SD_RECORD: {
+            char *nl, *line;
+            size_t len;
+
+            if (c->outlen < 1)
+                return;
+            if (c->out[0] == 0) {
+                /* End of the file list. */
+                sg_exec_consume(c, 1);
+                sg_exec_write(g, "", 1);
+                sg_scp_done(g);
+                return;
+            }
+            if (c->out[0] == 1 || c->out[0] == 2) {
+                sg_scp_proto_error(g, c);
+                return;
+            }
+            nl = memchr(c->out, '\n', c->outlen);
+            if (!nl)
+                return;                /* wait for the whole record */
+            len = (size_t)(nl - c->out) + 1;
+            line = snewn(len + 1, char);
+            memcpy(line, c->out, len);
+            line[len] = '\0';
+            sg_exec_consume(c, len);
+
+            if (line[0] == 'T') {
+                sg_exec_write(g, "", 1);
+                sfree(line);
+                again = true;
+                break;
+            }
+            if (line[0] == 'C') {
+                unsigned long mode = 0;
+                unsigned long long sz = 0;
+                int off = 0;
+                struct SgBatchItem *b;
+                wchar_t *w;
+
+                if (sscanf(line, "C%lo %llu %n", &mode, &sz, &off) != 2) {
+                    sfree(line);
+                    sg_xfer_fail(g, "SCP 协议错误：无法解析文件头");
+                    return;
+                }
+                sfree(line);
+
+                if (g->batch_pos >= g->nbatch) {
+                    sg_xfer_fail(g, "SCP 协议错误：收到了多余的文件");
+                    return;
+                }
+                /* Records come back in the order we asked for them. */
+                b = &g->batch[g->batch_pos];
+                if (g->lfh != INVALID_HANDLE_VALUE) {
+                    CloseHandle(g->lfh);
+                    g->lfh = INVALID_HANDLE_VALUE;
+                }
+                w = sg_w(b->local);
+                g->lfh = CreateFileW(w, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                                     FILE_ATTRIBUTE_NORMAL, NULL);
+                sfree(w);
+                if (g->lfh == INVALID_HANDLE_VALUE) {
+                    sg_statusf(g, "%s: 无法创建本地文件", b->local);
+                    sg_scp_done(g);
+                    return;
+                }
+                sfree(g->cur_local);
+                sfree(g->cur_remote);
+                g->cur_local = dupstr(b->local);
+                g->cur_remote = dupstr(b->remote);
+                sg_statusf(g, "正在下载 %s", b->remote);
+
+                g->scp_remaining = (uint64_t)sz;
+                sg_exec_write(g, "", 1);   /* accept the file */
+                g->scp_state = SG_SD_DATA;
+                again = true;
+                break;
+            }
+            sfree(line);
+            sg_xfer_fail(g, "SCP 协议错误：未知的响应记录");
+            return;
+          }
+
+          case SG_SD_DATA: {
+            size_t take;
+            DWORD written = 0;
+
+            if (g->scp_remaining == 0) {
+                g->scp_state = SG_SD_DATAEND;
+                again = true;
+                break;
+            }
+            if (c->outlen == 0)
+                return;
+            take = c->outlen < g->scp_remaining ? c->outlen
+                                                : (size_t)g->scp_remaining;
+            if (!WriteFile(g->lfh, c->out, (DWORD)take, &written, NULL) ||
+                written != take) {
+                sg_xfer_fail(g, "写入本地文件失败");
+                return;
+            }
+            sg_exec_consume(c, take);
+            g->scp_remaining -= take;
+            g->done_bytes += take;
+            sg_progress(g);
+            again = true;
+            break;
+          }
+
+          case SG_SD_DATAEND:
+            if (c->outlen < 1)
+                return;
+            if (c->out[0] != 0) {
+                sg_scp_proto_error(g, c);
+                return;
+            }
+            sg_exec_consume(c, 1);
+            sg_exec_write(g, "", 1);   /* acknowledge the file */
+            g->batch_pos++;
+            /* Back for the next C record, or for the source's EOF
+             * marker if that was the last file. */
+            g->scp_state = SG_SD_RECORD;
+            again = true;
+            break;
+
+          default:
+            return;
+        }
+    }
+}
+
+/* An exec channel has closed: work out what it meant. */
+static void sg_exec_done(SftpGui *g)
+{
+    int kind = g->exec_kind;
+    char *out = g->exec_out, *err = g->exec_err;
+    bool ok = g->exec_ok, walk = g->exec_walk;
+
+    g->exec_out = g->exec_err = NULL;
+    g->exec_outlen = g->exec_errlen = 0;
+    g->exec_kind = 0;
+    g->exec_walk = false;
+
+    if (kind == SG_EXEC_SCP_UL || kind == SG_EXEC_SCP_DL) {
+        /* The session ended before we had finished with it. */
+        if (g->pend == SG_P_SCP_UPLOAD || g->pend == SG_P_SCP_DOWNLOAD) {
+            if (g->lfh != INVALID_HANDLE_VALUE) {
+                CloseHandle(g->lfh);
+                g->lfh = INVALID_HANDLE_VALUE;
+            }
+            g->pend = SG_P_NONE;
+            if (ok)
+                sg_xfer_next(g);
+            else
+                sg_xfer_fail(g, (err && *err) ? err : "SCP 传输中断");
+        }
+        goto out;
+    }
+
+    if (kind == SG_EXEC_MKDIR) {
+        /* "mkdir -p" failing just means it was already there. */
+        g->pend = SG_P_NONE;
+        sg_local_enqueue_tree(g, g->walk_local, g->walk_remote);
+        sg_xfer_next(g);
+        goto out;
+    }
+
+    if (kind == SG_EXEC_LS) {
+        g->pend = SG_P_NONE;
+
+        if (!ok || !out || !*out) {
+            sg_statusf(g, "%s: %s", walk ? g->walk_remote : g->rmt.cwd,
+                       (err && *err) ? err : "无法列出远端目录");
+            if (walk)
+                sg_xfer_next(g);
+            goto out;
+        }
+
+        if (walk) {
+            char *canon = NULL;
+            struct SgEntry *ents = NULL;
+            int n = 0;
+
+            sg_parse_ls(out, &canon, &ents, &n);
+            sfree(canon);
+            for (int i = 0; i < n; i++) {
+                char *l, *r;
+
+                if (!strcmp(ents[i].name, ".."))
+                    continue;
+                l = sg_join(g->walk_local, ents[i].name, '\\');
+                r = sg_join(g->walk_remote, ents[i].name, '/');
+                if (ents[i].is_dir) {
+                    sg_task_push(g, SG_T_RDIR, l, r, 0);
+                } else {
+                    sg_task_push(g, SG_T_FILE, l, r, ents[i].size);
+                    g->total_bytes += ents[i].size;
+                }
+                sfree(l);
+                sfree(r);
+            }
+            sg_entries_free(ents, n);
+            sg_xfer_next(g);
+        } else {
+            char *canon = NULL;
+            int n = 0;
+
+            sg_entries_free(g->rents, g->nrents);
+            g->rents = NULL;
+            g->nrents = g->rents_size = 0;
+            sg_parse_ls(out, &canon, &g->rents, &n);
+            if (canon) {
+                sfree(g->rmt.cwd);
+                g->rmt.cwd = canon;
+            }
+            g->nrents = n;
+            g->rents_size = n;
+            sg_set_text(g->rmt.path, g->rmt.cwd);
+            sg_remote_fill(g);
+        }
+    }
+
+  out:
+    sfree(out);
+    sfree(err);
 }
 
 /* ----------------------------------------------------------------------
@@ -1718,7 +2824,7 @@ static void sg_list_activate(SftpGui *g, bool is_local)
 static bool sg_can_start(SftpGui *g)
 {
     if (!g->subsys_ok) {
-        sg_msgbox(g->hwnd, "SFTP 尚未连接", MB_ICONWARNING | MB_OK);
+        sg_msgbox(g->hwnd, "尚未连接", MB_ICONWARNING | MB_OK);
         return false;
     }
     if (g->busy || g->pend != SG_P_NONE) {
@@ -1738,17 +2844,13 @@ static void sg_enqueue_selection(SftpGui *g, bool from_local)
     HWND lv = from_local ? g->lcl.list : g->rmt.list;
     struct SgEntry *ents = from_local ? g->lcl.ents : g->rmt.ents;
     int nents = from_local ? g->lcl.nents : g->rmt.nents;
-    const char *src = from_local ? g->lcl.cwd : g->rmt.cwd;
-    const char *dst = from_local ? g->rmt.cwd : g->lcl.cwd;
-    char srcsep = from_local ? '\\' : '/';
-    char dstsep = from_local ? '/' : '\\';
     int *idxs = NULL;
     int n = sg_lv_collect(lv, &idxs);
     int count = 0;
 
     for (int i = 0; i < n; i++) {
         struct SgEntry *e;
-        char *s, *d;
+        char *lpath, *rpath;
 
         if (idxs[i] < 0 || idxs[i] >= nents)
             continue;
@@ -1758,16 +2860,21 @@ static void sg_enqueue_selection(SftpGui *g, bool from_local)
         if (from_local && e->is_dir && e->reparse)
             continue;           /* junction or symlink: not followed */
 
-        s = sg_join(src, e->name, srcsep);
-        d = sg_join(dst, e->name, dstsep);
+        /*
+         * A task always stores the local path and the remote path, in
+         * that order, whichever way the data is going.
+         */
+        lpath = sg_join(g->lcl.cwd, e->name, '\\');
+        rpath = sg_join(g->rmt.cwd, e->name, '/');
         if (e->is_dir) {
-            sg_task_push(g, from_local ? SG_T_LDIR : SG_T_RDIR, s, d, 0);
+            sg_task_push(g, from_local ? SG_T_LDIR : SG_T_RDIR,
+                         lpath, rpath, 0);
         } else {
-            sg_task_push(g, SG_T_FILE, s, d, e->size);
+            sg_task_push(g, SG_T_FILE, lpath, rpath, e->size);
             g->total_bytes += e->size;
         }
-        sfree(s);
-        sfree(d);
+        sfree(lpath);
+        sfree(rpath);
         count++;
     }
     sfree(idxs);
@@ -1799,13 +2906,25 @@ static void sg_do_cancel(SftpGui *g)
 {
     if (!g->busy)
         return;
-    /*
-     * We cannot retract requests already on the wire, so stop feeding
-     * new ones and let the replies drain; the batch winds itself up as
-     * soon as nothing is in flight.
-     */
+
     g->cancel = true;
-    sg_status(g, i18n_or("Cancelling..."));
+
+    /*
+     * Stop straight away rather than letting the current file finish:
+     * tear down the scp process (or leave the SFTP requests to be
+     * discarded when their replies arrive), drop whatever is left of
+     * the batch, and tidy up a partial download.
+     */
+    if (g->lfh != INVALID_HANDLE_VALUE &&
+        (g->pend == SG_P_DOWNLOAD || g->pend == SG_P_SCP_DOWNLOAD) &&
+        g->cur_local) {
+        wchar_t *w = sg_w(g->cur_local);
+        CloseHandle(g->lfh);
+        g->lfh = INVALID_HANDLE_VALUE;
+        DeleteFileW(w);                /* don't leave half a file behind */
+        sfree(w);
+    }
+    sg_xfer_finish(g, i18n_or("Transfer cancelled."));
 }
 
 /* ----------------------------------------------------------------------
@@ -1979,19 +3098,29 @@ static void sg_layout(SftpGui *g)
 /* Free everything a SftpGui owns; used on a failed start and at destroy. */
 static void sg_free(SftpGui *g, bool channel_still_ours)
 {
-    if (channel_still_ours && g->schan) {
-        SshChannel *sc = g->sc;
-        g->schan->g = NULL;
-        g->schan = NULL;
-        g->sc = NULL;
-        if (sc)
-            sshfwd_initiate_close(sc, NULL);
+    if (channel_still_ours) {
+        struct SgChan *ec = g->exec_chan;
+        g->exec_chan = NULL;
+        if (ec) {
+            ec->g = NULL;
+            if (ec->sc)
+                sshfwd_initiate_close(ec->sc, NULL);
+        }
+        if (g->schan) {
+            SshChannel *sc = g->sc;
+            g->schan->g = NULL;
+            g->schan = NULL;
+            g->sc = NULL;
+            if (sc)
+                sshfwd_initiate_close(sc, NULL);
+        }
     }
     if (g->lfh != INVALID_HANDLE_VALUE) {
         CloseHandle(g->lfh);
         g->lfh = INVALID_HANDLE_VALUE;
     }
     sg_tasks_free(g);
+    sg_batch_free(g);
     sftp_cleanup_request();
     sg_entries_free(g->lcl.ents, g->lcl.nents);
     sg_entries_free(g->rmt.ents, g->rmt.nents);
@@ -2000,10 +3129,12 @@ static void sg_free(SftpGui *g, bool channel_still_ours)
     sfree(g->rmt.cwd);
     sfree(g->target_path);
     sfree(g->inbuf);
+    sfree(g->exec_out);
+    sfree(g->exec_err);
     sfree(g);
 }
 
-static SftpGui *sg_create(HWND hwnd, Backend *be)
+static SftpGui *sg_create(HWND hwnd, Backend *be, bool scp)
 {
     SftpGui *g = snew(SftpGui);
     wchar_t wcwd[MAX_PATH];
@@ -2011,6 +3142,8 @@ static SftpGui *sg_create(HWND hwnd, Backend *be)
 
     memset(g, 0, sizeof(*g));
     g->hwnd = hwnd;
+    g->scp = scp;
+    g->be = be;
     g->lfh = INVALID_HANDLE_VALUE;
     g->pend = SG_P_NONE;
     g->rmt.cwd = dupstr("/");
@@ -2029,10 +3162,12 @@ static SftpGui *sg_create(HWND hwnd, Backend *be)
     sg_local_refresh(g);
 
     c = snew(struct SgChan);
+    memset(c, 0, sizeof(*c));
     c->chan.vt = &SgChan_vt;
     c->chan.initial_fixed_window_size = 0;
     c->g = g;
     c->sc = NULL;
+    c->kind = scp ? SG_CHAN_SENTINEL : SG_CHAN_SFTP;
     g->schan = c;
 
     c->sc = ssh_open_session_channel(be, &c->chan);
@@ -2040,12 +3175,12 @@ static SftpGui *sg_create(HWND hwnd, Backend *be)
         g->schan = NULL;
         sfree(c);
         sg_startup_error =
-            "无法在该会话上打开 SFTP 通道。"
-            "仅支持已完成登录的 SSH-2 会话。";
+            "无法在该会话上打开通道。仅支持已完成登录的 SSH-2 会话。";
         sg_free(g, false);
         return NULL;
     }
-    g->sc = c->sc;
+    if (!scp)
+        g->sc = c->sc;
 
     sg_instance = g;
     sg_layout(g);
@@ -2061,7 +3196,8 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     switch (msg) {
       case WM_CREATE: {
         CREATESTRUCTW *cs = (CREATESTRUCTW *)lParam;
-        SftpGui *ng = sg_create(hwnd, (Backend *)cs->lpCreateParams);
+        SftpGui *ng = sg_create(hwnd, (Backend *)cs->lpCreateParams,
+                                sg_pending_scp);
         if (!ng)
             return -1;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)ng);
@@ -2085,10 +3221,24 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             return 0;
         switch (wParam) {
           case SG_CH_SUBSYS_OK:
-            sg_send_init(g);
+            if (g->scp) {
+                /* The sentinel channel is up, so the connection is
+                 * usable; start in the login directory. */
+                g->subsys_ok = true;
+                sg_scp_goto(g, NULL);
+            } else {
+                sg_send_init(g);
+            }
             break;
           case SG_CH_SUBSYS_BAD:
             sg_fatal(g, "服务器拒绝启动 SFTP 子系统");
+            break;
+          case SG_CH_EXEC_DONE:
+            sg_exec_done(g);
+            break;
+          case SG_CH_PUMP:
+            if (g->pend == SG_P_SCP_UPLOAD && g->scp_state == SG_SU_DATA)
+                sg_scp_ul_pump(g);
             break;
           case SG_CH_OPENFAILED: {
             char *text = (char *)lParam;
@@ -2098,7 +3248,7 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
           }
           case SG_CH_LOST:
           default:
-            sg_fatal(g, "SFTP 通道已关闭");
+            sg_fatal(g, g->scp ? "SCP 通道已关闭" : "SFTP 通道已关闭");
             break;
         }
         return 0;
@@ -2162,7 +3312,7 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-void sftp_gui_open(HWND parent, Backend *be)
+static void sg_open(HWND parent, Backend *be, bool scp)
 {
     static bool registered;
     HINSTANCE inst = GetModuleHandleW(NULL);
@@ -2191,7 +3341,8 @@ void sftp_gui_open(HWND parent, Backend *be)
     }
 
     sg_startup_error = NULL;
-    title = sg_w(i18n_or("SFTP File Transfer"));
+    sg_pending_scp = scp;
+    title = sg_w(i18n_or(scp ? "SCP File Transfer" : "SFTP File Transfer"));
     hwnd = CreateWindowExW(0, SG_CLASSNAME, title,
                            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                            CW_USEDEFAULT, CW_USEDEFAULT, 880, 540,
@@ -2201,10 +3352,20 @@ void sftp_gui_open(HWND parent, Backend *be)
     if (!hwnd) {
         sg_msgbox(parent,
                   sg_startup_error ? sg_startup_error :
-                  "无法创建 SFTP 窗口", MB_ICONERROR | MB_OK);
+                  "无法创建文件传输窗口", MB_ICONERROR | MB_OK);
         return;
     }
     sg_instance = (SftpGui *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     ShowWindow(hwnd, SW_SHOWNORMAL);
     UpdateWindow(hwnd);
+}
+
+void sftp_gui_open(HWND parent, Backend *be)
+{
+    sg_open(parent, be, false);
+}
+
+void scp_gui_open(HWND parent, Backend *be)
+{
+    sg_open(parent, be, true);
 }
