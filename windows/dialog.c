@@ -107,6 +107,15 @@ static INT_PTR pds_default_dlgproc(PortableDialogStuff *pds, HWND hwnd,
     switch (msg) {
       case WM_LBUTTONUP:
         /*
+         * A drag of an item in a tree list box ends here: the dialog
+         * box holds the mouse capture during the drag, so the button
+         * release arrives here rather than at the control. Let the
+         * controls have first refusal on it.
+         */
+        if (pds->initialised &&
+            winctrl_handle_command(pds->dp, msg, wParam, lParam))
+            return true;
+        /*
          * Button release should trigger WM_OK if there was a
          * previous double click on the host CA list.
          */

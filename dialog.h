@@ -104,6 +104,11 @@ PREFIX intorptr CP(const void *p) { intorptr ret; ret.cp = p; return ret; }
  *    containing it). The handler should call dlg_listbox_get_rename()
  *    to find out the new name, and dlg_listbox_get_folder() to find
  *    out whether a folder was meant, and which one.
+ *  - the REORDER event, used only by tree list boxes, when the user
+ *    has dragged an item to a new position among the items it was
+ *    already alongside. Nothing about the underlying data has
+ *    changed; the front end has already recorded the new order, so
+ *    the handler just has to rebuild the list.
  */
 enum {
     EVENT_REFRESH,
@@ -112,7 +117,8 @@ enum {
     EVENT_SELCHANGE,
     EVENT_CALLBACK,
     EVENT_OPEN_FOLDER,
-    EVENT_RENAME
+    EVENT_RENAME,
+    EVENT_REORDER
 };
 typedef void (*handler_fn)(dlgcontrol *ctrl, dlgparam *dp,
                            void *data, int event);

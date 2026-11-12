@@ -878,8 +878,17 @@ static void sessionsaver_handler(dlgcontrol *ctrl, dlgparam *dlg,
             int i;
             dlg_update_start(ctrl, dlg);
             dlg_listbox_clear(ctrl, dlg);
-            for (i = 0; i < ssd->sesslist.nsessions; i++)
-                dlg_listbox_add(ctrl, dlg, ssd->sesslist.sessions[i]);
+            /*
+             * `Default Settings' itself isn't listed: it is what you
+             * get when no other session is chosen, so it doesn't need
+             * an entry of its own. The ids are the positions in
+             * ssd->sesslist, so that everything which looks a session
+             * up by list index keeps working; that means they start
+             * at 1 rather than 0.
+             */
+            for (i = 1; i < ssd->sesslist.nsessions; i++)
+                dlg_listbox_addwithid(ctrl, dlg, ssd->sesslist.sessions[i],
+                                      i);
             dlg_update_done(ctrl, dlg);
         }
     } else if (event == EVENT_VALCHANGE) {
@@ -900,6 +909,14 @@ static void sessionsaver_handler(dlgcontrol *ctrl, dlgparam *dlg,
             }
             if (top == ssd->sesslist.nsessions) {
                 top -= 1;
+            }
+            if (top < 1) {
+                /*
+                 * Item 0 is `Default Settings', which has no entry in
+                 * the list any more; the nearest thing to it is the
+                 * first session that does.
+                 */
+                top = 1;
             }
             dlg_listbox_select(ssd->listbox, dlg, top);
         }
@@ -1183,6 +1200,15 @@ static void sessionsaver_handler(dlgcontrol *ctrl, dlgparam *dlg,
                 break;
             }
         }
+    } else if (event == EVENT_REORDER) {
+        /*
+         * The user has dragged a session or folder to a different place
+         * in the list, without changing which folder it lives in. The
+         * front end has already recorded the new order, so all that has
+         * to happen here is for the list to be rebuilt in it.
+         */
+        if (ctrl == ssd->listbox)
+            dlg_refresh(ctrl, dlg);
     }
 }
 

@@ -15,12 +15,14 @@
 
 #include <assert.h>
 #include <ctype.h>
+#include <limits.h>
 #include <wchar.h>
 
 #include "putty.h"
 #include "misc.h"
 #include "dialog.h"
 #include "i18n.h"
+#include "storage.h"
 
 #include <commctrl.h>
 
@@ -944,7 +946,8 @@ static int tree_count_items(HWND tv, HTREEITEM parent)
 }
 
 static HTREEITEM tree_insert_item(HWND tv, HTREEITEM parent,
-                                  const char *text, size_t len, int index)
+                                  const char *text, size_t len, int index,
+                                  HTREEITEM after)
 {
     char *name = snewn(len + 1, char);
     TVINSERTSTRUCT ins;
@@ -955,7 +958,7 @@ static HTREEITEM tree_insert_item(HWND tv, HTREEITEM parent,
 
     memset(&ins, 0, sizeof(ins));
     ins.hParent = parent;
-    ins.hInsertAfter = TVI_LAST;
+    ins.hInsertAfter = after;
     ins.TREEINSITEM.mask = TVIF_TEXT | TVIF_PARAM | TVIF_CHILDREN;
     ins.TREEINSITEM.pszText = name;
     ins.TREEINSITEM.lParam = index;
@@ -1074,15 +1077,13 @@ static char *tree_item_path(HWND tv, HTREEITEM item)
  * the whole contents of a list box whenever it refreshes, and throws
  * the control away altogether when the user switches to another
  * configuration panel, so without remembering this the folders would
- * snap shut at every opportunity. The list is also kept in the Registry,
- * so it survives from one run of PuTTY to the next.
+ * snap shut at every opportunity. The list is also kept in a file
+ * alongside the sessions, so it survives from one run of PuTTY to the
+ * next.
  *
  * Each entry is a folder path exactly as it appears in a session name,
  * e.g. "dev" or "dev/tools".
  */
-#define EXPANDED_FOLDERS_KEY   PUTTY_REG_POS "\\SessionsExpanded"
-#define EXPANDED_FOLDERS_VALUE "ExpandedFolders"
-
 static strbuf *expanded_folders = NULL;
 static bool expanded_folders_loaded = false;
 
@@ -1094,18 +1095,12 @@ static bool expanded_folders_loaded = false;
  */
 static bool tree_rebuilding = false;
 
-/* The list of expanded folders, read from the Registry on first use. */
+/* The list of expanded folders, read from disk on first use. */
 static strbuf *get_expanded_folders(void)
 {
     if (!expanded_folders_loaded) {
-        HKEY rkey;
-
         expanded_folders_loaded = true;
-        rkey = open_regkey_ro(HKEY_CURRENT_USER, EXPANDED_FOLDERS_KEY);
-        if (rkey) {
-            expanded_folders = get_reg_multi_sz(rkey, EXPANDED_FOLDERS_VALUE);
-            close_regkey(rkey);
-        }
+        expanded_folders = read_expanded_folders();
         if (!expanded_folders)
             expanded_folders = strbuf_new();
     }
@@ -1164,19 +1159,10 @@ static void set_folder_expanded(const char *path, bool expanded)
         return;
     }
 
-    if (newlist->len == 0)
-        put_byte(newlist, '\0');       /* an empty MULTI_SZ value */
-
     strbuf_free(expanded_folders);
     expanded_folders = newlist;
 
-    {
-        HKEY rkey = create_regkey(HKEY_CURRENT_USER, EXPANDED_FOLDERS_KEY);
-        if (rkey) {
-            put_reg_multi_sz(rkey, EXPANDED_FOLDERS_VALUE, newlist);
-            close_regkey(rkey);
-        }
-    }
+    write_expanded_folders(newlist);
 }
 
 /*
@@ -1200,6 +1186,223 @@ static void tree_restore_expanded_folders(HWND tv, HTREEITEM parent)
     }
 }
 
+/*
+ * ======================================================================
+ * The order the user has dragged the items of the tree into.
+ *
+ * Sessions and folders arrive in alphabetical order, but the user can
+ * drag them into whatever order they like, and can drag a session (or a
+ * whole folder) into a different folder. The order isn't part of the
+ * sessions themselves, so it is kept in a separate file next to them
+ * (see read_sessions_order()): the items are named in the order they
+ * are shown, depth first, so that a folder is followed by everything
+ * inside it. A folder's name has a '/' on the end, which a session's
+ * can't, so that the two can be told apart.
+ *
+ * An item which isn't in the list at all - a session saved since the
+ * last drag, say - sorts after all the items which are, and keeps the
+ * alphabetical order the portable layer supplied it in.
+ * ======================================================================
+ */
+
+struct order_list {
+    char **entries;
+    int n;
+    size_t size;
+};
+
+static bool order_list_loaded = false;
+static struct order_list saved_order[1];
+
+static struct order_list *order_list_new(void)
+{
+    struct order_list *l = snew(struct order_list);
+    l->entries = NULL;
+    l->n = l->size = 0;
+    return l;
+}
+
+static void order_list_free(struct order_list *l)
+{
+    int i;
+
+    if (!l)
+        return;
+    for (i = 0; i < l->n; i++)
+        sfree(l->entries[i]);
+    sfree(l->entries);
+    sfree(l);
+}
+
+static void order_list_append(struct order_list *l, const char *entry)
+{
+    sgrowarray(l->entries, l->size, l->n);
+    l->entries[l->n++] = dupstr(entry);
+}
+
+static int order_list_find(struct order_list *l, const char *entry)
+{
+    int i;
+
+    for (i = 0; i < l->n; i++)
+        if (!strcmp(l->entries[i], entry))
+            return i;
+    return -1;
+}
+
+/* Forget the first `count' entries, from position `start' onwards. */
+static void order_list_delete(struct order_list *l, int start, int count)
+{
+    int i;
+
+    for (i = start; i < start + count; i++)
+        sfree(l->entries[i]);
+    memmove(l->entries + start, l->entries + start + count,
+            (l->n - start - count) * sizeof(char *));
+    l->n -= count;
+}
+
+/* Put the entries of `ins' in at position `at', and empty `ins'. */
+static void order_list_insert(struct order_list *l, int at,
+                              struct order_list *ins)
+{
+    int i;
+
+    for (i = l->n; i < l->n + ins->n; i++)
+        sgrowarray(l->entries, l->size, i);
+    memmove(l->entries + at + ins->n, l->entries + at,
+            (l->n - at) * sizeof(char *));
+    for (i = 0; i < ins->n; i++)
+        l->entries[at + i] = ins->entries[i];
+    l->n += ins->n;
+    ins->n = 0;                        /* the strings now belong to `l' */
+}
+
+/* The order the items are currently shown in, read from disk on first use. */
+static struct order_list *get_saved_order(void)
+{
+    if (!order_list_loaded) {
+        strbuf *sb;
+
+        order_list_loaded = true;
+        sb = read_sessions_order();
+        if (sb) {
+            BinarySource src[1];
+            BinarySource_BARE_INIT_PL(src, ptrlen_from_strbuf(sb));
+            while (true) {
+                const char *entry = get_asciz(src);
+                if (get_err(src))
+                    break;
+                if (*entry)
+                    order_list_append(saved_order, entry);
+            }
+            strbuf_free(sb);
+        }
+    }
+    return saved_order;
+}
+
+/* Record a new order, and use it from now on. */
+static void set_saved_order(struct order_list *l)
+{
+    strbuf *sb = strbuf_new();
+    int i;
+
+    for (i = 0; i < l->n; i++)
+        put_asciz(sb, l->entries[i]);
+
+    write_sessions_order(sb);
+    strbuf_free(sb);
+
+    order_list_delete(saved_order, 0, saved_order->n);
+    for (i = 0; i < l->n; i++)
+        order_list_append(saved_order, l->entries[i]);
+    order_list_loaded = true;
+}
+
+/*
+ * The key by which the stored order refers to an item: its path, with a
+ * '/' on the end if it is a folder rather than a session.
+ */
+static char *tree_order_path(HWND tv, HTREEITEM item)
+{
+    char *path = tree_item_path(tv, item);
+
+    if (path && tree_index_of_item(tv, item) < 0)
+        path = dupcat(path, "/");
+
+    return path;
+}
+
+/* Where an item with this key comes in the stored order. */
+static int order_rank(const char *key)
+{
+    int i = order_list_find(get_saved_order(), key);
+
+    return i < 0 ? INT_MAX : i;
+}
+
+/* Collect the items of a tree, in the order they are shown. */
+static void tree_collect_order(HWND tv, HTREEITEM parent,
+                               struct order_list *l)
+{
+    HTREEITEM item;
+
+    for (item = TreeView_GetChild(tv, parent); item;
+         item = TreeView_GetNextSibling(tv, item)) {
+        char *key = tree_order_path(tv, item);
+        if (key) {
+            order_list_append(l, key);
+            sfree(key);
+        }
+        tree_collect_order(tv, item, l);
+    }
+}
+
+/*
+ * Insert an item into the tree in the position the stored order gives
+ * it: after the last sibling which comes before it, and before the
+ * first one which comes after.
+ */
+static HTREEITEM tree_insert_ordered(HWND tv, HTREEITEM parent,
+                                     const char *text, size_t len, int index)
+{
+    char *name = snewn(len + 1, char);
+    char *parentpath = (parent == TVI_ROOT ? NULL
+                        : tree_item_path(tv, parent));
+    char *path, *key;
+    HTREEITEM item, ret, after = TVI_LAST;
+    int myrank;
+
+    memcpy(name, text, len);
+    name[len] = '\0';
+
+    path = (parentpath && *parentpath) ? dupcat(parentpath, "/", name)
+        : dupstr(name);
+    key = (index == TV_FOLDER_PARAM) ? dupcat(path, "/") : dupstr(path);
+    myrank = order_rank(key);
+
+    for (item = TreeView_GetChild(tv, parent); item;
+         item = TreeView_GetNextSibling(tv, item)) {
+        char *sibkey = tree_order_path(tv, item);
+        bool comes_later = (sibkey && order_rank(sibkey) > myrank);
+        sfree(sibkey);
+        if (comes_later) {
+            HTREEITEM prev = TreeView_GetPrevSibling(tv, item);
+            after = prev ? prev : TVI_FIRST;
+            break;
+        }
+    }
+
+    ret = tree_insert_item(tv, parent, name, len, index, after);
+
+    sfree(key);
+    sfree(path);
+    sfree(parentpath);
+    sfree(name);
+    return ret;
+}
+
 /* Add a name to the tree, creating any folders it names on the way. */
 static void tree_add_item(HWND tv, const char *name, int index)
 {
@@ -1211,15 +1414,15 @@ static void tree_add_item(HWND tv, const char *name, int index)
         size_t len = slash ? (size_t)(slash - p) : strlen(p);
 
         if (!slash) {
-            tree_insert_item(tv, parent, p, len, index);
+            tree_insert_ordered(tv, parent, p, len, index);
             return;
         }
 
         if (len > 0) {
             HTREEITEM folder = tree_find_child_by_name(tv, parent, p, len);
             if (!folder)
-                folder = tree_insert_item(tv, parent, p, len,
-                                          TV_FOLDER_PARAM);
+                folder = tree_insert_ordered(tv, parent, p, len,
+                                             TV_FOLDER_PARAM);
             parent = folder;
         }
 
@@ -1254,6 +1457,483 @@ void treebox(struct ctlpos *cp, const char *stext,
           TVS_HASLINES | TVS_LINESATROOT | TVS_HASBUTTONS |
           TVS_SHOWSELALWAYS,
           WS_EX_CLIENTEDGE, "", lid);
+}
+
+/*
+ * ======================================================================
+ * Dragging the items of a tree list box around.
+ *
+ * A session can be dragged up or down among the items it is already
+ * alongside, which changes the order they are shown in, or dropped on a
+ * folder - or between the items of another folder, or in the empty
+ * space below the tree - which moves it into that folder. Folders can
+ * be dragged in the same way, taking everything inside them along.
+ *
+ * While the drag is in progress, the place the item would land is shown
+ * either as an insertion line between two items, or by highlighting the
+ * folder it would go into.
+ *
+ * Changing the order is only a matter of recording it, so it is done
+ * entirely here. Moving something into a different folder changes what
+ * is stored, so it is reported to the portable layer as an EVENT_RENAME
+ * - which is what it is, the item simply gets a new name with a
+ * different folder path in front of it. Either way the portable layer
+ * then rebuilds the tree, which comes back in the new order.
+ * ======================================================================
+ */
+
+struct treebox_drag {
+    bool active;
+    HWND tv;
+    dlgcontrol *ctrl;
+    struct dlgparam *dp;
+    HTREEITEM item;                    /* the item being dragged */
+    HTREEITEM hilite;                  /* folder it would be dropped into */
+    HTREEITEM mark;                    /* item the insertion line is on */
+    bool mark_after;                   /* ... is it above or below it? */
+};
+
+static struct treebox_drag tree_drag;
+
+/*
+ * The path of the item which should end up selected when the tree is
+ * next rebuilt, or NULL. Dragging an item leaves it selected, but a
+ * rebuild starts with nothing selected, so this is used to put the
+ * selection back afterwards.
+ */
+static char *tree_pending_select = NULL;
+
+/* Take away whatever the drag is currently showing as its drop target. */
+static void tree_drag_clear_feedback(void)
+{
+    if (tree_drag.hilite) {
+        TreeView_SetItemState(tree_drag.tv, tree_drag.hilite,
+                              0, TVIS_DROPHILITED);
+        tree_drag.hilite = NULL;
+    }
+    if (tree_drag.mark) {
+        TreeView_SetInsertMark(tree_drag.tv, NULL, false);
+        tree_drag.mark = NULL;
+        tree_drag.mark_after = false;
+    }
+}
+
+static void tree_drag_stop(void)
+{
+    struct dlgparam *dp = tree_drag.dp;
+
+    tree_drag_clear_feedback();
+    tree_drag.active = false;
+    tree_drag.item = NULL;
+    tree_drag.tv = NULL;
+    tree_drag.ctrl = NULL;
+    tree_drag.dp = NULL;
+
+    if (dp && GetCapture() == dp->hwnd)
+        ReleaseCapture();
+}
+
+static void treebox_begin_drag(struct dlgparam *dp, dlgcontrol *ctrl,
+                               HWND tv, HTREEITEM item)
+{
+    if (tree_drag.active) {
+        if (tree_drag.dp == dp)
+            return;                    /* already busy with another drag */
+        /*
+         * A drag left over from a dialog box which has since gone away
+         * (because the box was closed mid-drag, say).
+         */
+        tree_drag_stop();
+    }
+
+    if (!item)
+        return;
+
+    tree_drag.active = true;
+    tree_drag.tv = tv;
+    tree_drag.ctrl = ctrl;
+    tree_drag.dp = dp;
+    tree_drag.item = item;
+    tree_drag.hilite = NULL;
+    tree_drag.mark = NULL;
+    tree_drag.mark_after = false;
+
+    /*
+     * The item being dragged has to be the selected one, because a move
+     * into another folder is reported as a rename of the selected item.
+     */
+    TreeView_SelectItem(tv, item);
+    SetCapture(dp->hwnd);
+}
+
+/* Is `anc' the item `item', or one of its ancestors? */
+static bool tree_item_is_ancestor(HWND tv, HTREEITEM anc, HTREEITEM item)
+{
+    for (; item; item = TreeView_GetParent(tv, item))
+        if (item == anc)
+            return true;
+    return false;
+}
+
+/* Find the item whose path is `path', anywhere in the tree. */
+static HTREEITEM tree_find_item_by_path(HWND tv, HTREEITEM parent,
+                                        const char *path)
+{
+    HTREEITEM item;
+
+    for (item = TreeView_GetChild(tv, parent); item;
+         item = TreeView_GetNextSibling(tv, item)) {
+        HTREEITEM sub;
+        char *ipath = tree_item_path(tv, item);
+        bool match = (ipath && !strcmp(ipath, path));
+
+        sfree(ipath);
+        if (match)
+            return item;
+        sub = tree_find_item_by_path(tv, item, path);
+        if (sub)
+            return sub;
+    }
+
+    return NULL;
+}
+
+/* The last item in a parent's list of children, or NULL if it is empty. */
+static HTREEITEM tree_last_child(HWND tv, HTREEITEM parent)
+{
+    HTREEITEM item = TreeView_GetChild(tv, parent), next;
+
+    while (item && (next = TreeView_GetNextSibling(tv, item)) != NULL)
+        item = next;
+
+    return item;
+}
+
+/*
+ * Work out where a drop at `pt' (in the tree view's coordinates) would
+ * put the item being dragged. Returns false if it can't be dropped
+ * there at all. On success, `*newparent' is the item whose list of
+ * children it would join (TVI_ROOT for the top level) and `*before' is
+ * the item it would be placed in front of, or NULL to mean "after
+ * everything else in that list".
+ *
+ * The middle of a folder means `into this folder'; above or below an
+ * item means `next to it'; and the empty space below the items means
+ * `at the end of the list'.
+ */
+static bool tree_drop_place(HWND tv, HTREEITEM item, POINT pt,
+                            HTREEITEM *newparent, HTREEITEM *before)
+{
+    HTREEITEM target = NULL;
+    TVHITTESTINFO ht;
+    RECT cr;
+
+    *newparent = TVI_ROOT;
+    *before = NULL;
+
+    /*
+     * A release somewhere else entirely - over another control, say -
+     * means the drag was abandoned.
+     */
+    GetClientRect(tv, &cr);
+    if (pt.x < cr.left || pt.x >= cr.right ||
+        pt.y < cr.top || pt.y >= cr.bottom)
+        return false;
+
+    ht.pt = pt;
+    ht.flags = 0;
+    if (TreeView_HitTest(tv, &ht) &&
+        (ht.flags & (TVHT_ONITEM | TVHT_ONITEMRIGHT)))
+        target = ht.hItem;
+
+    /* Dropping an item on itself would do nothing, so don't offer it. */
+    if (target == item)
+        return false;
+
+    if (target) {
+        RECT r;
+
+        if (TreeView_GetItemRect(tv, target, &r, true)) {
+            if (tree_index_of_item(tv, target) < 0 &&
+                pt.y >= r.top + (r.bottom - r.top) / 4 &&
+                pt.y < r.bottom - (r.bottom - r.top) / 4) {
+                /* Into the folder. */
+                *newparent = target;
+            } else {
+                /* Next to the item, in whichever folder it lives in. */
+                *newparent = TreeView_GetParent(tv, target);
+                if (!*newparent)
+                    *newparent = TVI_ROOT;
+                *before = (pt.y < (r.top + r.bottom) / 2)
+                    ? target : TreeView_GetNextSibling(tv, target);
+            }
+        }
+    }
+
+    /* An item can't be put inside itself. */
+    if (*newparent != TVI_ROOT && tree_item_is_ancestor(tv, item, *newparent))
+        return false;
+
+    return true;
+}
+
+/*
+ * Show where the item would land if it were dropped now: an insertion
+ * mark line between two items, or a highlight on a folder it would go
+ * into. Nothing at all means the drop would be refused.
+ */
+static void tree_drag_update_feedback(POINT pt)
+{
+    HWND tv = tree_drag.tv;
+    HTREEITEM newparent, before, hilite = NULL, mark = NULL;
+    bool mark_after = false;
+
+    if (tree_drop_place(tv, tree_drag.item, pt, &newparent, &before)) {
+        if (before) {
+            mark = before;
+            mark_after = false;        /* the line goes above it */
+        } else if (newparent != TVI_ROOT) {
+            hilite = newparent;        /* into this folder */
+        } else {
+            mark = tree_last_child(tv, TVI_ROOT);
+            mark_after = true;         /* the line goes below it */
+        }
+    }
+
+    if (hilite == tree_drag.hilite && mark == tree_drag.mark &&
+        mark_after == tree_drag.mark_after)
+        return;                        /* nothing has changed */
+
+    tree_drag_clear_feedback();
+
+    if (hilite) {
+        tree_drag.hilite = hilite;
+        TreeView_SetItemState(tv, hilite,
+                              TVIS_DROPHILITED, TVIS_DROPHILITED);
+    } else if (mark) {
+        tree_drag.mark = mark;
+        tree_drag.mark_after = mark_after;
+        TreeView_SetInsertMark(tv, mark, mark_after);
+    }
+}
+
+/*
+ * Work out where the item on the end of the mouse would be dropped, and
+ * then either record the new order or ask for the item to be moved.
+ * `pt' is in the tree view's coordinates.
+ */
+static void treebox_drag_drop(struct dlgparam *dp, POINT pt)
+{
+    HWND tv = tree_drag.tv;
+    HTREEITEM item = tree_drag.item;
+    dlgcontrol *ctrl = tree_drag.ctrl;
+    HTREEITEM newparent = TVI_ROOT, before = NULL;
+    HTREEITEM sib;
+    struct order_list *orig = NULL, *neworder = NULL, *block = NULL;
+    char *oldpath = NULL, *newpath = NULL, *leaf = NULL;
+    char *oldparentpath = NULL, *newparentpath = NULL;
+    char *key = NULL, *prefix = NULL;
+    bool is_folder, parent_changed, unchanged;
+    int start = -1, end, at, i;
+
+    /* Where would this drop put the item - or can't it go there at all? */
+    if (!tree_drop_place(tv, item, pt, &newparent, &before))
+        goto out;
+
+    oldpath = tree_item_path(tv, item);
+    if (!oldpath)
+        goto out;
+    is_folder = (tree_index_of_item(tv, item) < 0);
+
+    /* The name of the item, and the name it would have in its new home. */
+    {
+        const char *slash = strrchr(oldpath, '/');
+
+        if (slash) {
+            oldparentpath = dupprintf("%.*s", (int)(slash - oldpath), oldpath);
+            leaf = dupstr(slash + 1);
+        } else {
+            leaf = dupstr(oldpath);
+        }
+    }
+    newparentpath = (newparent == TVI_ROOT ? NULL
+                     : tree_item_path(tv, newparent));
+    newpath = (newparentpath && *newparentpath)
+        ? dupcat(newparentpath, "/", leaf) : dupstr(leaf);
+
+    /* There can't be two things of the same name in one folder. */
+    for (sib = TreeView_GetChild(tv, newparent); sib;
+         sib = TreeView_GetNextSibling(tv, sib)) {
+        char *text = tree_item_text(tv, sib);
+        bool clash = (sib != item && text && !stricmp(text, leaf));
+
+        sfree(text);
+        if (clash)
+            goto out;
+    }
+
+    /*
+     * Work out the order the items would be shown in, by taking the
+     * current one and moving the item (with everything inside it) to
+     * where it was dropped.
+     */
+    orig = order_list_new();
+    tree_collect_order(tv, TVI_ROOT, orig);
+
+    neworder = order_list_new();
+    tree_collect_order(tv, TVI_ROOT, neworder);
+
+    key = is_folder ? dupcat(oldpath, "/") : dupstr(oldpath);
+    start = order_list_find(neworder, key);
+    if (start < 0)
+        goto out;
+    prefix = dupcat(oldpath, "/");
+    end = start + 1;
+    while (end < neworder->n &&
+           !strncmp(neworder->entries[end], prefix, strlen(prefix)))
+        end++;
+
+    block = order_list_new();
+    for (i = start; i < end; i++) {
+        if (strcmp(oldpath, newpath)) {
+            char *moved = dupcat(newpath,
+                                 neworder->entries[i] + strlen(oldpath));
+            order_list_append(block, moved);
+            sfree(moved);
+        } else {
+            order_list_append(block, neworder->entries[i]);
+        }
+    }
+    order_list_delete(neworder, start, end - start);
+
+    if (before) {
+        char *bkey = tree_order_path(tv, before);
+        at = order_list_find(neworder, bkey);
+        sfree(bkey);
+        if (at < 0)
+            at = neworder->n;
+    } else if (newparent == TVI_ROOT) {
+        at = neworder->n;
+    } else {
+        /* After the last of the new parent folder's other contents. */
+        char *pp = dupcat(newparentpath, "/");
+        size_t plen = strlen(pp);
+
+        at = neworder->n;
+        for (i = 0; i < neworder->n; i++)
+            if (!strncmp(neworder->entries[i], pp, plen))
+                at = i + 1;
+        sfree(pp);
+    }
+
+    order_list_insert(neworder, at, block);
+
+    /* If nothing actually moved, there is nothing to do. */
+    unchanged = (orig->n == neworder->n);
+    for (i = 0; unchanged && i < orig->n; i++)
+        if (strcmp(orig->entries[i], neworder->entries[i]))
+            unchanged = false;
+
+    if (unchanged)
+        goto out;
+
+    parent_changed =
+        ((oldparentpath == NULL) != (newparentpath == NULL)) ||
+        (oldparentpath && newparentpath &&
+         strcmp(oldparentpath, newparentpath));
+
+    /* Record the order, and rebuild the tree in it. */
+    set_saved_order(neworder);
+    sfree(tree_pending_select);
+    tree_pending_select = dupstr(newpath);
+
+    if (parent_changed) {
+        /*
+         * A move into another folder: the item's name has changed, so the
+         * portable layer has to move the stored session (or folder).
+         */
+        if (is_folder) {
+            dp->tree_folder = dupstr(oldpath);
+            if (folder_is_expanded(oldpath))
+                set_folder_expanded(newpath, true);
+        }
+        if (newparentpath)
+            set_folder_expanded(newparentpath, true);   /* show where it went */
+        dp->tree_newname = dupstr(newpath);
+    }
+
+    tree_drag_stop();
+
+    if (parent_changed) {
+        ctrl->handler(ctrl, dp, dp->data, EVENT_RENAME);
+        sfree(dp->tree_newname);
+        dp->tree_newname = NULL;
+        sfree(dp->tree_folder);
+        dp->tree_folder = NULL;
+    } else {
+        ctrl->handler(ctrl, dp, dp->data, EVENT_REORDER);
+    }
+
+    /*
+     * If the tree wasn't rebuilt after all (because the move was
+     * refused, say), the selection we were going to restore no longer
+     * means anything, so throw it away.
+     */
+    if (tree_pending_select) {
+        sfree(tree_pending_select);
+        tree_pending_select = NULL;
+    }
+
+  out:
+    order_list_free(orig);
+    order_list_free(neworder);
+    order_list_free(block);
+    sfree(oldpath);
+    sfree(newpath);
+    sfree(leaf);
+    sfree(oldparentpath);
+    sfree(newparentpath);
+    sfree(key);
+    sfree(prefix);
+}
+
+/*
+ * Handle a mouse message which belongs to a drag in progress. The mouse
+ * is captured by the dialog box, so these arrive as dialog messages
+ * rather than as tree view notifications.
+ */
+static bool treebox_drag_mouse(struct dlgparam *dp, UINT msg,
+                               WPARAM wParam, LPARAM lParam)
+{
+    POINT pt;
+
+    if (!tree_drag.active || tree_drag.dp != dp)
+        return false;
+
+    if (msg == WM_CAPTURECHANGED) {
+        /* Something else grabbed the mouse, so the drag is over. */
+        tree_drag_stop();
+        return true;
+    }
+
+    pt.x = (short)LOWORD(lParam);
+    pt.y = (short)HIWORD(lParam);
+    MapWindowPoints(dp->hwnd, tree_drag.tv, &pt, 1);
+
+    if (msg == WM_LBUTTONUP) {
+        tree_drag_clear_feedback();
+        treebox_drag_drop(dp, pt);     /* this ends the drag if it moved */
+        if (tree_drag.active)
+            tree_drag_stop();          /* otherwise the drop was refused */
+        return true;
+    }
+
+    if (msg != WM_MOUSEMOVE)
+        return false;
+
+    tree_drag_update_feedback(pt);
+
+    return true;
 }
 
 /*
@@ -2292,6 +2972,16 @@ bool winctrl_handle_command(struct dlgparam *dp, UINT msg,
     static UINT draglistmsg = WM_NULL;
 
     /*
+     * While the user is dragging an item around in a tree list box, the
+     * dialog box holds the mouse capture, so the mouse messages for the
+     * drag arrive here rather than at the tree itself.
+     */
+    if (tree_drag.active &&
+        (msg == WM_MOUSEMOVE || msg == WM_LBUTTONUP ||
+         msg == WM_CAPTURECHANGED))
+        return treebox_drag_mouse(dp, msg, wParam, lParam);
+
+    /*
      * Filter out pointless window messages. Our interest is in
      * WM_COMMAND and the drag list message, and nothing else.
      */
@@ -3047,6 +3737,18 @@ bool winctrl_handle_notify(struct dlgparam *dp, WPARAM wParam, LPARAM lParam)
         ctrl->handler(ctrl, dp, dp->data, EVENT_SELCHANGE);
         break;
 
+      case TVN_BEGINDRAG: {
+        /*
+         * The user has started to drag an item. Take the mouse capture
+         * and keep track of where it goes; see treebox_drag_drop(),
+         * which works out what to do with it when it is released.
+         */
+        NMTREEVIEW *nmtv = (NMTREEVIEW *)lParam;
+
+        treebox_begin_drag(dp, ctrl, nh->hwndFrom, nmtv->itemNew.hItem);
+        return true;
+      }
+
       case NM_RCLICK:
         /*
          * Right-clicking an item offers a context menu: `Open' for a
@@ -3549,6 +4251,21 @@ void dlg_update_done(dlgcontrol *ctrl, dlgparam *dp)
              */
             tree_rebuilding = false;
             tree_restore_expanded_folders(hw, TVI_ROOT);
+
+            /*
+             * Likewise whatever was being dragged when the rebuild was
+             * asked for, which is where the user expects to be now.
+             */
+            if (tree_pending_select) {
+                HTREEITEM item = tree_find_item_by_path(
+                    hw, TVI_ROOT, tree_pending_select);
+                sfree(tree_pending_select);
+                tree_pending_select = NULL;
+                if (item) {
+                    TreeView_SelectItem(hw, item);
+                    TreeView_EnsureVisible(hw, item);
+                }
+            }
         }
         InvalidateRect(hw, NULL, true);
     }

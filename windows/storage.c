@@ -51,6 +51,8 @@ DECL_WINDOWS_FUNCTION(static, HRESULT, SHGetFolderPathA,
 #define SESSIONS_SUBDIR   "PuTTY\\sessions"
 #define SESSIONS_MARKER   "PuTTY\\.sessions-migrated"
 #define SESSIONS_TEMPFILE "PuTTY\\.sessions-saving"
+#define SESSIONS_ORDER    "PuTTY\\.sessions-order"
+#define SESSIONS_EXPANDED "PuTTY\\.sessions-expanded"
 
 static void migrate_registry_sessions_if_needed(void);
 static void migrate_registry_session(HKEY parent, const char *subname,
@@ -1011,6 +1013,91 @@ void enum_settings_finish(settings_e *e)
     sfree(e);
 }
 
+/* ======================================================================
+ * How the user has arranged the saved sessions: the order they have
+ * dragged them into, and which folders they have open.
+ *
+ * Neither is part of any individual session, so each gets a file of its
+ * own, in the same directory as the sessions folder but not inside it:
+ * anything inside that folder would be enumerated as a session, and a
+ * folder full of sessions is likely to be copied about without this
+ * being meaningful any more.
+ *
+ * Each file holds its entries one after another, each terminated by a
+ * NUL.
+ * ====================================================================== */
+
+/* Read one of those files, or return NULL if there isn't one. */
+static strbuf *read_arrangement_file(const char *subpath)
+{
+    char *path = appdata_subpath(subpath);
+    strbuf *sb = NULL;
+
+    if (path) {
+        HANDLE f = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (f != INVALID_HANDLE_VALUE) {
+            char buf[4096];
+            DWORD got;
+
+            sb = strbuf_new();
+            while (ReadFile(f, buf, sizeof(buf), &got, NULL) && got > 0)
+                put_data(sb, buf, got);
+            CloseHandle(f);
+
+            if (sb->len == 0) {        /* nothing useful in it */
+                strbuf_free(sb);
+                sb = NULL;
+            }
+        }
+        sfree(path);
+    }
+
+    return sb;
+}
+
+/* Replace one of those files. */
+static void write_arrangement_file(const char *subpath, strbuf *data)
+{
+    char *path = appdata_subpath(subpath);
+    bool ok = false;
+
+    if (path) {
+        HANDLE f = CreateFile(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, NULL);
+        if (f != INVALID_HANDLE_VALUE) {
+            DWORD wrote = 0;
+
+            ok = WriteFile(f, data->s, data->len, &wrote, NULL) &&
+                wrote == data->len;
+            CloseHandle(f);
+        }
+        if (!ok)
+            DeleteFile(path);          /* don't leave half a file behind */
+        sfree(path);
+    }
+}
+
+strbuf *read_sessions_order(void)
+{
+    return read_arrangement_file(SESSIONS_ORDER);
+}
+
+void write_sessions_order(strbuf *data)
+{
+    write_arrangement_file(SESSIONS_ORDER, data);
+}
+
+strbuf *read_expanded_folders(void)
+{
+    return read_arrangement_file(SESSIONS_EXPANDED);
+}
+
+void write_expanded_folders(strbuf *data)
+{
+    write_arrangement_file(SESSIONS_EXPANDED, data);
+}
+
 /*
  * Copy a session out of the Registry and into a file, and then record
  * that we've done that, so we never do it again unless the marker file
@@ -1712,6 +1799,16 @@ void cleanup_all(void)
             sfree(path);
         }
         path = appdata_subpath(SESSIONS_MARKER);
+        if (path) {
+            DeleteFile(path);
+            sfree(path);
+        }
+        path = appdata_subpath(SESSIONS_ORDER);
+        if (path) {
+            DeleteFile(path);
+            sfree(path);
+        }
+        path = appdata_subpath(SESSIONS_EXPANDED);
         if (path) {
             DeleteFile(path);
             sfree(path);

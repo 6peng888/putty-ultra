@@ -86,6 +86,23 @@ settings_e *enum_settings_start(void);
 bool enum_settings_next(settings_e *handle, strbuf *out);
 void enum_settings_finish(settings_e *handle);
 
+/*
+ * Store and retrieve how the user has arranged the saved sessions, for
+ * platforms whose configuration box shows them as a list they can
+ * rearrange: the order they have dragged the items into, and which
+ * folders they have open. Neither is part of any individual session, so
+ * both are kept separately from them.
+ *
+ * Each read function returns the names, each terminated by a NUL, back
+ * to back in order - or NULL if nothing has been stored yet. The caller
+ * frees what it gets back. Each write function replaces the stored list
+ * with the given one (the caller still owns that buffer).
+ */
+strbuf *read_sessions_order(void);
+void write_sessions_order(strbuf *data);
+strbuf *read_expanded_folders(void);
+void write_expanded_folders(strbuf *data);
+
 /* ----------------------------------------------------------------------
  * Functions to access PuTTY's host key database.
  */
