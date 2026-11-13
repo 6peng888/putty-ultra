@@ -55,6 +55,11 @@
 #define SG_ID_STATUS     1131
 #define SG_ID_PROGTEXT   1132
 
+/* Items of the list views' context menu. */
+#define SG_ID_CTX_XFER   1140
+#define SG_ID_CTX_DELETE 1141
+#define SG_ID_CTX_RENAME 1142
+
 #define SG_CLASSNAME L"PuTTYSftpWindow"
 
 /* Timer that keeps the transfer readout ticking while a batch runs. */
@@ -74,6 +79,8 @@
 #define SG_CH_PUMP        5     /* carry on feeding an SCP upload */
 #define SG_CH_PICK_LOCAL  6     /* a local drop-down item was chosen */
 #define SG_CH_PICK_REMOTE 7     /* a remote drop-down item was chosen */
+#define SG_CH_RENAME      8     /* a name has been typed into a label edit */
+#define SG_CH_RENAME_EDIT 9     /* start editing a row's name in place */
 
 /*
  * State of the single SFTP request the window has outstanding outside
@@ -96,6 +103,13 @@ enum {
     SG_P_DOWNLOAD,         /* bulk transfer, requests carry a context */
     SG_P_UPLOAD,
     SG_P_CLOSE_FILE,
+    /* Context menu: deleting remote entries, one directory at a time. */
+    SG_P_DEL_OPENDIR,
+    SG_P_DEL_READDIR,
+    SG_P_DEL_CLOSEDIR,
+    SG_P_DEL_REMOVE,       /* deleting one remote file */
+    SG_P_DEL_RMDIR,        /* deleting one remote directory */
+    SG_P_RENAME,           /* renaming a remote entry */
     /* SCP: a one-shot command (directory listing or mkdir) is running */
     SG_P_SCP_EXEC,
     /* SCP: an interactive scp session is in progress */
@@ -112,6 +126,8 @@ enum {
 #define SG_EXEC_MKDIR    2      /* mkdir -p */
 #define SG_EXEC_SCP_UL   3      /* scp -t: we are the source */
 #define SG_EXEC_SCP_DL   4      /* scp -f: we are the sink */
+#define SG_EXEC_RM       5      /* rm -rf: delete remote entries */
+#define SG_EXEC_MV       6      /* mv: rename a remote entry */
 
 /* Which kind of channel a struct SgChan is. */
 #define SG_CHAN_SFTP     1
@@ -188,6 +204,13 @@ struct SgReqCtx {
     char *buf;                  /* read requests only */
 };
 
+/* One remote entry queued for deletion from the context menu. */
+struct SgDelItem {
+    char *path;
+    bool is_dir;
+    bool scanned;               /* its children are already in the list */
+};
+
 struct SgChan {
     Channel chan;
     SftpGui *g;                 /* NULL once the window has gone away */
@@ -230,6 +253,15 @@ struct SftpGui {
      */
     char *pick;
 
+    /*
+     * A name typed into a list view's label edit. The rename runs from
+     * a posted message rather than from the notification itself, so the
+     * edit control is gone before the pane is refilled.
+     */
+    bool ren_local;
+    int ren_idx;
+    char *ren_name;
+
     /* SCP: state of the interactive scp session in progress. */
     int scp_state;
     uint64_t scp_sent;
@@ -257,6 +289,15 @@ struct SftpGui {
     /* Reassembly buffer for incoming SFTP data. */
     char *inbuf;
     size_t inlen, incap;
+
+    /*
+     * Context menu: the remote entries being deleted. Parents come
+     * before their children in the list, so deleting backwards removes
+     * a tree from the bottom up.
+     */
+    struct SgDelItem *del;
+    int ndel, delsize, del_walk, del_done;
+    bool del_error;
 
     int pend;
     struct fxp_handle *dirhandle;   /* directory being listed */
@@ -317,6 +358,9 @@ static void sg_exec_done(SftpGui *g);
 static void sg_scp_ul_pump(SftpGui *g);
 static void sg_abort_exec(SftpGui *g);
 static void sg_batch_free(SftpGui *g);
+static void sg_del_run(SftpGui *g);
+static void sg_del_free(SftpGui *g);
+static void sg_del_push(SftpGui *g, const char *path, bool is_dir);
 static LRESULT CALLBACK SgWndProc(HWND, UINT, WPARAM, LPARAM);
 
 /* ----------------------------------------------------------------------
@@ -2681,6 +2725,22 @@ static void sg_scp_rx(SftpGui *g, struct SgChan *c)
     }
 }
 
+/* Copy a command's error output, minus the line ending, for the status
+ * line. Caller frees. */
+static char *sg_exec_message(const char *text, const char *fallback)
+{
+    const char *src = (text && *text) ? text : fallback;
+    size_t n = strlen(src);
+
+    while (n > 0 && (src[n-1] == '\n' || src[n-1] == '\r' || src[n-1] == ' '))
+        n--;
+
+    char *ret = snewn(n + 1, char);
+    memcpy(ret, src, n);
+    ret[n] = '\0';
+    return ret;
+}
+
 /* An exec channel has closed: work out what it meant. */
 static void sg_exec_done(SftpGui *g)
 {
@@ -2714,6 +2774,23 @@ static void sg_exec_done(SftpGui *g)
         g->pend = SG_P_NONE;
         sg_local_enqueue_tree(g, g->walk_local, g->walk_remote);
         sg_xfer_next(g);
+        goto out;
+    }
+
+    if (kind == SG_EXEC_RM || kind == SG_EXEC_MV) {
+        /* The context menu's remote delete and rename. */
+        g->pend = SG_P_NONE;
+        if (!ok) {
+            char *msg = sg_exec_message(
+                err, kind == SG_EXEC_RM ? "删除失败" : "重命名失败");
+
+            sg_status(g, msg);
+            sfree(msg);
+        } else {
+            sg_status(g, kind == SG_EXEC_RM ? i18n_or("Deleted.")
+                                            : "已重命名");
+        }
+        sg_remote_refresh(g);
         goto out;
     }
 
@@ -3125,6 +3202,90 @@ static void sg_handle_packet(SftpGui *g, struct sftp_packet *pktin)
         sg_xfer_next(g);
         break;
 
+      case SG_P_DEL_OPENDIR: {
+        struct fxp_handle *h = fxp_opendir_recv(pktin, req);
+
+        g->pend = SG_P_NONE;
+        if (!h) {
+            sg_statusf(g, "%s: %s", g->del[g->del_walk].path, fxp_error());
+            g->del_error = true;
+            g->del_walk++;
+            sg_del_run(g);
+            break;
+        }
+        g->dirhandle = h;
+        g->pend = SG_P_DEL_READDIR;
+        sftp_register(fxp_readdir_send(h));
+        break;
+      }
+
+      case SG_P_DEL_READDIR: {
+        struct fxp_names *names = fxp_readdir_recv(pktin, req);
+
+        if (!names) {
+            struct fxp_handle *h = g->dirhandle;
+
+            if (fxp_error_type() != SSH_FX_EOF) {
+                sg_statusf(g, "%s: %s", g->del[g->del_walk].path,
+                           fxp_error());
+                g->del_error = true;
+            }
+            g->dirhandle = NULL;
+            g->pend = SG_P_DEL_CLOSEDIR;
+            sftp_register(fxp_close_send(h));
+            break;
+        }
+        for (int i = 0; i < names->nnames; i++) {
+            struct fxp_name *fn = &names->names[i];
+            bool isdir =
+                ((fn->attrs.flags & SSH_FILEXFER_ATTR_PERMISSIONS) &&
+                 (fn->attrs.permissions & 0170000) == PERMS_DIRECTORY);
+            char *p;
+
+            if (!strcmp(fn->filename, ".") || !strcmp(fn->filename, ".."))
+                continue;
+            p = sg_join(g->del[g->del_walk].path, fn->filename, '/');
+            sg_del_push(g, p, isdir);
+            sfree(p);
+        }
+        fxp_free_names(names);
+        sftp_register(fxp_readdir_send(g->dirhandle));
+        break;
+      }
+
+      case SG_P_DEL_CLOSEDIR:
+        fxp_close_recv(pktin, req);
+        g->pend = SG_P_NONE;
+        g->del[g->del_walk].scanned = true;
+        g->del_walk++;
+        sg_del_run(g);
+        break;
+
+      case SG_P_DEL_REMOVE:
+      case SG_P_DEL_RMDIR: {
+        bool ok = (g->pend == SG_P_DEL_RMDIR)
+            ? fxp_rmdir_recv(pktin, req) : fxp_remove_recv(pktin, req);
+
+        g->pend = SG_P_NONE;
+        if (!ok) {
+            sg_statusf(g, "%s: %s", g->del[g->ndel-1].path, fxp_error());
+            g->del_error = true;
+        } else {
+            g->del_done++;
+        }
+        sfree(g->del[g->ndel-1].path);
+        g->ndel--;
+        sg_del_run(g);
+        break;
+      }
+
+      case SG_P_RENAME:
+        g->pend = SG_P_NONE;
+        if (!fxp_rename_recv(pktin, req))
+            sg_status(g, fxp_error());
+        sg_remote_refresh(g);
+        break;
+
       default:
         sfree(req);
         sftp_pkt_free(pktin);
@@ -3180,6 +3341,7 @@ static void sg_fatal(SftpGui *g, const char *msg)
         g->lfh = INVALID_HANDLE_VALUE;
     }
     sg_tasks_free(g);
+    sg_del_free(g);
     g->busy = false;
     EnableWindow(g->btn_upload, FALSE);
     EnableWindow(g->btn_download, FALSE);
@@ -3329,6 +3491,459 @@ static void sg_do_cancel(SftpGui *g)
 }
 
 /* ----------------------------------------------------------------------
+ * Keyboard input for the window's own controls.
+ *
+ * PuTTY's message loop deliberately never calls TranslateMessage: the
+ * terminal window translates keystrokes itself, and keeping the two
+ * apart is what lets it tie a character to the key that produced it.
+ * The consequence is that no other window in this process ever receives
+ * a WM_CHAR, so the path boxes and the in-place name editor have to
+ * translate their own WM_KEYDOWN messages, which is what this does.
+ */
+
+static void sg_type_key(HWND hwnd, WPARAM vk, LPARAM lParam)
+{
+    BYTE state[256];
+    wchar_t buf[8];
+    UINT scancode = (UINT)((lParam >> 16) & 0xFF);
+    int n;
+
+    if (vk == VK_PACKET) {
+        /* An injected Unicode character: the character is in lParam. */
+        SendMessageW(hwnd, WM_CHAR, (WPARAM)(lParam & 0xFFFF), lParam);
+        return;
+    }
+    if (!GetKeyboardState(state))
+        return;
+
+    n = ToUnicode((UINT)vk, scancode, state, buf, lenof(buf), 0);
+    for (int i = 0; i < n; i++)
+        SendMessageW(hwnd, WM_CHAR, (WPARAM)buf[i], lParam);
+}
+
+/* The name editor a list view creates, once we have subclassed it. */
+static WNDPROC sg_label_origproc;
+static HWND sg_label_edit;
+
+static LRESULT CALLBACK sg_label_proc(HWND hwnd, UINT msg, WPARAM wParam,
+                                      LPARAM lParam)
+{
+    if (msg == WM_KEYDOWN)
+        sg_type_key(hwnd, wParam, lParam);
+    return CallWindowProcW(sg_label_origproc, hwnd, msg, wParam, lParam);
+}
+
+static void sg_watch_label_edit(HWND edit)
+{
+    if (!edit || edit == sg_label_edit)
+        return;
+    sg_label_edit = edit;
+    sg_label_origproc = (WNDPROC)SetWindowLongPtrW(
+        edit, GWLP_WNDPROC, (LONG_PTR)sg_label_proc);
+}
+
+/* ----------------------------------------------------------------------
+ * The list views' context menu: upload/download, delete and rename.
+ *
+ * The same menu serves both panes. The transfer item is the one
+ * difference: in the local pane it pushes the selection out to the
+ * server, and in the remote pane it pulls it in.
+ */
+
+/* The rows selected in a pane, ignoring the ".." entry. Caller frees. */
+static int sg_ctx_selection(struct SgPane *p, int **out)
+{
+    int *idxs = NULL;
+    int n = sg_lv_collect(p->list, &idxs);
+    int m = 0;
+
+    for (int i = 0; i < n; i++)
+        if (idxs[i] >= 0 && idxs[i] < p->nents &&
+            strcmp(p->ents[idxs[i]].name, "..") != 0)
+            idxs[m++] = idxs[i];
+    *out = idxs;
+    return m;
+}
+
+/* Select the row under the mouse unless it already is selected. */
+static bool sg_ctx_hit_test(HWND lv, POINT screen)
+{
+    LVHITTESTINFO ht;
+
+    memset(&ht, 0, sizeof(ht));
+    ht.pt = screen;
+    ScreenToClient(lv, &ht.pt);
+    if ((int)SendMessageW(lv, LVM_HITTEST, 0, (LPARAM)&ht) < 0)
+        return false;
+    if (!(ht.flags & LVIS_SELECTED)) {
+        ListView_SetItemState(lv, -1, 0, LVIS_SELECTED);
+        ListView_SetItemState(lv, ht.iItem, LVIS_SELECTED | LVIS_FOCUSED,
+                              LVIS_SELECTED | LVIS_FOCUSED);
+    }
+    return true;
+}
+
+/* Delete a local file, or a directory and everything below it. */
+static char *sg_local_delete(const char *path, bool is_dir, bool recurse)
+{
+    wchar_t *w;
+    DWORD e;
+
+    if (is_dir && recurse) {
+        struct SgEntry *ents = NULL;
+        int n = 0;
+        char *err = sg_local_list(path, &ents, &n);
+
+        if (err)
+            return err;
+        for (int i = 0; i < n; i++) {
+            char *child;
+
+            if (!strcmp(ents[i].name, ".."))
+                continue;
+            child = sg_join(path, ents[i].name, '\\');
+            /* A junction or symlink is removed, never followed. */
+            err = sg_local_delete(child, ents[i].is_dir, !ents[i].reparse);
+            sfree(child);
+            if (err)
+                break;
+        }
+        sg_entries_free(ents, n);
+        if (err)
+            return err;
+    }
+
+    w = sg_w(path);
+    if (is_dir ? !RemoveDirectoryW(w) : !DeleteFileW(w)) {
+        e = GetLastError();
+        sfree(w);
+        return dupprintf("%s: %s", path, win_strerror(e));
+    }
+    sfree(w);
+    return NULL;
+}
+
+/* ----------------------------------------------------------------------
+ * Remote deletion: walk the tree into a list, then remove it backwards,
+ * so every directory is empty by the time its turn comes.
+ */
+
+static void sg_del_free(SftpGui *g)
+{
+    for (int i = 0; i < g->ndel; i++)
+        sfree(g->del[i].path);
+    sfree(g->del);
+    g->del = NULL;
+    g->ndel = g->delsize = g->del_walk = g->del_done = 0;
+    g->del_error = false;
+}
+
+static void sg_del_push(SftpGui *g, const char *path, bool is_dir)
+{
+    if (g->ndel >= g->delsize) {
+        g->delsize = g->delsize ? g->delsize * 2 : 16;
+        g->del = sresize(g->del, g->delsize, struct SgDelItem);
+    }
+    g->del[g->ndel].path = dupstr(path);
+    g->del[g->ndel].is_dir = is_dir;
+    g->del[g->ndel].scanned = false;
+    g->ndel++;
+}
+
+static void sg_del_run(SftpGui *g)
+{
+    while (g->pend == SG_P_NONE) {
+        if (g->del_walk < g->ndel) {
+            struct SgDelItem *it = &g->del[g->del_walk];
+
+            if (it->is_dir && !it->scanned) {
+                g->pend = SG_P_DEL_OPENDIR;
+                sftp_register(fxp_opendir_send(it->path));
+                return;
+            }
+            g->del_walk++;
+            continue;
+        }
+
+        if (g->ndel == 0) {
+            bool bad = g->del_error;
+            int done = g->del_done;
+
+            sg_del_free(g);
+            if (bad)
+                sg_status(g, "部分项目删除失败");
+            else
+                sg_statusf(g, i18n_or("Deleted %d item(s)."), done);
+            sg_remote_refresh(g);
+            return;
+        }
+
+        struct SgDelItem *it = &g->del[g->ndel-1];
+
+        g->pend = it->is_dir ? SG_P_DEL_RMDIR : SG_P_DEL_REMOVE;
+        sftp_register(it->is_dir ? fxp_rmdir_send(it->path)
+                                 : fxp_remove_send(it->path));
+        return;
+    }
+}
+
+static void sg_remote_delete(SftpGui *g, int *idxs, int n)
+{
+    sg_del_free(g);
+    for (int i = 0; i < n; i++) {
+        struct SgEntry *e = &g->rmt.ents[idxs[i]];
+        char *path = sg_join(g->rmt.cwd, e->name, '/');
+
+        sg_del_push(g, path, e->is_dir);
+        sfree(path);
+    }
+    sg_del_run(g);
+}
+
+/* SCP has no delete of its own: ask the shell on the far end. */
+static void sg_scp_delete(SftpGui *g, int *idxs, int n)
+{
+    char *cmd = dupstr("rm -rf");
+
+    for (int i = 0; i < n; i++) {
+        struct SgEntry *e = &g->rmt.ents[idxs[i]];
+        char *path = sg_join(g->rmt.cwd, e->name, '/');
+        char *q = sg_shquote(path);
+        char *next = dupprintf("%s %s", cmd, q);
+
+        sfree(cmd);
+        sfree(path);
+        sfree(q);
+        cmd = next;
+    }
+
+    g->exec_walk = false;
+    g->pend = SG_P_SCP_EXEC;
+    if (!sg_exec_start(g, SG_EXEC_RM, false, cmd)) {
+        sg_status(g, "无法在会话上打开通道");
+        g->pend = SG_P_NONE;
+    }
+    sfree(cmd);
+}
+
+/* ----------------------------------------------------------------------
+ * Renaming.
+ */
+
+static void sg_rename_local(SftpGui *g, const char *from, const char *to)
+{
+    char *oldp = sg_join(g->lcl.cwd, from, '\\');
+    char *newp = sg_join(g->lcl.cwd, to, '\\');
+    wchar_t *wo = sg_w(oldp), *wn = sg_w(newp);
+    bool ok = MoveFileW(wo, wn) != 0;
+    DWORD e = GetLastError();
+
+    sfree(wo);
+    sfree(wn);
+    if (!ok)
+        sg_statusf(g, "%s: %s", oldp, win_strerror(e));
+    else
+        sg_statusf(g, "已重命名为 %s", to);
+    sfree(oldp);
+    sfree(newp);
+    sg_local_refresh(g);
+}
+
+static void sg_rename_remote(SftpGui *g, const char *from, const char *to)
+{
+    char *oldp = sg_join(g->rmt.cwd, from, '/');
+    char *newp = sg_join(g->rmt.cwd, to, '/');
+
+    if (g->scp) {
+        char *qo = sg_shquote(oldp), *qn = sg_shquote(newp);
+        char *cmd = dupprintf("mv %s %s", qo, qn);
+
+        sfree(qo);
+        sfree(qn);
+        g->exec_walk = false;
+        g->pend = SG_P_SCP_EXEC;
+        if (!sg_exec_start(g, SG_EXEC_MV, false, cmd)) {
+            sg_status(g, "无法在会话上打开通道");
+            g->pend = SG_P_NONE;
+        }
+        sfree(cmd);
+    } else {
+        g->pend = SG_P_RENAME;
+        sftp_register(fxp_rename_send(oldp, newp));
+    }
+    sfree(oldp);
+    sfree(newp);
+}
+
+/*
+ * Open the in-place name editor on one row. The list view creates an
+ * edit box of its own, but it only hands the keyboard to it when the
+ * command came from the keyboard or a slow click, so the focus is set
+ * explicitly here as well.
+ */
+static void sg_start_label_edit(SftpGui *g, bool is_local, int idx)
+{
+    HWND lv = is_local ? g->lcl.list : g->rmt.list;
+    int n = is_local ? g->lcl.nents : g->rmt.nents;
+    HWND edit;
+
+    if (idx < 0 || idx >= n)
+        return;
+
+    ListView_SetItemState(lv, -1, 0, LVIS_SELECTED);
+    ListView_SetItemState(lv, idx, LVIS_SELECTED | LVIS_FOCUSED,
+                          LVIS_SELECTED | LVIS_FOCUSED);
+    SendMessageW(lv, LVM_ENSUREVISIBLE, idx, FALSE);
+    SetFocus(lv);
+    if (!SendMessageW(lv, LVM_EDITLABELW, idx, 0))
+        return;
+
+    edit = (HWND)SendMessageW(lv, LVM_GETEDITCONTROL, 0, 0);
+    if (edit) {
+        sg_watch_label_edit(edit);
+        SetFocus(edit);
+    }
+}
+
+/* Rename one entry of a pane, once the label edit box has finished. */
+static void sg_ctx_rename(SftpGui *g, bool is_local, int idx, const char *name)
+{
+    struct SgPane *p = is_local ? &g->lcl : &g->rmt;
+
+    if (idx < 0 || idx >= p->nents || !*name)
+        return;
+    if (!strcmp(name, "..") || !strcmp(name, p->ents[idx].name))
+        return;
+    if (strpbrk(name, is_local ? "\\/:*?\"<>|" : "/"))
+        return;                        /* not a name Windows or the
+                                        * server would accept */
+
+    if (is_local)
+        sg_rename_local(g, p->ents[idx].name, name);
+    else
+        sg_rename_remote(g, p->ents[idx].name, name);
+}
+
+/* ----------------------------------------------------------------------
+ * Delete, after asking first.
+ */
+
+static void sg_ctx_delete(SftpGui *g, bool is_local, int *idxs, int n)
+{
+    struct SgPane *p = is_local ? &g->lcl : &g->rmt;
+    char *msg;
+
+    if (n == 0)
+        return;
+
+    msg = dupprintf(i18n_or("Delete %d selected item(s)?"), n);
+    {
+        wchar_t *wmsg = sg_w(msg), *wcap = sg_w("SFTP");
+        int ret = MessageBoxW(g->hwnd, wmsg, wcap,
+                              MB_ICONWARNING | MB_YESNO);
+
+        sfree(wmsg);
+        sfree(wcap);
+        if (ret != IDYES) {
+            sfree(msg);
+            return;
+        }
+    }
+    sfree(msg);
+
+    if (is_local) {
+        char *err = NULL;
+        int done = 0;
+
+        for (int i = 0; i < n && !err; i++) {
+            struct SgEntry *e = &p->ents[idxs[i]];
+            char *path = sg_join(g->lcl.cwd, e->name, '\\');
+
+            err = sg_local_delete(path, e->is_dir, !e->reparse);
+            sfree(path);
+            if (!err)
+                done++;
+        }
+        if (err) {
+            sg_status(g, err);
+            sfree(err);
+        } else {
+            sg_statusf(g, i18n_or("Deleted %d item(s)."), done);
+        }
+        sg_local_refresh(g);
+    } else if (g->scp) {
+        sg_scp_delete(g, idxs, n);
+    } else {
+        sg_remote_delete(g, idxs, n);
+    }
+}
+
+static void sg_popup_menu(SftpGui *g, bool is_local, int x, int y)
+{
+    struct SgPane *p = is_local ? &g->lcl : &g->rmt;
+    int *idxs = NULL;
+    int n = sg_ctx_selection(p, &idxs);
+    bool ready = !g->busy && g->subsys_ok && g->pend == SG_P_NONE;
+    bool can_xfer = n > 0 && ready;
+    /* The local pane needs no connection, but not mid-transfer either. */
+    bool can_edit = is_local ? !g->busy : ready;
+    bool can_del = n > 0 && can_edit;
+    bool can_ren = n == 1 && can_edit;
+    HMENU m = CreatePopupMenu();
+    wchar_t *wxfer = sg_w(i18n_or(is_local ? "Upload..." : "Download..."));
+    wchar_t *wdel = sg_w(i18n_or("Delete"));
+    wchar_t *wren = sg_w(i18n_or("Rename"));
+    int cmd;
+
+    AppendMenuW(m, MF_STRING, SG_ID_CTX_XFER, wxfer);
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, SG_ID_CTX_DELETE, wdel);
+    AppendMenuW(m, MF_STRING, SG_ID_CTX_RENAME, wren);
+    EnableMenuItem(m, SG_ID_CTX_XFER, can_xfer ? MF_ENABLED : MF_GRAYED);
+    EnableMenuItem(m, SG_ID_CTX_DELETE, can_del ? MF_ENABLED : MF_GRAYED);
+    EnableMenuItem(m, SG_ID_CTX_RENAME, can_ren ? MF_ENABLED : MF_GRAYED);
+
+    sfree(wxfer);
+    sfree(wdel);
+    sfree(wren);
+
+    SetForegroundWindow(g->hwnd);
+    cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                              x, y, 0, g->hwnd, NULL);
+    DestroyMenu(m);
+
+    switch (cmd) {
+      case SG_ID_CTX_XFER:
+        if (is_local)
+            sg_do_upload(g);
+        else
+            sg_do_download(g);
+        break;
+
+      case SG_ID_CTX_DELETE:
+        sg_ctx_delete(g, is_local, idxs, n);
+        break;
+
+      case SG_ID_CTX_RENAME:
+        if (n == 1) {
+            /*
+             * Start the label edit from a posted message. The menu is
+             * still being torn down when TrackPopupMenu returns, and it
+             * takes the keyboard focus back with it: an edit box opened
+             * here would end up without focus, and typing would go
+             * nowhere.
+             */
+            g->ren_idx = idxs[0];
+            g->ren_local = is_local;
+            PostMessage(g->hwnd, WM_SG_NOTIFY, SG_CH_RENAME_EDIT, 0);
+        }
+        break;
+    }
+
+    sfree(idxs);
+}
+
+/* ----------------------------------------------------------------------
  * Window plumbing.
  */
 
@@ -3354,9 +3969,12 @@ static void sg_edit_enter(HWND hwnd)
 static LRESULT CALLBACK sg_edit_proc(HWND hwnd, UINT msg,
                                      WPARAM wParam, LPARAM lParam)
 {
-    if (msg == WM_KEYDOWN && wParam == VK_RETURN) {
-        sg_edit_enter(hwnd);
-        return 0;
+    if (msg == WM_KEYDOWN) {
+        if (wParam == VK_RETURN) {
+            sg_edit_enter(hwnd);
+            return 0;
+        }
+        sg_type_key(hwnd, wParam, lParam);
     }
     if (msg == WM_CHAR && (wParam == '\r' || wParam == '\n'))
         return 0;
@@ -3430,16 +4048,16 @@ static void sg_create_controls(SftpGui *g)
     sg_subclass_combo(&g->lcl);
     g->lcl.up = sg_child(g, L"BUTTON", "..", BS_PUSHBUTTON, 0, SG_ID_L_UP);
     g->lcl.list = sg_child(g, WC_LISTVIEWW, "",
-                           LVS_REPORT | LVS_SHOWSELALWAYS, WS_EX_CLIENTEDGE,
-                           SG_ID_L_LIST);
+                           LVS_REPORT | LVS_SHOWSELALWAYS | LVS_EDITLABELS,
+                           WS_EX_CLIENTEDGE, SG_ID_L_LIST);
 
     g->rmt.label = sg_child(g, L"STATIC", "Remote", SS_LEFT, 0, SG_ID_R_LABEL);
     g->rmt.path = sg_child(g, L"COMBOBOX", "", combo_style, 0, SG_ID_R_PATH);
     sg_subclass_combo(&g->rmt);
     g->rmt.up = sg_child(g, L"BUTTON", "..", BS_PUSHBUTTON, 0, SG_ID_R_UP);
     g->rmt.list = sg_child(g, WC_LISTVIEWW, "",
-                           LVS_REPORT | LVS_SHOWSELALWAYS, WS_EX_CLIENTEDGE,
-                           SG_ID_R_LIST);
+                           LVS_REPORT | LVS_SHOWSELALWAYS | LVS_EDITLABELS,
+                           WS_EX_CLIENTEDGE, SG_ID_R_LIST);
 
     ListView_SetExtendedListViewStyle(
         g->lcl.list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
@@ -3568,6 +4186,7 @@ static void sg_free(SftpGui *g, bool channel_still_ours)
     }
     sg_tasks_free(g);
     sg_batch_free(g);
+    sg_del_free(g);
     sftp_cleanup_request();
     sg_entries_free(g->lcl.ents, g->lcl.nents);
     sg_entries_free(g->rmt.ents, g->rmt.nents);
@@ -3582,6 +4201,7 @@ static void sg_free(SftpGui *g, bool channel_still_ours)
     sfree(g->rmt.cwd);
     sfree(g->target_path);
     sfree(g->pick);
+    sfree(g->ren_name);
     sfree(g->inbuf);
     sfree(g->exec_out);
     sfree(g->exec_err);
@@ -3666,6 +4286,12 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       case WM_SIZE:
         if (g)
             sg_layout(g);
+        /*
+         * Moving the panes uncovers strips of window that the pane that
+         * used to be there had painted. The children are clipped out, so
+         * this repaints just the gaps and never the panes themselves.
+         */
+        InvalidateRect(hwnd, NULL, TRUE);
         return 0;
 
       case WM_TIMER:
@@ -3725,6 +4351,18 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             }
             break;
           }
+          case SG_CH_RENAME: {
+            char *name = g->ren_name;
+            g->ren_name = NULL;
+            if (name) {
+                sg_ctx_rename(g, g->ren_local, g->ren_idx, name);
+                sfree(name);
+            }
+            break;
+          }
+          case SG_CH_RENAME_EDIT:
+            sg_start_label_edit(g, g->ren_local, g->ren_idx);
+            break;
           case SG_CH_OPENFAILED: {
             char *text = (char *)lParam;
             sg_fatal(g, text);
@@ -3800,6 +4438,37 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         }
         break;
 
+      case WM_CONTEXTMENU: {
+        POINT pt;
+        HWND lv = NULL;
+        bool keyboard = (lParam == (LPARAM)-1);
+
+        if (!g)
+            break;
+        if (keyboard) {
+            /* Invoked from the keyboard: use the current selection. */
+            GetCursorPos(&pt);
+            lv = (GetFocus() == g->rmt.list) ? g->rmt.list : g->lcl.list;
+        } else {
+            pt.x = (int)(short)LOWORD(lParam);
+            pt.y = (int)(short)HIWORD(lParam);
+            for (int i = 0; i < 2 && !lv; i++) {
+                HWND cand = i ? g->rmt.list : g->lcl.list;
+                RECT rc;
+                GetWindowRect(cand, &rc);
+                if (PtInRect(&rc, pt))
+                    lv = cand;
+            }
+        }
+        if (!lv)
+            break;
+        SetFocus(lv);
+        if (!keyboard && !sg_ctx_hit_test(lv, pt))
+            return 0;                  /* clicked below the last row */
+        sg_popup_menu(g, lv == g->lcl.list, pt.x, pt.y);
+        return 0;
+      }
+
       case WM_MEASUREITEM: {
         MEASUREITEMSTRUCT *mis = (MEASUREITEMSTRUCT *)lParam;
         if (mis->CtlType == ODT_COMBOBOX) {
@@ -3829,6 +4498,38 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             else if (nm->hwndFrom == g->rmt.list)
                 sg_list_activate(g, false);
             return 0;
+        }
+        if (nm->code == LVN_BEGINLABELEDITW) {
+            HWND edit;
+
+            if (nm->hwndFrom != g->lcl.list && nm->hwndFrom != g->rmt.list)
+                break;
+            /* Make sure the edit box owns the keyboard and turns the
+             * keys into characters: this window's message loop does not
+             * translate them (see sg_type_key). */
+            edit = (HWND)SendMessageW(nm->hwndFrom, LVM_GETEDITCONTROL, 0, 0);
+            if (edit) {
+                sg_watch_label_edit(edit);
+                SetFocus(edit);
+            }
+            return FALSE;              /* allow the edit */
+        }
+        if (nm->code == LVN_ENDLABELEDITW) {
+            NMLVDISPINFOW *di = (NMLVDISPINFOW *)lParam;
+
+            if (nm->hwndFrom != g->lcl.list && nm->hwndFrom != g->rmt.list)
+                break;
+            sg_label_edit = NULL;      /* the edit box is about to go */
+            if (di->item.pszText) {
+                sfree(g->ren_name);
+                g->ren_name = sg_to_utf8(di->item.pszText);
+                g->ren_idx = di->item.iItem;
+                g->ren_local = (nm->hwndFrom == g->lcl.list);
+                PostMessage(hwnd, WM_SG_NOTIFY, SG_CH_RENAME, 0);
+            }
+            /* Refuse the edit: the pane is refreshed with the new name
+             * once the rename has actually happened. */
+            return FALSE;
         }
         break;
       }

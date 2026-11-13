@@ -55,6 +55,12 @@ Transfer cancelled.=传输已取消。
 Cancelling...=正在取消...
 Select the files to transfer first.=请先选择要传输的文件。
 Please wait for the current operation to finish.=请等待当前操作完成。
+Upload...=上传...
+Download...=下载...
+Rename=重命名
+Delete %d selected item(s)?=确定要删除选中的 %d 个项目吗？
+Deleted %d item(s).=已删除 %d 个项目。
+Deleted.=已删除。
 
 # ===== 对话框标题与提示 =====
 PuTTY Configuration=PuTTY 配置
