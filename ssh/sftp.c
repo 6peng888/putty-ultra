@@ -12,8 +12,26 @@
 #include "tree234.h"
 #include "sftp.h"
 
-static const char *fxp_error_message;
-static int fxp_errtype;
+/*
+ * Everything that is per-conversation rather than per-request lives in
+ * one of these: the table of requests in flight, and the outcome of the
+ * last reply. A front end that only ever runs one conversation (psftp,
+ * pscp) keeps using the default one and never notices; the Windows GUI
+ * gives each of its transfer windows one of its own, so several of them
+ * can be open at once without their request tables interfering.
+ */
+struct sftp_client {
+    tree234 *requests;
+    const char *error_message;
+    int error_type;
+};
+
+static struct sftp_client default_client;
+static struct sftp_client *cur_client = &default_client;
+
+#define sftp_requests (cur_client->requests)
+#define fxp_error_message (cur_client->error_message)
+#define fxp_errtype (cur_client->error_type)
 
 static void fxp_internal_error(const char *msg);
 
@@ -96,7 +114,36 @@ static int sftp_reqfind(void *av, void *bv)
     return 0;
 }
 
-static tree234 *sftp_requests;
+struct sftp_client *sftp_client_new(void)
+{
+    struct sftp_client *client = snew(struct sftp_client);
+
+    client->requests = NULL;
+    client->error_message = NULL;
+    client->error_type = 0;
+    return client;
+}
+
+void sftp_client_free(struct sftp_client *client)
+{
+    if (!client || client == &default_client)
+        return;
+    if (cur_client == client)
+        cur_client = &default_client;
+    if (client->requests)
+        freetree234(client->requests);
+    sfree(client);
+}
+
+void sftp_client_select(struct sftp_client *client)
+{
+    cur_client = client ? client : &default_client;
+}
+
+struct sftp_client *sftp_client_current(void)
+{
+    return cur_client;
+}
 
 static struct sftp_request *sftp_alloc_request(void)
 {

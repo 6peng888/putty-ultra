@@ -18,9 +18,10 @@
  * (as drawn by the tab strip), which is put in the window's title so
  * the two windows can be told apart in the taskbar. It may be NULL.
  *
- * Only one such window can exist per process, because ssh/sftp.c keeps
- * its request table in globals; a second call just re-activates the
- * window that is already open.
+ * There is one window per session: asking again for a session brings its
+ * window to the front, and a different session gets a window of its own.
+ * Each window keeps its own SFTP request table (see sftp_client_new), so
+ * transfers in different windows do not disturb each other.
  */
 void sftp_gui_open(HWND parent, Backend *be, const wchar_t *tab_label);
 void scp_gui_open(HWND parent, Backend *be, const wchar_t *tab_label);

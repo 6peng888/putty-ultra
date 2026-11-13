@@ -79,6 +79,24 @@ bool sftp_recvdata(char *data, size_t len);
  */
 void sftp_cleanup_request(void);
 
+/*
+ * Independent SFTP conversations in one process.
+ *
+ * The table of requests in flight and the outcome of the last reply are
+ * per-conversation. A front end that runs only one conversation (psftp,
+ * pscp) simply never touches this and keeps the default one. A front end
+ * that runs several at once - the Windows GUI's transfer windows - takes
+ * one of these for each, selects it before doing anything with the
+ * fxp_* calls, and frees it when that conversation ends. sftp_senddata is
+ * then expected to use sftp_client_current() to work out which
+ * conversation it is sending for.
+ */
+struct sftp_client;
+struct sftp_client *sftp_client_new(void);
+void sftp_client_free(struct sftp_client *client);
+void sftp_client_select(struct sftp_client *client);   /* NULL: default */
+struct sftp_client *sftp_client_current(void);
+
 struct fxp_attrs {
     unsigned long flags;
     uint64_t size;

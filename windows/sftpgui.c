@@ -13,8 +13,10 @@
  * receive anywhere, so the window stays responsive and the terminal
  * keeps working while a transfer runs.
  *
- * ssh/sftp.c keeps its pending-request table in file-scope globals, so
- * only one of these windows can exist per process.
+ * Each window owns one SFTP conversation, with a request table of its
+ * own (see sftp_client_new in ssh/sftp.c), so a window can be opened for
+ * every session in the program without them interfering. Every entry
+ * point selects its window's conversation before touching ssh/sftp.c.
  */
 
 #include <stdio.h>
@@ -333,11 +335,32 @@ struct SftpGui {
      */
     bool dl_end_known;
     uint64_t dl_end;
+
+    /* This window's own SFTP request table (see ssh/sftp.h). */
+    struct sftp_client *sftpc;
+
+    SftpGui *next;              /* the list of open windows */
 };
 
-static SftpGui *sg_instance;
+static SftpGui *sg_windows;     /* every open transfer window */
 static const char *sg_startup_error;
 static bool sg_pending_scp;     /* mode for the window being created */
+
+static SftpGui *sg_by_client(struct sftp_client *client)
+{
+    for (SftpGui *g = sg_windows; g; g = g->next)
+        if (client && g->sftpc == client)
+            return g;
+    return NULL;
+}
+
+static SftpGui *sg_by_backend(Backend *be)
+{
+    for (SftpGui *g = sg_windows; g; g = g->next)
+        if (be && g->be == be)
+            return g;
+    return NULL;
+}
 
 /* ----------------------------------------------------------------------
  * Forward declarations for the mutually recursive parts.
@@ -1225,6 +1248,9 @@ static size_t sg_chan_send(Channel *chan, bool is_stderr,
     }
     memcpy(g->inbuf + g->inlen, data, len);
     g->inlen += len;
+    /* Replying to these requests may send more of our own, and they all
+     * belong to this window's table. */
+    sftp_client_select(g->sftpc);
     sg_process_inbuf(g);
     return len;
 }
@@ -1318,7 +1344,8 @@ static const ChannelVtable SgChan_vt = {
  */
 bool sftp_senddata(const char *data, size_t len)
 {
-    SftpGui *g = sg_instance;
+    /* ssh/sftp.c calls this with the conversation's client selected. */
+    SftpGui *g = sg_by_client(sftp_client_current());
 
     if (!g || !g->sc || !g->chan_open)
         return false;
@@ -3952,10 +3979,13 @@ static WNDPROC sg_edit_origproc;
 
 static void sg_edit_enter(HWND hwnd)
 {
-    SftpGui *g = sg_instance;
+    SftpGui *g = NULL;
     wchar_t buf[1024];
     char *path;
 
+    for (SftpGui *w = sg_windows; w && !g; w = w->next)
+        if (hwnd == w->lcl.edit || hwnd == w->rmt.edit)
+            g = w;
     if (!g)
         return;
     GetWindowTextW(hwnd, buf, lenof(buf));
@@ -4188,7 +4218,23 @@ static void sg_free(SftpGui *g, bool channel_still_ours)
     sg_tasks_free(g);
     sg_batch_free(g);
     sg_del_free(g);
-    sftp_cleanup_request();
+    /*
+     * Drop this window from the list of open ones and throw away its
+     * request table: it is this window's alone, so closing it must not
+     * disturb a transfer running in another window.
+     */
+    for (SftpGui **pw = &sg_windows; *pw; pw = &(*pw)->next) {
+        if (*pw == g) {
+            *pw = g->next;
+            break;
+        }
+    }
+    if (g->sftpc) {
+        if (sftp_client_current() == g->sftpc)
+            sftp_client_select(NULL);
+        sftp_client_free(g->sftpc);
+        g->sftpc = NULL;
+    }
     sg_entries_free(g->lcl.ents, g->lcl.nents);
     sg_entries_free(g->rmt.ents, g->rmt.nents);
     sg_entries_free(g->rents, g->nrents);
@@ -4219,6 +4265,7 @@ static SftpGui *sg_create(HWND hwnd, Backend *be, bool scp)
     g->hwnd = hwnd;
     g->scp = scp;
     g->be = be;
+    g->sftpc = sftp_client_new();
     g->lfh = INVALID_HANDLE_VALUE;
     g->pend = SG_P_NONE;
     g->rmt.cwd = dupstr("/");
@@ -4262,7 +4309,8 @@ static SftpGui *sg_create(HWND hwnd, Backend *be, bool scp)
     if (!scp)
         g->sc = c->sc;
 
-    sg_instance = g;
+    g->next = sg_windows;
+    sg_windows = g;
     sg_layout(g);
     sg_status(g, i18n_or("Connecting..."));
     return g;
@@ -4272,6 +4320,15 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                                   LPARAM lParam)
 {
     SftpGui *g = (SftpGui *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+
+    /*
+     * Several transfer windows can be open at once, each with its own
+     * SFTP conversation. Everything this window does from here - buttons,
+     * menus, list refreshes, transfers - must go to its own request
+     * table, so select it before any of that runs.
+     */
+    if (g)
+        sftp_client_select(g->sftpc);
 
     switch (msg) {
       case WM_CREATE: {
@@ -4557,8 +4614,7 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       case WM_DESTROY:
         if (g) {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            if (sg_instance == g)
-                sg_instance = NULL;
+            /* sg_free takes the window out of the open-window list. */
             sg_free(g, true);
         }
         return 0;
@@ -4590,20 +4646,21 @@ static wchar_t *sg_title(bool scp, const wchar_t *tab_label)
 
 void sftpgui_tab_label_changed(Backend *be, const wchar_t *tab_label)
 {
-    SftpGui *g = sg_instance;
-    wchar_t *title;
-
     /*
-     * Only the one transfer window can exist, and only the session that
-     * opened it owns it: every other tab's re-caption is ignored here.
-     * The label carries the tab's number, so reordering the tabs changes
-     * it even when the session itself did not.
+     * Every open window is told about every tab, since only a window
+     * knows which session's tab it belongs to. The label carries the
+     * tab's number, so reordering the tabs changes it even when the
+     * session itself did not.
      */
-    if (!g || !be || g->be != be)
-        return;
-    title = sg_title(g->scp, tab_label);
-    SetWindowTextW(g->hwnd, title);
-    sfree(title);
+    for (SftpGui *g = sg_windows; g; g = g->next) {
+        wchar_t *title;
+
+        if (!be || g->be != be)
+            continue;
+        title = sg_title(g->scp, tab_label);
+        SetWindowTextW(g->hwnd, title);
+        sfree(title);
+    }
 }
 
 static void sg_open(HWND parent, Backend *be, bool scp,
@@ -4614,10 +4671,19 @@ static void sg_open(HWND parent, Backend *be, bool scp,
     HWND hwnd;
     wchar_t *title;
 
-    if (sg_instance) {
-        ShowWindow(sg_instance->hwnd, SW_SHOWNORMAL);
-        SetForegroundWindow(sg_instance->hwnd);
-        return;
+    /*
+     * One window per session: asking again for the same session brings
+     * its window forward instead of opening a second one on the same
+     * connection. Other sessions get windows of their own.
+     */
+    {
+        SftpGui *open = sg_by_backend(be);
+
+        if (open) {
+            ShowWindow(open->hwnd, SW_SHOWNORMAL);
+            SetForegroundWindow(open->hwnd);
+            return;
+        }
     }
 
     if (!registered) {
@@ -4657,7 +4723,6 @@ static void sg_open(HWND parent, Backend *be, bool scp,
                   "无法创建文件传输窗口", MB_ICONERROR | MB_OK);
         return;
     }
-    sg_instance = (SftpGui *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     /*
      * The title bar and the taskbar show the small icon; the .ico file
      * carries one, so ask for it at the size Windows wants rather than
