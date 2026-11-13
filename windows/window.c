@@ -1422,6 +1422,19 @@ static void tab_move(int from, int to)
         tab_active--;
     else if (to <= tab_active && tab_active < from)
         tab_active++;
+
+    /*
+     * The number is part of a tab's label, so moving tabs re-captions the
+     * ones that changed places. The transfer window carries its session's
+     * label in its title, so it is told about every tab: it recognises
+     * the one that owns it and ignores the rest.
+     */
+    for (int i = 0; i < tab_count; i++) {
+        wchar_t label[1024];
+
+        tab_label(i, label, lenof(label));
+        sftpgui_tab_label_changed(tab_list[i]->backend, label);
+    }
 }
 
 static void tab_relayout(void)
@@ -2546,11 +2559,18 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
             /*
              * Open the two-pane SFTP window on the active session's own
              * SSH connection: it adds an extra channel to it rather
-             * than dialling again, so no new login is needed.
+             * than dialling again, so no new login is needed. It is
+             * captioned with this tab's label, so that the window can be
+             * told apart from the session's own in the taskbar.
              */
             if (tab_active >= 0 && tab_list[tab_active]->backend &&
-                tab_list[tab_active]->backend->vt->protocol == PROT_SSH)
-                sftp_gui_open(tab_frame_hwnd, tab_list[tab_active]->backend);
+                tab_list[tab_active]->backend->vt->protocol == PROT_SSH) {
+                wchar_t label[1024];
+
+                tab_label(tab_active, label, lenof(label));
+                sftp_gui_open(tab_frame_hwnd, tab_list[tab_active]->backend,
+                              label);
+            }
             return 0;
         }
         if ((wParam & ~0xF) == IDM_XFER_SCP) {
@@ -2558,8 +2578,13 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
              * the classic SCP protocol and shell commands instead of
              * the SFTP subsystem. */
             if (tab_active >= 0 && tab_list[tab_active]->backend &&
-                tab_list[tab_active]->backend->vt->protocol == PROT_SSH)
-                scp_gui_open(tab_frame_hwnd, tab_list[tab_active]->backend);
+                tab_list[tab_active]->backend->vt->protocol == PROT_SSH) {
+                wchar_t label[1024];
+
+                tab_label(tab_active, label, lenof(label));
+                scp_gui_open(tab_frame_hwnd, tab_list[tab_active]->backend,
+                             label);
+            }
             return 0;
         }
         if (wParam >= IDM_SAVED_MIN && wParam < IDM_SAVED_MAX) {

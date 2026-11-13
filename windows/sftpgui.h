@@ -14,13 +14,22 @@
  * Open the two-pane transfer window for the SSH connection that 'be'
  * belongs to, using the SFTP subsystem (open_sftp) or plain SCP
  * (open_scp). No new login is needed either way. 'parent' is the
- * window that owns the new one.
+ * window that reports errors; 'tab_label' is the session tab's caption
+ * (as drawn by the tab strip), which is put in the window's title so
+ * the two windows can be told apart in the taskbar. It may be NULL.
  *
  * Only one such window can exist per process, because ssh/sftp.c keeps
  * its request table in globals; a second call just re-activates the
  * window that is already open.
  */
-void sftp_gui_open(HWND parent, Backend *be);
-void scp_gui_open(HWND parent, Backend *be);
+void sftp_gui_open(HWND parent, Backend *be, const wchar_t *tab_label);
+void scp_gui_open(HWND parent, Backend *be, const wchar_t *tab_label);
+
+/*
+ * Called when a session's tab label changes - reordering the tabs
+ * renumbers them, and the number is part of the label. If the transfer
+ * window belongs to 'be', it takes the new label as its caption.
+ */
+void sftpgui_tab_label_changed(Backend *be, const wchar_t *tab_label);
 
 #endif /* PUTTY_WIN_SFTPGUI_H */

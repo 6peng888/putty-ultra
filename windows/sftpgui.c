@@ -4566,7 +4566,47 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-static void sg_open(HWND parent, Backend *be, bool scp)
+/*
+ * The window's caption: the session tab's label first, the way the
+ * session's own window is captioned, so that the two can be told apart
+ * in the taskbar. Caller frees.
+ */
+static wchar_t *sg_title(bool scp, const wchar_t *tab_label)
+{
+    wchar_t *base = sg_w(i18n_or(scp ? "SCP File Transfer"
+                                    : "SFTP File Transfer"));
+    size_t n = wcslen(base) + (tab_label ? wcslen(tab_label) : 0) + 8;
+    wchar_t *title = snewn(n, wchar_t);
+
+    if (tab_label && *tab_label)
+        _snwprintf(title, n, L"%s - %s", tab_label, base);
+    else
+        _snwprintf(title, n, L"%s", base);
+    title[n-1] = L'\0';
+    sfree(base);
+    return title;
+}
+
+void sftpgui_tab_label_changed(Backend *be, const wchar_t *tab_label)
+{
+    SftpGui *g = sg_instance;
+    wchar_t *title;
+
+    /*
+     * Only the one transfer window can exist, and only the session that
+     * opened it owns it: every other tab's re-caption is ignored here.
+     * The label carries the tab's number, so reordering the tabs changes
+     * it even when the session itself did not.
+     */
+    if (!g || !be || g->be != be)
+        return;
+    title = sg_title(g->scp, tab_label);
+    SetWindowTextW(g->hwnd, title);
+    sfree(title);
+}
+
+static void sg_open(HWND parent, Backend *be, bool scp,
+                    const wchar_t *tab_label)
 {
     static bool registered;
     HINSTANCE inst = GetModuleHandleW(NULL);
@@ -4596,11 +4636,18 @@ static void sg_open(HWND parent, Backend *be, bool scp)
 
     sg_startup_error = NULL;
     sg_pending_scp = scp;
-    title = sg_w(i18n_or(scp ? "SCP File Transfer" : "SFTP File Transfer"));
+
+    title = sg_title(scp, tab_label);
+    /*
+     * The window is deliberately unowned. An owned window is kept on top
+     * of its owner at all times and gets no taskbar button of its own,
+     * so making the session window its owner left this window covering
+     * the session and missing from the taskbar.
+     */
     hwnd = CreateWindowExW(0, SG_CLASSNAME, title,
                            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                            CW_USEDEFAULT, CW_USEDEFAULT, 1200, 640,
-                           parent, NULL, inst, be);
+                           NULL, NULL, inst, be);
     sfree(title);
 
     if (!hwnd) {
@@ -4612,14 +4659,17 @@ static void sg_open(HWND parent, Backend *be, bool scp)
     sg_instance = (SftpGui *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     ShowWindow(hwnd, SW_SHOWNORMAL);
     UpdateWindow(hwnd);
+    /* Now that it is an ordinary top-level window, bring it to the
+     * front so it is not hidden behind the session it belongs to. */
+    SetForegroundWindow(hwnd);
 }
 
-void sftp_gui_open(HWND parent, Backend *be)
+void sftp_gui_open(HWND parent, Backend *be, const wchar_t *tab_label)
 {
-    sg_open(parent, be, false);
+    sg_open(parent, be, false, tab_label);
 }
 
-void scp_gui_open(HWND parent, Backend *be)
+void scp_gui_open(HWND parent, Backend *be, const wchar_t *tab_label)
 {
-    sg_open(parent, be, true);
+    sg_open(parent, be, true, tab_label);
 }
