@@ -4288,10 +4288,25 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             sg_layout(g);
         /*
          * Moving the panes uncovers strips of window that the pane that
-         * used to be there had painted. The children are clipped out, so
-         * this repaints just the gaps and never the panes themselves.
+         * used to be there had painted, so everything is redrawn: the
+         * window's own background around the gaps, and the panes
+         * themselves, which cannot be trusted to notice that their
+         * contents have to be laid out again for the new width. The
+         * panes are double-buffered, so this does not flicker.
          */
-        InvalidateRect(hwnd, NULL, TRUE);
+        RedrawWindow(hwnd, NULL, NULL,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+        return 0;
+
+      case WM_EXITSIZEMOVE:
+        /*
+         * The drag has finished: do the final repaint now rather than
+         * leaving it to the next WM_PAINT, so the window is never left
+         * showing a mix of the old and the new layout.
+         */
+        RedrawWindow(hwnd, NULL, NULL,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN |
+                     RDW_UPDATENOW);
         return 0;
 
       case WM_TIMER:
