@@ -31,6 +31,7 @@
 #include "ssh/channel.h"
 #include "ssh/sftp.h"
 #include "sftpgui.h"
+#include "putty-rc.h"          /* IDI_MAINICON: the PuTTY window icon */
 
 #include <commctrl.h>
 #include <shellapi.h>          /* SHGetFileInfoW: the system file icons */
@@ -4627,7 +4628,7 @@ static void sg_open(HWND parent, Backend *be, bool scp,
         wc.hInstance = inst;
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
         wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-        wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+        wc.hIcon = LoadIcon(inst, MAKEINTRESOURCE(IDI_MAINICON));
         wc.lpszClassName = SG_CLASSNAME;
         if (!RegisterClassW(&wc))
             return;
@@ -4657,6 +4658,16 @@ static void sg_open(HWND parent, Backend *be, bool scp,
         return;
     }
     sg_instance = (SftpGui *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    /*
+     * The title bar and the taskbar show the small icon; the .ico file
+     * carries one, so ask for it at the size Windows wants rather than
+     * letting the big icon be scaled down.
+     */
+    SendMessageW(hwnd, WM_SETICON, ICON_SMALL,
+                 (LPARAM)LoadImageW(inst, MAKEINTRESOURCEW(IDI_MAINICON),
+                                    IMAGE_ICON,
+                                    GetSystemMetrics(SM_CXSMICON),
+                                    GetSystemMetrics(SM_CYSMICON), 0));
     ShowWindow(hwnd, SW_SHOWNORMAL);
     UpdateWindow(hwnd);
     /* Now that it is an ordinary top-level window, bring it to the
