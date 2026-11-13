@@ -11,25 +11,26 @@
 #define PUTTY_WIN_SFTPGUI_H
 
 /*
- * Open the two-pane transfer window for the SSH connection that 'be'
- * belongs to, using the SFTP subsystem (open_sftp) or plain SCP
- * (open_scp). No new login is needed either way. 'parent' is the
- * window that reports errors; 'tab_label' is the session tab's caption
- * (as drawn by the tab strip), which is put in the window's title so
- * the two windows can be told apart in the taskbar. It may be NULL.
+ * Open the transfer window for the SSH connection that 'be' belongs to,
+ * using the SFTP subsystem (open_sftp) or plain SCP (open_scp). No new
+ * login is needed either way. 'parent' is the window that reports
+ * errors; 'tab_label' is the session tab's caption, which becomes the
+ * caption of the tab this session gets in the transfer window.
  *
- * There is one window per session: asking again for a session brings its
- * window to the front, and a different session gets a window of its own.
- * Each window keeps its own SFTP request table (see sftp_client_new), so
- * transfers in different windows do not disturb each other.
+ * There is one transfer window, and it has a tab per session, each tab
+ * holding that session's own two-pane view. Asking again for a session
+ * brings its tab to the front. Each tab keeps its own SFTP request table
+ * (see sftp_client_new), so transfers in different tabs do not disturb
+ * each other.
  */
 void sftp_gui_open(HWND parent, Backend *be, const wchar_t *tab_label);
 void scp_gui_open(HWND parent, Backend *be, const wchar_t *tab_label);
 
 /*
  * Called when a session's tab label changes - reordering the tabs
- * renumbers them, and the number is part of the label. If the transfer
- * window belongs to 'be', it takes the new label as its caption.
+ * renumbers them, and the number is part of the label. If that session
+ * has a tab in the transfer window, it takes the new label. The tab
+ * itself stays where the user put it.
  */
 void sftpgui_tab_label_changed(Backend *be, const wchar_t *tab_label);
 

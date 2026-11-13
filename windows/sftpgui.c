@@ -13,10 +13,12 @@
  * receive anywhere, so the window stays responsive and the terminal
  * keeps working while a transfer runs.
  *
- * Each window owns one SFTP conversation, with a request table of its
- * own (see sftp_client_new in ssh/sftp.c), so a window can be opened for
- * every session in the program without them interfering. Every entry
- * point selects its window's conversation before touching ssh/sftp.c.
+ * One window holds a tab per session, each tab being a page: a whole
+ * two-pane view in a child window. Each page owns one SFTP conversation,
+ * with a request table of its own (see sftp_client_new in ssh/sftp.c), so
+ * every session in the program can browse and transfer at the same time
+ * without the pages interfering. Every entry point selects its page's
+ * conversation before touching ssh/sftp.c.
  */
 
 #include <stdio.h>
@@ -63,7 +65,14 @@
 #define SG_ID_CTX_DELETE 1141
 #define SG_ID_CTX_RENAME 1142
 
-#define SG_CLASSNAME L"PuTTYSftpWindow"
+#define SG_CLASSNAME L"PuTTYSftpWindow"     /* one session's page */
+#define SG_FRAME_CLASS L"PuTTYSftpFrame"    /* the tabbed window */
+
+/* Geometry of the tab strip, in pixels at 96dpi. */
+#define SG_TABSTRIP_H   26
+#define SG_TAB_PAD      10      /* text padding inside a tab */
+#define SG_TAB_CLOSE_W  16      /* the "x" at the right-hand end */
+#define SG_TAB_GAP      3
 
 /* Timer that keeps the transfer readout ticking while a batch runs. */
 #define SG_TIMER_PROGRESS 1
@@ -326,6 +335,8 @@ struct SftpGui {
     uint64_t cur_size;
     bool any_error;
     bool fatal_shown;           /* don't let a later error overwrite one */
+    bool dead;                  /* the session behind this page has gone;
+                                 * its tab is struck through */
 
     /*
      * Short read in the middle of a download: if the server ever
@@ -336,13 +347,16 @@ struct SftpGui {
     bool dl_end_known;
     uint64_t dl_end;
 
-    /* This window's own SFTP request table (see ssh/sftp.h). */
+    /* This page's own SFTP request table (see ssh/sftp.h). */
     struct sftp_client *sftpc;
 
-    SftpGui *next;              /* the list of open windows */
+    struct SgFrame *frame;      /* the tabbed window this page lives in */
+    wchar_t *tab_label;         /* caption of this page's tab */
+
+    SftpGui *next;              /* the open pages, in tab order */
 };
 
-static SftpGui *sg_windows;     /* every open transfer window */
+static SftpGui *sg_windows;     /* every open page, in tab order */
 static const char *sg_startup_error;
 static bool sg_pending_scp;     /* mode for the window being created */
 
@@ -361,6 +375,31 @@ static SftpGui *sg_by_backend(Backend *be)
             return g;
     return NULL;
 }
+
+/*
+ * The one tabbed window all the pages live in. Each page is a whole
+ * two-pane transfer view in a child window; only the active one is
+ * visible.
+ */
+typedef struct SgFrame SgFrame;
+struct SgFrame {
+    HWND hwnd;
+    int strip_h;
+    SftpGui *active;
+    bool destroying;
+
+    /* Dragging a tab sideways to reorder it. */
+    bool dragging, drag_moved;
+    SftpGui *drag_page;
+    POINT drag_start;
+};
+
+static SgFrame *sg_frame;
+
+static HWND sg_frame_get(void);
+static void sg_frame_activate(SftpGui *g);
+static void sg_frame_forget(SftpGui *g);
+static void sg_frame_update_title(SgFrame *f);
 
 /* ----------------------------------------------------------------------
  * Forward declarations for the mutually recursive parts.
@@ -3358,6 +3397,7 @@ static void sg_fatal(SftpGui *g, const char *msg)
     if (g->fatal_shown)
         return;                         /* keep the first, more useful one */
     g->fatal_shown = true;
+    g->dead = true;
     g->subsys_ok = false;
     g->chan_open = false;
     g->pend = SG_P_NONE;
@@ -3377,6 +3417,9 @@ static void sg_fatal(SftpGui *g, const char *msg)
     EnableWindow(g->rmt.up, FALSE);
     EnableWindow(g->lcl.up, FALSE);
     sg_status(g, msg);
+    /* The tab goes struck through, the way a closed session's tab does. */
+    if (g->frame)
+        InvalidateRect(g->frame->hwnd, NULL, FALSE);
 }
 
 static void sg_list_activate(SftpGui *g, bool is_local)
@@ -4249,6 +4292,7 @@ static void sg_free(SftpGui *g, bool channel_still_ours)
     sfree(g->target_path);
     sfree(g->pick);
     sfree(g->ren_name);
+    sfree(g->tab_label);
     sfree(g->inbuf);
     sfree(g->exec_out);
     sfree(g->exec_err);
@@ -4265,7 +4309,9 @@ static SftpGui *sg_create(HWND hwnd, Backend *be, bool scp)
     g->hwnd = hwnd;
     g->scp = scp;
     g->be = be;
+    g->frame = sg_frame;
     g->sftpc = sftp_client_new();
+    g->tab_label = sg_dupw(L"");
     g->lfh = INVALID_HANDLE_VALUE;
     g->pend = SG_P_NONE;
     g->rmt.cwd = dupstr("/");
@@ -4309,8 +4355,14 @@ static SftpGui *sg_create(HWND hwnd, Backend *be, bool scp)
     if (!scp)
         g->sc = c->sc;
 
-    g->next = sg_windows;
-    sg_windows = g;
+    /* New pages join the end of the tab strip. */
+    {
+        SftpGui **tail = &sg_windows;
+
+        while (*tail)
+            tail = &(*tail)->next;
+        *tail = g;
+    }
     sg_layout(g);
     sg_status(g, i18n_or("Connecting..."));
     return g;
@@ -4373,14 +4425,6 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                 sg_progress_refresh(g);
         }
         return 0;
-
-      case WM_GETMINMAXINFO: {
-        MINMAXINFO *mmi = (MINMAXINFO *)lParam;
-        /* Wide enough for both panes' four columns plus the buttons. */
-        mmi->ptMinTrackSize.x = 1024;
-        mmi->ptMinTrackSize.y = 420;
-        return 0;
-      }
 
       case WM_SG_NOTIFY:
         if (!g)
@@ -4614,7 +4658,8 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       case WM_DESTROY:
         if (g) {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            /* sg_free takes the window out of the open-window list. */
+            /* Take the tab away first, then free the page. */
+            sg_frame_forget(g);
             sg_free(g, true);
         }
         return 0;
@@ -4623,43 +4668,501 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-/*
- * The window's caption: the session tab's label first, the way the
- * session's own window is captioned, so that the two can be told apart
- * in the taskbar. Caller frees.
+/* ----------------------------------------------------------------------
+ * The tabbed window.
+ *
+ * One top-level window holds a page per session, each page being a whole
+ * two-pane transfer view in a child window of its own (SgWndProc). The
+ * tab strip along the top is drawn here: there are never more than a few
+ * tabs, and drawing them directly keeps the window's behaviour - the
+ * title following the active tab, labels that follow the session tabs,
+ * dragging to reorder - under our control.
  */
-static wchar_t *sg_title(bool scp, const wchar_t *tab_label)
-{
-    wchar_t *base = sg_w(i18n_or(scp ? "SCP File Transfer"
-                                    : "SFTP File Transfer"));
-    size_t n = wcslen(base) + (tab_label ? wcslen(tab_label) : 0) + 8;
-    wchar_t *title = snewn(n, wchar_t);
 
-    if (tab_label && *tab_label)
-        _snwprintf(title, n, L"%s - %s", tab_label, base);
-    else
-        _snwprintf(title, n, L"%s", base);
-    title[n-1] = L'\0';
-    sfree(base);
-    return title;
+static int sg_page_count(void)
+{
+    int n = 0;
+
+    for (SftpGui *g = sg_windows; g; g = g->next)
+        n++;
+    return n;
 }
 
+static int sg_page_index(SftpGui *page)
+{
+    int i = 0;
+
+    for (SftpGui *g = sg_windows; g; g = g->next, i++)
+        if (g == page)
+            return i;
+    return -1;
+}
+
+/*
+ * Where each tab goes. Fills in the rectangles and the pages behind
+ * them, up to 'max' of each, and returns the number of tabs that fit.
+ */
+static int sg_tabs(SgFrame *f, RECT *rects, SftpGui **pages, int max)
+{
+    HDC hdc = GetDC(f->hwnd);
+    HGDIOBJ oldfont = SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
+    int x = 4, n = 0;
+    int top = 4, hgt = f->strip_h - 8;
+
+    for (SftpGui *g = sg_windows; g && n < max; g = g->next) {
+        const wchar_t *label = g->tab_label ? g->tab_label : L"";
+        SIZE sz;
+
+        GetTextExtentPoint32W(hdc, label, (int)wcslen(label), &sz);
+        rects[n].left = x;
+        rects[n].top = top;
+        rects[n].right = x + sz.cx + 2 * SG_TAB_PAD + SG_TAB_CLOSE_W;
+        rects[n].bottom = top + hgt;
+        pages[n] = g;
+        n++;
+        x = rects[n-1].right + SG_TAB_GAP;
+    }
+
+    SelectObject(hdc, oldfont);
+    ReleaseDC(f->hwnd, hdc);
+    return n;
+}
+
+/* The tab under a client-area point; *on_close says the "x" was hit. */
+static SftpGui *sg_tab_at(SgFrame *f, POINT p, bool *on_close)
+{
+    RECT rects[64];
+    SftpGui *pages[64];
+    int n = sg_tabs(f, rects, pages, lenof(rects));
+
+    if (on_close)
+        *on_close = false;
+    for (int i = 0; i < n; i++) {
+        if (PtInRect(&rects[i], p)) {
+            if (on_close)
+                *on_close = (p.x >= rects[i].right - SG_TAB_CLOSE_W);
+            return pages[i];
+        }
+    }
+    return NULL;
+}
+
+static void sg_frame_update_title(SgFrame *f)
+{
+    if (!f->active) {
+        wchar_t *base = sg_w(i18n_or("SFTP File Transfer"));
+
+        SetWindowTextW(f->hwnd, base);
+        sfree(base);
+        return;
+    }
+
+    /*
+     * "<tab label> - SFTP", with the protocol of the page that is in
+     * front, so the caption says both which session and which mode.
+     */
+    {
+        const wchar_t *label = f->active->tab_label ? f->active->tab_label
+                                                    : L"";
+        wchar_t *mode = sg_w(i18n_or(f->active->scp ? "SCP" : "SFTP"));
+        size_t n = wcslen(label) + wcslen(mode) + 8;
+        wchar_t *title = snewn(n, wchar_t);
+
+        if (*label)
+            _snwprintf(title, n, L"%s - %s", label, mode);
+        else
+            _snwprintf(title, n, L"%s", mode);
+        title[n-1] = L'\0';
+        SetWindowTextW(f->hwnd, title);
+        sfree(title);
+        sfree(mode);
+    }
+}
+
+/*
+ * Draw a line through the part of a tab's label that its characters
+ * actually occupy, to mark a page whose session has gone. Measured with
+ * the same flags as the real DrawTextW call, so the line covers exactly
+ * the visible text even where it has been shortened with an ellipsis.
+ */
+static void sg_strike_through(HDC hdc, const wchar_t *label,
+                              const RECT *text)
+{
+    RECT calc = *text;
+    HPEN pen, oldpen;
+    int y;
+
+    DrawTextW(hdc, label, -1, &calc,
+              DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_CALCRECT);
+    if (calc.right > text->right)
+        calc.right = text->right;
+    if (calc.right <= text->left)
+        return;                        /* nothing visible to strike out */
+
+    y = (text->top + text->bottom) / 2;
+    pen = CreatePen(PS_SOLID, 1, GetTextColor(hdc));
+    oldpen = SelectObject(hdc, pen);
+    MoveToEx(hdc, text->left, y, NULL);
+    LineTo(hdc, calc.right, y);
+    SelectObject(hdc, oldpen);
+    DeleteObject(pen);
+}
+
+static void sg_frame_layout(SgFrame *f)
+{
+    RECT cr;
+
+    if (!f->hwnd || !f->active)
+        return;
+    GetClientRect(f->hwnd, &cr);
+    MoveWindow(f->active->hwnd, 0, f->strip_h, cr.right,
+               cr.bottom - f->strip_h, TRUE);
+}
+
+static void sg_frame_activate(SftpGui *g)
+{
+    SgFrame *f = g->frame;
+
+    if (!f || f->destroying)
+        return;
+    f->active = g;
+    for (SftpGui *p = sg_windows; p; p = p->next)
+        ShowWindow(p->hwnd, p == g ? SW_SHOW : SW_HIDE);
+    sg_frame_layout(f);
+    sg_frame_update_title(f);
+    InvalidateRect(f->hwnd, NULL, FALSE);
+    SetFocus(g->hwnd);
+}
+
+/* Move a page to another position in the tab order. */
+static void sg_frame_move(SftpGui *page, int to)
+{
+    int from = sg_page_index(page);
+    SftpGui *prev = NULL, *cur;
+
+    if (from < 0 || to < 0 || to >= sg_page_count() || from == to)
+        return;
+
+    for (cur = sg_windows; cur && cur != page; cur = cur->next)
+        prev = cur;
+    if (!cur)
+        return;
+    if (prev)
+        prev->next = page->next;
+    else
+        sg_windows = page->next;
+
+    if (to == 0) {
+        page->next = sg_windows;
+        sg_windows = page;
+    } else {
+        SftpGui *p = sg_windows;
+
+        for (int i = 0; i < to - 1 && p->next; i++)
+            p = p->next;
+        page->next = p->next;
+        p->next = page;
+    }
+}
+
+/*
+ * A page is about to go away: take its tab out of the strip and hand
+ * the window over to the tab next to it, or close it if that was the
+ * last one.
+ */
+static void sg_frame_forget(SftpGui *g)
+{
+    SgFrame *f = g->frame;
+    SftpGui *next = NULL;
+
+    if (f && !f->destroying && f->active == g) {
+        next = g->next;
+        if (!next)
+            for (SftpGui *p = sg_windows; p && p != g; p = p->next)
+                next = p;              /* the tab just before it */
+    }
+
+    for (SftpGui **pw = &sg_windows; *pw; pw = &(*pw)->next) {
+        if (*pw == g) {
+            *pw = g->next;
+            break;
+        }
+    }
+    g->next = NULL;
+
+    if (!f || f->destroying)
+        return;
+
+    if (f->active == g) {
+        f->active = NULL;
+        if (next)
+            sg_frame_activate(next);
+        else
+            PostMessage(f->hwnd, WM_CLOSE, 0, 0);   /* that was the last */
+        return;
+    }
+
+    /* Another tab was closed: the strip simply gets shorter. */
+    InvalidateRect(f->hwnd, NULL, FALSE);
+}
+
+static void sg_frame_paint(SgFrame *f)
+{
+    PAINTSTRUCT ps;
+    HDC hdc = BeginPaint(f->hwnd, &ps);
+    RECT cr, strip;
+    RECT *rects;
+    SftpGui **pages;
+    int n, max = sg_page_count() + 1;
+    HGDIOBJ oldfont;
+
+    GetClientRect(f->hwnd, &cr);
+    strip = cr;
+    strip.bottom = f->strip_h;
+    FillRect(hdc, &strip, GetSysColorBrush(COLOR_BTNFACE));
+
+    rects = snewn(max, RECT);
+    pages = snewn(max, SftpGui *);
+    n = sg_tabs(f, rects, pages, max);
+
+    oldfont = SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(hdc, TRANSPARENT);
+
+    for (int i = 0; i < n; i++) {
+        bool act = (pages[i] == f->active);
+        RECT tr = rects[i], text, close;
+
+        FillRect(hdc, &tr, GetSysColorBrush(
+                     act ? COLOR_HIGHLIGHT : COLOR_BTNFACE));
+        if (!act)
+            FrameRect(hdc, &tr, GetSysColorBrush(COLOR_BTNSHADOW));
+        SetTextColor(hdc, GetSysColor(
+                         act ? COLOR_HIGHLIGHTTEXT :
+                         pages[i]->dead ? COLOR_GRAYTEXT : COLOR_BTNTEXT));
+
+        close = tr;
+        close.left = close.right - SG_TAB_CLOSE_W;
+        DrawTextW(hdc, L"x", -1, &close,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        text = tr;
+        text.left += SG_TAB_PAD;
+        text.right -= SG_TAB_CLOSE_W;
+        DrawTextW(hdc, pages[i]->tab_label ? pages[i]->tab_label : L"", -1,
+                  &text, DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+                  DT_END_ELLIPSIS);
+
+        /* A session that has gone leaves its tab struck through. */
+        if (pages[i]->dead)
+            sg_strike_through(hdc, pages[i]->tab_label
+                              ? pages[i]->tab_label : L"", &text);
+    }
+
+    SelectObject(hdc, oldfont);
+    sfree(rects);
+    sfree(pages);
+    EndPaint(f->hwnd, &ps);
+}
+
+static LRESULT CALLBACK SgFrameProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                    LPARAM lParam)
+{
+    SgFrame *f = (SgFrame *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+
+    switch (msg) {
+      case WM_NCCREATE: {
+        CREATESTRUCTW *cs = (CREATESTRUCTW *)lParam;
+        SgFrame *nf = (SgFrame *)cs->lpCreateParams;
+
+        nf->hwnd = hwnd;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)nf);
+        return TRUE;
+      }
+
+      case WM_SIZE:
+        if (f) {
+            sg_frame_layout(f);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+
+      case WM_GETMINMAXINFO: {
+        MINMAXINFO *mmi = (MINMAXINFO *)lParam;
+
+        /* Wide enough for both panes' four columns plus the buttons. */
+        mmi->ptMinTrackSize.x = 1024;
+        mmi->ptMinTrackSize.y = 420;
+        return 0;
+      }
+
+      case WM_PAINT:
+        if (f)
+            sg_frame_paint(f);
+        return 0;
+
+      case WM_LBUTTONDOWN:
+        if (f) {
+            POINT p;
+            bool on_close = false;
+            SftpGui *tab;
+
+            p.x = (int)(short)LOWORD(lParam);
+            p.y = (int)(short)HIWORD(lParam);
+            tab = sg_tab_at(f, p, &on_close);
+            if (!tab)
+                return 0;
+            if (on_close) {
+                /* From a posted message, so the strip is not redrawn
+                 * from inside the page's own destruction. */
+                PostMessage(tab->hwnd, WM_CLOSE, 0, 0);
+                return 0;
+            }
+            sg_frame_activate(tab);
+            f->dragging = true;
+            f->drag_moved = false;
+            f->drag_page = tab;
+            f->drag_start = p;
+            SetCapture(hwnd);
+        }
+        return 0;
+
+      case WM_MOUSEMOVE:
+        if (f && f->dragging && f->drag_page) {
+            POINT p;
+            int dx, dy;
+
+            p.x = (int)(short)LOWORD(lParam);
+            p.y = (int)(short)HIWORD(lParam);
+            if (!f->drag_moved) {
+                dx = p.x - f->drag_start.x;
+                dy = p.y - f->drag_start.y;
+                if (dx * dx + dy * dy <
+                    GetSystemMetrics(SM_CXDRAG) * GetSystemMetrics(SM_CXDRAG))
+                    return 0;
+                f->drag_moved = true;
+            }
+            {
+                SftpGui *over = sg_tab_at(f, p, NULL);
+
+                if (over && over != f->drag_page) {
+                    sg_frame_move(f->drag_page, sg_page_index(over));
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
+            }
+        }
+        return 0;
+
+      case WM_LBUTTONUP:
+        if (f && f->dragging) {
+            f->dragging = false;
+            f->drag_page = NULL;
+            ReleaseCapture();
+        }
+        return 0;
+
+      case WM_CAPTURECHANGED:
+        if (f) {
+            f->dragging = false;
+            f->drag_page = NULL;
+        }
+        return 0;
+
+      case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+
+      case WM_DESTROY:
+        if (f) {
+            f->destroying = true;
+            if (sg_frame == f)
+                sg_frame = NULL;
+            /* The pages are children, so they follow it down; the
+             * structure itself is freed once they have all gone. */
+        }
+        return 0;
+
+      case WM_NCDESTROY:
+        if (f) {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            sfree(f);
+        }
+        break;
+    }
+
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+/* The tabbed window, created on demand. */
+static HWND sg_frame_get(void)
+{
+    static bool registered;
+    HINSTANCE inst = GetModuleHandleW(NULL);
+    SgFrame *f;
+    HWND hwnd;
+
+    if (sg_frame && sg_frame->hwnd)
+        return sg_frame->hwnd;
+
+    if (!registered) {
+        WNDCLASSW wc;
+
+        memset(&wc, 0, sizeof(wc));
+        wc.lpfnWndProc = SgFrameProc;
+        wc.hInstance = inst;
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hIcon = LoadIcon(inst, MAKEINTRESOURCE(IDI_MAINICON));
+        wc.lpszClassName = SG_FRAME_CLASS;
+        if (!RegisterClassW(&wc))
+            return NULL;
+        registered = true;
+    }
+
+    f = snew(SgFrame);
+    memset(f, 0, sizeof(*f));
+    f->strip_h = SG_TABSTRIP_H;
+
+    /*
+     * Deliberately unowned: an owned window is kept above its owner at
+     * all times and gets no taskbar button of its own.
+     */
+    hwnd = CreateWindowExW(0, SG_FRAME_CLASS, L"",
+                           WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 1200, 660,
+                           NULL, NULL, inst, f);
+    if (!hwnd) {
+        sfree(f);
+        return NULL;
+    }
+    sg_frame = f;
+
+    /* The title bar and the taskbar show the small icon; the .ico file
+     * carries one, so ask for it at the size Windows wants. */
+    SendMessageW(hwnd, WM_SETICON, ICON_SMALL,
+                 (LPARAM)LoadImageW(inst, MAKEINTRESOURCEW(IDI_MAINICON),
+                                    IMAGE_ICON,
+                                    GetSystemMetrics(SM_CXSMICON),
+                                    GetSystemMetrics(SM_CYSMICON), 0));
+    return hwnd;
+}
+
+/* The session tab labels, kept in step with the session window's. */
 void sftpgui_tab_label_changed(Backend *be, const wchar_t *tab_label)
 {
-    /*
-     * Every open window is told about every tab, since only a window
-     * knows which session's tab it belongs to. The label carries the
-     * tab's number, so reordering the tabs changes it even when the
-     * session itself did not.
-     */
-    for (SftpGui *g = sg_windows; g; g = g->next) {
-        wchar_t *title;
+    const wchar_t *label = tab_label ? tab_label : L"";
 
+    for (SftpGui *g = sg_windows; g; g = g->next) {
         if (!be || g->be != be)
             continue;
-        title = sg_title(g->scp, tab_label);
-        SetWindowTextW(g->hwnd, title);
-        sfree(title);
+        if (g->tab_label && !wcscmp(g->tab_label, label))
+            continue;
+        sfree(g->tab_label);
+        g->tab_label = sg_dupw(label);
+        if (g->frame) {
+            if (g->frame->active == g)
+                sg_frame_update_title(g->frame);
+            InvalidateRect(g->frame->hwnd, NULL, FALSE);
+        }
     }
 }
 
@@ -4668,22 +5171,19 @@ static void sg_open(HWND parent, Backend *be, bool scp,
 {
     static bool registered;
     HINSTANCE inst = GetModuleHandleW(NULL);
-    HWND hwnd;
-    wchar_t *title;
+    SftpGui *open, *g;
+    HWND frame, page;
 
     /*
-     * One window per session: asking again for the same session brings
-     * its window forward instead of opening a second one on the same
-     * connection. Other sessions get windows of their own.
+     * One page per session: asking again brings that session's tab to
+     * the front instead of showing the same connection twice.
      */
-    {
-        SftpGui *open = sg_by_backend(be);
-
-        if (open) {
-            ShowWindow(open->hwnd, SW_SHOWNORMAL);
-            SetForegroundWindow(open->hwnd);
-            return;
-        }
+    open = sg_by_backend(be);
+    if (open && open->frame) {
+        sg_frame_activate(open);
+        ShowWindow(open->frame->hwnd, SW_SHOWNORMAL);
+        SetForegroundWindow(open->frame->hwnd);
+        return;
     }
 
     if (!registered) {
@@ -4694,50 +5194,39 @@ static void sg_open(HWND parent, Backend *be, bool scp,
         wc.hInstance = inst;
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
         wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-        wc.hIcon = LoadIcon(inst, MAKEINTRESOURCE(IDI_MAINICON));
         wc.lpszClassName = SG_CLASSNAME;
         if (!RegisterClassW(&wc))
             return;
         registered = true;
     }
 
+    frame = sg_frame_get();
+    if (!frame) {
+        sg_msgbox(parent, "无法创建文件传输窗口", MB_ICONERROR | MB_OK);
+        return;
+    }
+
     sg_startup_error = NULL;
     sg_pending_scp = scp;
 
-    title = sg_title(scp, tab_label);
-    /*
-     * The window is deliberately unowned. An owned window is kept on top
-     * of its owner at all times and gets no taskbar button of its own,
-     * so making the session window its owner left this window covering
-     * the session and missing from the taskbar.
-     */
-    hwnd = CreateWindowExW(0, SG_CLASSNAME, title,
-                           WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 1200, 640,
-                           NULL, NULL, inst, be);
-    sfree(title);
-
-    if (!hwnd) {
+    page = CreateWindowExW(0, SG_CLASSNAME, L"", WS_CHILD | WS_CLIPCHILDREN,
+                           0, 0, 10, 10, frame, NULL, inst, be);
+    if (!page) {
         sg_msgbox(parent,
                   sg_startup_error ? sg_startup_error :
                   "无法创建文件传输窗口", MB_ICONERROR | MB_OK);
         return;
     }
-    /*
-     * The title bar and the taskbar show the small icon; the .ico file
-     * carries one, so ask for it at the size Windows wants rather than
-     * letting the big icon be scaled down.
-     */
-    SendMessageW(hwnd, WM_SETICON, ICON_SMALL,
-                 (LPARAM)LoadImageW(inst, MAKEINTRESOURCEW(IDI_MAINICON),
-                                    IMAGE_ICON,
-                                    GetSystemMetrics(SM_CXSMICON),
-                                    GetSystemMetrics(SM_CYSMICON), 0));
-    ShowWindow(hwnd, SW_SHOWNORMAL);
-    UpdateWindow(hwnd);
-    /* Now that it is an ordinary top-level window, bring it to the
-     * front so it is not hidden behind the session it belongs to. */
-    SetForegroundWindow(hwnd);
+
+    g = (SftpGui *)GetWindowLongPtrW(page, GWLP_USERDATA);
+    if (!g)
+        return;
+
+    sfree(g->tab_label);
+    g->tab_label = sg_dupw(tab_label && *tab_label ? tab_label : L"");
+    sg_frame_activate(g);
+    ShowWindow(frame, SW_SHOWNORMAL);
+    SetForegroundWindow(frame);
 }
 
 void sftp_gui_open(HWND parent, Backend *be, const wchar_t *tab_label)

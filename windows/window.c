@@ -1389,6 +1389,11 @@ static void frame_set_title(WinGuiSeat *wgs)
             caption[n-1] = L'\0';
             sw_SetWindowText(tab_frame_hwnd, caption);
             sfree(caption);
+
+            /* The transfer window captions its tab for this session the
+             * same way, and the label can change without the tab being
+             * moved (a session that names its own tab, say). */
+            sftpgui_tab_label_changed(wgs->backend, label);
         } else {
             sw_SetWindowText(tab_frame_hwnd, wgs->window_name);
         }
