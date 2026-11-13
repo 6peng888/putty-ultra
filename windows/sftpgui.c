@@ -3604,8 +3604,13 @@ static SftpGui *sg_create(HWND hwnd, Backend *be, bool scp)
 
     sg_create_controls(g);
 
+    /* Start in the user's home directory, not in whatever working
+     * directory the process happened to inherit. */
     wcwd[0] = L'\0';
-    if (GetCurrentDirectoryW(lenof(wcwd), wcwd))
+    if (SHGetFolderPathW(NULL, CSIDL_PROFILE, NULL, 0, wcwd) != S_OK ||
+        !wcwd[0])
+        GetCurrentDirectoryW(lenof(wcwd), wcwd);
+    if (wcwd[0])
         g->lcl.cwd = sg_to_utf8(wcwd);
     if (!g->lcl.cwd)
         g->lcl.cwd = dupstr("C:\\");
