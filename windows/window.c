@@ -1363,8 +1363,36 @@ static void frame_set_title(WinGuiSeat *wgs)
 {
     if (!tab_frame_hwnd)
         return;
-    if (tab_active >= 0 && tab_list[tab_active] == wgs)
-        sw_SetWindowText(tab_frame_hwnd, wgs->window_name);
+    if (tab_active >= 0 && tab_list[tab_active] == wgs) {
+        int idx = tab_find(wgs);
+
+        if (idx >= 0) {
+            /*
+             * Caption the frame the way the tab strip captions this
+             * session, followed by the title the session itself set, so
+             * that the taskbar says which tab is in front. The tab's
+             * number is part of its label, and changes when tabs are
+             * reordered (see tab_move).
+             */
+            wchar_t label[1024];
+            const wchar_t *name = wgs->window_name ? wgs->window_name : L"";
+            size_t n;
+            wchar_t *caption;
+
+            tab_label(idx, label, lenof(label));
+            n = wcslen(label) + wcslen(name) + 4;
+            caption = snewn(n, wchar_t);
+            if (*name)
+                _snwprintf(caption, n, L"%s - %s", label, name);
+            else
+                _snwprintf(caption, n, L"%s", label);
+            caption[n-1] = L'\0';
+            sw_SetWindowText(tab_frame_hwnd, caption);
+            sfree(caption);
+        } else {
+            sw_SetWindowText(tab_frame_hwnd, wgs->window_name);
+        }
+    }
     InvalidateRect(tab_frame_hwnd, NULL, true);
 
     /*
@@ -1435,6 +1463,10 @@ static void tab_move(int from, int to)
         tab_label(i, label, lenof(label));
         sftpgui_tab_label_changed(tab_list[i]->backend, label);
     }
+
+    /* The active tab's number is in the frame's caption too. */
+    if (tab_active >= 0 && tab_active < tab_count)
+        frame_set_title(tab_list[tab_active]);
 }
 
 static void tab_relayout(void)
