@@ -58,6 +58,7 @@
 #define IDM_XFER_SFTP 0x01E0
 #define IDM_XFER_SCP  0x01F0     /* placeholder, not implemented yet */
 #define IDM_SPECIALSEP 0x0200
+#define IDM_SELALL    0x0210
 
 #define IDM_SPECIAL_MIN 0x0400
 #define IDM_SPECIAL_MAX 0x0800
@@ -891,6 +892,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
         for (j = 0; j < lenof(wgs->popup_menus); j++) {
             m = wgs->popup_menus[j].menu;
             menu_add(m, MF_ENABLED, IDM_COPY, "&Copy");
+            menu_add(m, MF_ENABLED, IDM_SELALL, "Select All Text");
             menu_add(m, MF_ENABLED, IDM_PASTE, "&Paste");
         }
 
@@ -2813,6 +2815,7 @@ static void frame_build_menu(void)
     frame_xfer_menu_pos = (int)GetMenuItemCount(sm) - 1;
     AppendMenu(sm, MF_SEPARATOR, 0, 0);
     menu_add(sm, MF_ENABLED, IDM_COPY, "&Copy");
+    menu_add(sm, MF_ENABLED, IDM_SELALL, "Select All Text");
     menu_add(sm, MF_ENABLED, IDM_PASTE, "&Paste");
     AppendMenu(sm, MF_SEPARATOR, 0, 0);
     menu_add(sm, MF_ENABLED, IDM_RECONF, "Chan&ge Settings...");
@@ -3021,6 +3024,7 @@ static void new_session_finish(WinGuiSeat *wgs)
         for (j = 0; j < lenof(wgs->popup_menus); j++) {
             m = wgs->popup_menus[j].menu;
             menu_add(m, MF_ENABLED, IDM_COPY, "&Copy");
+            menu_add(m, MF_ENABLED, IDM_SELALL, "Select All Text");
             menu_add(m, MF_ENABLED, IDM_PASTE, "&Paste");
         }
 
@@ -4865,6 +4869,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
           }
           case IDM_COPYALL:
             term_copyall(wgs->term, clips_system, lenof(clips_system));
+            break;
+          case IDM_SELALL:
+            term_selectall(wgs->term);
             break;
           case IDM_COPY:
             term_request_copy(wgs->term, clips_system, lenof(clips_system));

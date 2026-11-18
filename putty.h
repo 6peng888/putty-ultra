@@ -2060,6 +2060,7 @@ void term_blink(Terminal *, bool set_cursor);
 void term_do_paste(Terminal *, const wchar_t *, size_t);
 void term_nopaste(Terminal *);
 void term_copyall(Terminal *, const int *, int);
+void term_selectall(Terminal *);
 void term_pre_reconfig(Terminal *, Conf *);
 void term_reconfig(Terminal *, Conf *);
 void term_request_copy(Terminal *, const int *clipboards, int n_clipboards);

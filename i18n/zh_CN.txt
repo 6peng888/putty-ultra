@@ -31,6 +31,7 @@ Rese&t Terminal=重置终端(&T)
 &About PuTTY=关于 PuTTY(&A)
 &About PuTTYtel=关于 PuTTYtel(&A)
 C&opy All to Clipboard=全部复制到剪贴板(&O)
+Select All Text=选择全部文本
 &Restart Session=重新启动会话(&R)
 &File Transfer=文件传输(&F)
 &SFTP Transfer...=SFTP 传输(&S)...

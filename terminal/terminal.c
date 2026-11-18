@@ -6831,6 +6831,44 @@ void term_copyall(Terminal *term, const int *clipboards, int n_clipboards)
     clipme(term, top, bottom, false, true, clipboards, n_clipboards);
 }
 
+/*
+ * Select the entire contents of the terminal, scrollback included, as
+ * if the user had dragged from the top left of the scrollback down to
+ * the bottom right of the last non-blank line. The text handed to the
+ * clipboard is the plain display text; attributes and colours are kept
+ * in parallel arrays, so no terminal control sequences leak into it.
+ */
+void term_selectall(Terminal *term)
+{
+    pos top, bottom;
+
+    top.y = -sblines(term);
+    top.x = 0;
+    bottom.y = find_last_nonempty_line(term, term->screen);
+    bottom.x = term->cols;
+
+    term->seltype = LEXICOGRAPHIC;
+    term->selmode = SM_CHAR;
+    term->selstate = SELECTED;
+    term->selstart = top;
+    term->selend = bottom;
+    term->selanchor = top;
+
+    /*
+     * Extract the text now, so that the Copy command has something to
+     * work from (copy-on-select without the shortcut reuses the stored
+     * copy). Only the internal buffer is filled in: selecting all does
+     * not by itself disturb the system clipboard.
+     */
+    {
+        static const int clip_local[] = { CLIP_LOCAL };
+        clipme(term, top, bottom, false, false,
+               clip_local, lenof(clip_local));
+    }
+
+    term_schedule_update(term);
+}
+
 static void paste_from_clip_local(void *vterm)
 {
     Terminal *term = (Terminal *)vterm;
