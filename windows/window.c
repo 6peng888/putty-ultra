@@ -184,9 +184,10 @@ struct WinGuiSeatListNode wgslisthead = {
 /* Tabbed multi-session support.
  * Each PuTTY session is a WinGuiSeat whose terminal window (term_hwnd)
  * is a child of a single frame window. The frame owns the title bar,
- * the system menu and a tab strip; it forwards most system-menu
- * commands to the active tab, and intercepts New/Duplicate/Saved
- * Session to open additional tabs. */
+ * the system menu and a tab strip; session-specific commands come from
+ * the tab strip's context menu (the title bar's menu keeps only the
+ * commands that are not about one session), and the frame intercepts
+ * New/Duplicate/Saved Session to open additional tabs. */
 /*
  * Tab strip metrics. All of them are given in 96-dpi pixels and scaled
  * to the frame's actual DPI when they are used, so the strip keeps in
@@ -208,8 +209,9 @@ static bool g_quitting = false;
 static bool g_closing_all = false;   /* true while tearing down every tab on exit */
 static HMENU frame_savedsess_menu = NULL;
 static HMENU frame_xfer_menu = NULL;
+static HMENU frame_tab_menu = NULL;    /* context menu of the tab strip */
 static int frame_xfer_menu_pos = -1;   /* position of the submenu in the
-                                        * frame's system menu */
+                                        * tab strip's context menu */
 static RECT g_tabrects[MAX_TABS];
 static RECT g_plusrect;
 static int g_tabcount = 0;
@@ -2447,6 +2449,46 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
         }
         return DefWindowProcW(hwnd, message, wParam, lParam);
 
+      case WM_RBUTTONDOWN: {
+        int mx = (int)(short)LOWORD(lParam);
+        int my = (int)(short)HIWORD(lParam);
+        POINT pt;
+        UINT cmd;
+
+        /*
+         * Right-clicking the tab strip pops up the menu of commands
+         * that act on one session. The tab under the pointer is
+         * selected first, so that those commands apply to the session
+         * the user pointed at; a right click on the empty part of the
+         * strip acts on whichever tab is already active.
+         */
+        if (my >= tab_strip_height())
+            return DefWindowProcW(hwnd, message, wParam, lParam);
+        if (tab_active < 0 || !frame_tab_menu)
+            return 0;
+
+        {
+            int idx = tab_index_at(mx, my);
+            if (idx >= 0)
+                tab_activate(idx);
+        }
+
+        {
+            WinGuiSeat *w = frame_current_seat();
+            if (w)
+                show_mouseptr(w, true);    /* the menu needs a pointer */
+        }
+
+        GetCursorPos(&pt);
+        cmd = TrackPopupMenu(
+            frame_tab_menu,
+            TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD,
+            pt.x, pt.y, 0, hwnd, NULL);
+        if (cmd)
+            SendMessage(hwnd, WM_SYSCOMMAND, cmd, 0);
+        return 0;
+      }
+
       case WM_CAPTURECHANGED:
         /*
          * Something else took the mouse away (another window captured
@@ -2464,7 +2506,7 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
       case WM_INITMENUPOPUP:
         if ((HMENU)wParam == frame_savedsess_menu)
             frame_build_saved_menu();
-        else if ((HMENU)wParam == GetSystemMenu(hwnd, false)) {
+        else if ((HMENU)wParam == frame_tab_menu) {
             /*
              * Reconnect makes sense only for a session whose
              * connection has gone down, so enable it just when the
@@ -2763,7 +2805,6 @@ static void frame_update_xfer_menu(void)
     bool live_ssh = (tab_active >= 0 && tab_list[tab_active]->backend &&
                      tab_list[tab_active]->backend->vt->protocol == PROT_SSH);
     DWORD flags = live_ssh ? MF_ENABLED : MF_GRAYED;
-    HMENU sm;
 
     if (frame_xfer_menu) {
         EnableMenuItem(frame_xfer_menu, IDM_XFER_SFTP,
@@ -2772,12 +2813,10 @@ static void frame_update_xfer_menu(void)
                        MF_BYCOMMAND | flags);
     }
 
-    if (frame_xfer_menu_pos < 0 || !tab_frame_hwnd)
+    if (frame_xfer_menu_pos < 0 || !frame_tab_menu)
         return;
-    sm = GetSystemMenu(tab_frame_hwnd, false);
-    if (sm)
-        EnableMenuItem(sm, (UINT)frame_xfer_menu_pos,
-                       MF_BYPOSITION | flags);
+    EnableMenuItem(frame_tab_menu, (UINT)frame_xfer_menu_pos,
+                   MF_BYPOSITION | flags);
 }
 
 static void frame_build_menu(void)
@@ -2785,43 +2824,21 @@ static void frame_build_menu(void)
     HMENU sm = GetSystemMenu(tab_frame_hwnd, false);
     char *str;
 
+    /*
+     * The title bar's system menu keeps only the commands that do not
+     * act on one particular session: opening or picking sessions, the
+     * event log (which covers every session), full screen, help and
+     * About. Everything session-specific lives on the tab strip's
+     * context menu below, because it is the tab that identifies the
+     * session those commands apply to.
+     */
     frame_savedsess_menu = CreateMenu();
     AppendMenu(sm, MF_SEPARATOR, 0, 0);
     menu_add(sm, MF_ENABLED, IDM_NEWSESS, "Ne&w Session...");
-    /* Enabled on demand in WM_INITMENUPOPUP: only when the active
-     * session's connection is down. */
-    menu_add(sm, MF_GRAYED, IDM_RECONNECT, "Reco&nnect Session");
-    menu_add(sm, MF_ENABLED, IDM_DUPSESS, "&Duplicate Session");
     menu_add(sm, MF_POPUP | MF_ENABLED, (UINT_PTR)frame_savedsess_menu,
              "Sa&ved Sessions");
     AppendMenu(sm, MF_SEPARATOR, 0, 0);
-    /* Enabled on demand in WM_INITMENUPOPUP: only when the active
-     * session is a live SSH connection it can share. */
-    menu_add(sm, MF_GRAYED, IDM_DUPCHANNEL, "Duplicate channel");
-    /*
-     * File transfer submenu. Also enabled on demand in
-     * WM_INITMENUPOPUP, because both entries need a live SSH session.
-     */
-    frame_xfer_menu = CreateMenu();
-    menu_add(frame_xfer_menu, MF_ENABLED, IDM_XFER_SFTP, "&SFTP Transfer...");
-    menu_add(frame_xfer_menu, MF_ENABLED, IDM_XFER_SCP, "S&CP Transfer...");
-    menu_add(sm, MF_POPUP | MF_GRAYED, (UINT_PTR)frame_xfer_menu,
-             "&File Transfer");
-    /*
-     * Remember where we put it. A popup item's identifier is the
-     * submenu handle rather than the id we passed, so it has to be
-     * enabled by position instead of by command.
-     */
-    frame_xfer_menu_pos = (int)GetMenuItemCount(sm) - 1;
-    AppendMenu(sm, MF_SEPARATOR, 0, 0);
-    menu_add(sm, MF_ENABLED, IDM_COPY, "&Copy");
-    menu_add(sm, MF_ENABLED, IDM_SELALL, "Select All Text");
-    menu_add(sm, MF_ENABLED, IDM_PASTE, "&Paste");
-    AppendMenu(sm, MF_SEPARATOR, 0, 0);
-    menu_add(sm, MF_ENABLED, IDM_RECONF, "Chan&ge Settings...");
     menu_add(sm, MF_ENABLED, IDM_SHOWLOG, "&Event Log");
-    menu_add(sm, MF_ENABLED, IDM_CLRSB, "C&lear Scrollback");
-    menu_add(sm, MF_ENABLED, IDM_RESET, "Rese&t Terminal");
     AppendMenu(sm, MF_SEPARATOR, 0, 0);
     menu_add(sm, MF_ENABLED, IDM_FULLSCREEN, "&Full Screen");
     AppendMenu(sm, MF_SEPARATOR, 0, 0);
@@ -2830,6 +2847,43 @@ static void frame_build_menu(void)
     str = dupprintf("&About %s", appname);
     menu_add(sm, MF_ENABLED, IDM_ABOUT, str);
     sfree(str);
+
+    /*
+     * Context menu of the tab strip: right-clicking a tab pops this up,
+     * after selecting the tab it was invoked over, so all of these act
+     * on that session.
+     */
+    frame_tab_menu = CreatePopupMenu();
+    /* Enabled on demand in WM_INITMENUPOPUP: only when the selected
+     * session's connection is down. */
+    menu_add(frame_tab_menu, MF_GRAYED, IDM_RECONNECT, "Reco&nnect Session");
+    menu_add(frame_tab_menu, MF_ENABLED, IDM_DUPSESS, "&Duplicate Session");
+    /* Enabled on demand in WM_INITMENUPOPUP: only when the selected
+     * session is a live SSH connection it can share. */
+    menu_add(frame_tab_menu, MF_GRAYED, IDM_DUPCHANNEL, "Duplicate channel");
+    /*
+     * File transfer submenu. Also enabled on demand in
+     * WM_INITMENUPOPUP, because both entries need a live SSH session.
+     */
+    frame_xfer_menu = CreateMenu();
+    menu_add(frame_xfer_menu, MF_ENABLED, IDM_XFER_SFTP, "&SFTP Transfer...");
+    menu_add(frame_xfer_menu, MF_ENABLED, IDM_XFER_SCP, "S&CP Transfer...");
+    menu_add(frame_tab_menu, MF_POPUP | MF_GRAYED, (UINT_PTR)frame_xfer_menu,
+             "&File Transfer");
+    /*
+     * Remember where we put it. A popup item's identifier is the
+     * submenu handle rather than the id we passed, so it has to be
+     * enabled by position instead of by command.
+     */
+    frame_xfer_menu_pos = (int)GetMenuItemCount(frame_tab_menu) - 1;
+    AppendMenu(frame_tab_menu, MF_SEPARATOR, 0, 0);
+    menu_add(frame_tab_menu, MF_ENABLED, IDM_COPY, "&Copy");
+    menu_add(frame_tab_menu, MF_ENABLED, IDM_SELALL, "Select All Text");
+    menu_add(frame_tab_menu, MF_ENABLED, IDM_PASTE, "&Paste");
+    AppendMenu(frame_tab_menu, MF_SEPARATOR, 0, 0);
+    menu_add(frame_tab_menu, MF_ENABLED, IDM_RECONF, "Chan&ge Settings...");
+    menu_add(frame_tab_menu, MF_ENABLED, IDM_CLRSB, "C&lear Scrollback");
+    menu_add(frame_tab_menu, MF_ENABLED, IDM_RESET, "Rese&t Terminal");
 
     frame_build_saved_menu();
 }
