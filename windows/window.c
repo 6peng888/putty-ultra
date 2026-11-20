@@ -138,7 +138,7 @@ static void conf_cache_data(WinGuiSeat *wgs);
 /* Tabbed multi-session support (added modification) */
 static LRESULT CALLBACK FrameWndProc(HWND, UINT, WPARAM, LPARAM);
 static void new_session_finish(WinGuiSeat *wgs);
-static void new_session(Conf *conf, const wchar_t *tab_name);
+static WinGuiSeat *new_session(Conf *conf, const wchar_t *tab_name);
 static void tab_add(WinGuiSeat *wgs);
 static void tab_activate(int idx);
 static wchar_t *tab_name_from_session(const char *sessname);
@@ -1215,6 +1215,39 @@ static wchar_t *tab_name_from_session(const char *sessname)
     return dup_mb_to_wc(DEFAULT_CODEPAGE, sessname);
 }
 
+/* The name a tab is captioned with, before any "[n]" suffix: the name
+ * of the saved session the tab was opened from if there is one, else
+ * the window title. Never NULL. */
+static const wchar_t *tab_base_name(const WinGuiSeat *wgs)
+{
+    const wchar_t *name = wgs->tab_name;
+
+    if (!name || !*name)
+        name = wgs->window_name;
+    return name ? name : L"";
+}
+
+/*
+ * The ordinal for a new downstream of the session captioned `name': one
+ * more than the highest ordinal any open downstream of that session
+ * already carries. Ordinals are given out once, when a tab is created,
+ * and never change afterwards - in particular, dragging the tabs around
+ * the strip does not renumber them, so a suffix always identifies the
+ * same child session.
+ */
+static int next_dup_index(const wchar_t *name)
+{
+    int n = 0;
+
+    for (int i = 0; i < tab_count; i++) {
+        int d = tab_list[i]->dup_index;
+
+        if (d > n && !wcscmp(tab_base_name(tab_list[i]), name))
+            n = d;
+    }
+    return n + 1;
+}
+
 /*
  * Compose the caption of tab idx: its 1-based number (so the tabs can
  * be told apart at a glance) followed by the name of the saved session
@@ -1223,6 +1256,9 @@ static wchar_t *tab_name_from_session(const char *sessname)
  * 0/2 escape; a tab whose session wasn't opened from a saved one shows
  * the window title as before.
  *
+ * A tab opened by "Duplicate channel" carries the ordinal of that
+ * child session in square brackets after the name (see dup_index).
+ *
  * Nothing about the text depends on whether the tab is the active one:
  * the active tab is indicated by its background instead (see the
  * WM_PAINT handler), so that switching tabs cannot change how wide any
@@ -1230,42 +1266,11 @@ static wchar_t *tab_name_from_session(const char *sessname)
  */
 static void tab_label(int idx, wchar_t *buf, size_t buflen)
 {
-    WinGuiSeat *wgs = tab_list[idx];
-    const wchar_t *name = wgs->tab_name;
-    int downstream = 0;
+    const wchar_t *name = tab_base_name(tab_list[idx]);
+    int dup = tab_list[idx]->dup_index;
 
-    if (!name || !*name)
-        name = wgs->window_name;
-    if (!name)
-        name = L"";
-
-    /*
-     * A tab opened by "Duplicate channel" also carries the ordinal of
-     * that downstream channel among the open tabs sharing its name, in
-     * square brackets, so that several channels of one session can be
-     * told apart. Counting up to this tab (inclusive) renumbers them
-     * when tabs are opened or closed, the way the leading tab number
-     * already does.
-     */
-    if (wgs->dup_channel) {
-        for (int i = 0; i <= idx; i++) {
-            WinGuiSeat *w = tab_list[i];
-            const wchar_t *wname;
-
-            if (!w->dup_channel)
-                continue;
-            wname = w->tab_name;
-            if (!wname || !*wname)
-                wname = w->window_name;
-            if (!wname)
-                wname = L"";
-            if (!wcscmp(wname, name))
-                downstream++;
-        }
-    }
-
-    if (downstream)
-        _snwprintf(buf, buflen, L"%d: %s[%d]", idx + 1, name, downstream);
+    if (dup > 0)
+        _snwprintf(buf, buflen, L"%d: %s[%d]", idx + 1, name, dup);
     else
         _snwprintf(buf, buflen, L"%d: %s", idx + 1, name);
     buf[buflen - 1] = L'\0';
@@ -2552,9 +2557,10 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
             EnableMenuItem((HMENU)wParam, IDM_RECONNECT, MF_BYCOMMAND |
                            (down ? MF_ENABLED : MF_GRAYED));
             /*
-             * Duplicate channel needs a live SSH connection that is
-             * actually offering itself for reuse - which rules out a
-             * tab that is itself a downstream of another one.
+             * Duplicate channel needs a live SSH connection that can be
+             * shared: either one offering itself for reuse, or a tab
+             * that is itself a downstream, whose connection is its
+             * upstream's and can be reused from there.
              */
             bool live_ssh = (tab_active >= 0 &&
                              tab_list[tab_active]->backend &&
@@ -2564,7 +2570,9 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
             if (live_ssh) {
                 char *pipename = backend_get_dedicated_share_pipe(
                     tab_list[tab_active]->backend);
-                candup = (pipename != NULL);
+                candup = (pipename != NULL ||
+                          *conf_get_str(tab_list[tab_active]->conf,
+                                        CONF_ssh_share_pipe));
                 sfree(pipename);
             }
             EnableMenuItem((HMENU)wParam, IDM_DUPCHANNEL, MF_BYCOMMAND |
@@ -2628,42 +2636,64 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
             return 0;   /* submenu header */
         if ((wParam & ~0xF) == IDM_DUPCHANNEL) {
             /*
-             * Open a new tab reusing the active tab's SSH connection.
-             * This is the only action that ever does: it asks the
-             * active session for a listening socket name unique to it,
-             * and passes that name to the new launch in
-             * CONF_ssh_share_pipe, so the new session attaches to this
-             * connection as a downstream instead of dialling the
-             * server again. No other launch looks for an existing
-             * connection to reuse.
+             * Open a new tab reusing an existing SSH connection. This
+             * is the only action that ever does: work out which
+             * upstream the new launch should attach to, and pass its
+             * listening socket name in CONF_ssh_share_pipe, so the new
+             * session reuses that connection as a downstream instead of
+             * dialling the server again.
+             *
+             * Normally the upstream is the active session itself, which
+             * then publishes a listening socket unique to its own
+             * connection. A session that is itself a downstream has no
+             * connection of its own to publish - everything it does
+             * travels over its upstream's connection - so a duplicate
+             * of it attaches to that same upstream, which is the one it
+             * was started from and still names in CONF_ssh_share_pipe.
+             * Either way the new tab reuses the original connection.
              */
             if (tab_active >= 0 && tab_list[tab_active]->backend &&
                 tab_list[tab_active]->backend->vt->protocol == PROT_SSH) {
-                Conf *c = conf_copy(tab_list[tab_active]->conf);
-                /*
-                 * Drop any name inherited from the source tab's own
-                 * configuration (which could only be set if the source
-                 * was itself a duplicate channel), so we never aim the
-                 * new session at the wrong upstream.
-                 */
+                WinGuiSeat *src = tab_list[tab_active];
+                Conf *c = conf_copy(src->conf);
+                const char *inherited = conf_get_str(src->conf,
+                                                     CONF_ssh_share_pipe);
                 char *pipename = backend_get_dedicated_share_pipe(
-                    tab_list[tab_active]->backend);
+                    src->backend);
+
+                if (!pipename && *inherited)
+                    pipename = dupstr(inherited);
+
                 conf_set_str(c, CONF_ssh_share_pipe, "");
                 if (pipename) {
                     char *msg = dupprintf(
                         "Duplicate channel: targeting dedicated "
                         "listening socket %s", pipename);
-                    lp_eventlog(&tab_list[tab_active]->logpolicy, msg);
+                    lp_eventlog(&src->logpolicy, msg);
                     sfree(msg);
                     conf_set_str(c, CONF_ssh_share_pipe, pipename);
                     sfree(pipename);
                 } else {
-                    lp_eventlog(&tab_list[tab_active]->logpolicy,
+                    lp_eventlog(&src->logpolicy,
                                 "Duplicate channel: the active session is "
                                 "not offering its connection for reuse, so "
                                 "this tab will make a new connection");
                 }
-                new_session(c, tab_list[tab_active]->tab_name);
+                {
+                    WinGuiSeat *w = new_session(c, src->tab_name);
+
+                    /*
+                     * If the new tab reuses the connection, number it
+                     * as the next child session of the same session.
+                     * The number is fixed from here on, so it keeps
+                     * identifying that child however the tabs are
+                     * rearranged afterwards.
+                     */
+                    if (*conf_get_str(w->conf, CONF_ssh_share_pipe)) {
+                        w->dup_index = next_dup_index(tab_base_name(src));
+                        tab_relayout();
+                    }
+                }
             }
             return 0;
         }
@@ -3172,8 +3202,12 @@ static void new_session_finish(WinGuiSeat *wgs)
  * show on that tab - normally the name of the saved session it was
  * opened from, as returned by tab_name_from_session() - or NULL if the
  * tab should fall back to showing the window title.
+ *
+ * Returns the session, so that a caller needing to set anything else
+ * about it (such as the downstream ordinal of a "Duplicate channel"
+ * tab) can do so.
  */
-static void new_session(Conf *conf, const wchar_t *tab_name)
+static WinGuiSeat *new_session(Conf *conf, const wchar_t *tab_name)
 {
     WinGuiSeat *wgs = snew(WinGuiSeat);
     memset(wgs, 0, sizeof(*wgs));
@@ -3184,17 +3218,10 @@ static void new_session(Conf *conf, const wchar_t *tab_name)
     wgs->caret_x = wgs->caret_y = -1;
     wgs->busy_status = BUSY_NOT;
     wgs->conf = conf;
-    /*
-     * A launch that may reuse an existing SSH connection got here
-     * through "Duplicate channel": CONF_ssh_share_pipe is set only by
-     * that command and is never loaded from a saved session. Its tab
-     * says so (see tab_label).
-     */
-    if (*conf_get_str(conf, CONF_ssh_share_pipe))
-        wgs->dup_channel = true;
     if (tab_name && *tab_name)
         wgs->tab_name = dupwcs(tab_name);
     new_session_finish(wgs);
+    return wgs;
 }
 
 char *handle_restrict_acl_cmdline_prefix(char *p)
