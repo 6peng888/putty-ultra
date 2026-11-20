@@ -300,6 +300,15 @@ bool dlg_checkbox_get(dlgcontrol *ctrl, dlgparam *dp)
     return gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(uc->toplevel));
 }
 
+void dlg_control_enable(dlgcontrol *ctrl, dlgparam *dp, bool enabled)
+{
+    struct uctrl *uc = dlg_find_byctrl(dp, ctrl);
+
+    if (!uc)
+        return;
+    gtk_widget_set_sensitive(uc->toplevel, enabled);
+}
+
 void dlg_editbox_set_utf8(dlgcontrol *ctrl, dlgparam *dp, char const *text)
 {
     struct uctrl *uc = dlg_find_byctrl(dp, ctrl);

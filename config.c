@@ -427,6 +427,25 @@ static void config_protocols_handler(dlgcontrol *ctrl, dlgparam *dlg,
     }
 }
 
+/*
+ * Per-line timestamps are only produced for screen logging, because
+ * that is the only log type whose lines are reconstructed here: every
+ * line it writes goes out with a timestamp in front of it (see
+ * logscreen_flush). So the option is only offered for that log type,
+ * and greyed out for the others, where it would do nothing.
+ */
+static void logging_timestamp_enable(dlgcontrol *logtype_ctrl,
+                                     dlgparam *dlg, Conf *conf)
+{
+    /* Set up next to the radio buttons, in the logging panel. */
+    dlgcontrol *ts = logtype_ctrl->context2.p;
+
+    if (!ts)
+        return;
+    dlg_control_enable(ts, dlg,
+                       conf_get_int(conf, CONF_logtype) == LGTYP_SCREEN);
+}
+
 static void loggingbuttons_handler(dlgcontrol *ctrl, dlgparam *dlg,
                                    void *data, int event)
 {
@@ -449,10 +468,12 @@ static void loggingbuttons_handler(dlgcontrol *ctrl, dlgparam *dlg,
             conf_set_int(conf, CONF_logtype, LGTYP_NONE);
         }
         dlg_radiobutton_set(ctrl, dlg, button);
+        logging_timestamp_enable(ctrl, dlg, conf);
     } else if (event == EVENT_VALCHANGE) {
         button = dlg_radiobutton_get(ctrl, dlg);
         assert(button >= 0 && button < ctrl->radio.nbuttons);
         conf_set_int(conf, CONF_logtype, ctrl->radio.buttondata[button].i);
+        logging_timestamp_enable(ctrl, dlg, conf);
     }
 }
 
@@ -2234,6 +2255,7 @@ void setup_config_box(struct controlbox *b, bool midsession,
      * The logging buttons change depending on whether SSH packet
      * logging can sensibly be available.
      */
+    dlgcontrol *logtype_ctrl;
     {
         const char *sshlogname, *sshrawlogname;
         if ((midsession && protocol == PROT_SSH) ||
@@ -2244,16 +2266,16 @@ void setup_config_box(struct controlbox *b, bool midsession,
             sshlogname = NULL;         /* this will disable both buttons */
             sshrawlogname = NULL;      /* this will just placate optimisers */
         }
-        ctrl_radiobuttons(s, "Session logging:", NO_SHORTCUT, 2,
-                          HELPCTX(logging_main),
-                          loggingbuttons_handler,
-                          I(CONF_logtype),
-                          "None", 't', I(LGTYP_NONE),
-                          "Printable output", 'p', I(LGTYP_ASCII),
-                          "All session output", 'l', I(LGTYP_DEBUG),
-                          "Screen output", 'n', I(LGTYP_SCREEN),
-                          sshlogname, 's', I(LGTYP_PACKETS),
-                          sshrawlogname, 'r', I(LGTYP_SSHRAW));
+        logtype_ctrl = ctrl_radiobuttons(s, "Session logging:", NO_SHORTCUT, 2,
+                                         HELPCTX(logging_main),
+                                         loggingbuttons_handler,
+                                         I(CONF_logtype),
+                                         "None", 't', I(LGTYP_NONE),
+                                         "Printable output", 'p', I(LGTYP_ASCII),
+                                         "All session output", 'l', I(LGTYP_DEBUG),
+                                         "Screen output", 'n', I(LGTYP_SCREEN),
+                                         sshlogname, 's', I(LGTYP_PACKETS),
+                                         sshrawlogname, 'r', I(LGTYP_SSHRAW));
     }
     ctrl_filesel(s, "Log file name:", 'f',
                  FILTER_ALL_FILES, true, "Select session log file name",
@@ -2274,9 +2296,15 @@ void setup_config_box(struct controlbox *b, bool midsession,
     ctrl_checkbox(s, "Include header", 'i',
                   HELPCTX(logging_header),
                   conf_checkbox_handler, I(CONF_logheader));
-    ctrl_checkbox(s, "Prepend timestamp to each line", 'm',
-                  HELPCTX(no_help),
-                  conf_checkbox_handler, I(CONF_logtimestamp));
+    /*
+     * The timestamp option only means something for screen logging,
+     * so loggingbuttons_handler() greys it out for the other log
+     * types; it finds it through the radio button control's context2.
+     */
+    logtype_ctrl->context2 =
+        P(ctrl_checkbox(s, "Prepend timestamp to each line", 'm',
+                        HELPCTX(no_help),
+                        conf_checkbox_handler, I(CONF_logtimestamp)));
 
     if ((midsession && protocol == PROT_SSH) ||
         (!midsession && backend_vt_from_proto(PROT_SSH))) {

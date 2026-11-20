@@ -6,6 +6,7 @@
 
 #include <time.h>
 #include <assert.h>
+#include <sys/time.h>
 
 struct tm ltime(void)
 {
@@ -13,4 +14,13 @@ struct tm ltime(void)
     time(&t);
     assert (t != ((time_t)-1));
     return *localtime(&t);
+}
+
+int ltime_milliseconds(void)
+{
+    struct timeval tv;
+
+    if (gettimeofday(&tv, NULL) != 0)
+        return 0;
+    return (int)(tv.tv_usec / 1000);
 }

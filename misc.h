@@ -166,6 +166,8 @@ static inline void bufchain_set_callback(bufchain *ch, IdempotentCallback *ic)
 bool validate_manual_hostkey(char *key);
 
 struct tm ltime(void);
+/* Milliseconds part (0-999) of the current local time. */
+int ltime_milliseconds(void);
 
 /*
  * Special form of strcmp which can cope with NULL inputs. NULL is

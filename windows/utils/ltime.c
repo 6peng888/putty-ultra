@@ -25,3 +25,11 @@ struct tm ltime(void)
     tm.tm_isdst=0; /* GetLocalTime doesn't tell us */
     return tm;
 }
+
+int ltime_milliseconds(void)
+{
+    SYSTEMTIME st;
+
+    GetLocalTime(&st);
+    return st.wMilliseconds;
+}

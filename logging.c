@@ -573,7 +573,10 @@ void log_reconfig(LogContext *ctx, Conf *conf)
  * translate format codes into time/date strings
  * and insert them into log file name
  *
- * "&Y":YYYY   "&m":MM   "&d":DD   "&T":hhmmss   "&h":<hostname>   "&&":&
+ * "&Y":YYYY   "&m":MM   "&d":DD   "&T":hhmmss.mmm   "&h":<hostname>   "&&":&
+ *
+ * "&T" carries milliseconds as well as seconds, so that two logs opened
+ * within the same second still get distinct names.
  */
 static Filename *xlatlognam(const Filename *src,
                             const char *hostname, int port,
@@ -609,6 +612,8 @@ static Filename *xlatlognam(const Filename *src,
                 break;
               case 't':
                 size = strftime(buf, sizeof(buf), "%H%M%S", tm);
+                size += sprintf(buf + size, ".%03d",
+                                ltime_milliseconds());
                 break;
               case 'h':
                 bufp = hostname;

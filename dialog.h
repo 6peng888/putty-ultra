@@ -585,6 +585,15 @@ void dlg_radiobutton_set(dlgcontrol *ctrl, dlgparam *dp, int whichbutton);
 int dlg_radiobutton_get(dlgcontrol *ctrl, dlgparam *dp);
 void dlg_checkbox_set(dlgcontrol *ctrl, dlgparam *dp, bool checked);
 bool dlg_checkbox_get(dlgcontrol *ctrl, dlgparam *dp);
+/*
+ * Enable or disable a control, greying it out in the process. A
+ * disabled control cannot be operated or reached with the keyboard.
+ * Front ends that cannot support this may ignore it. A control on a
+ * panel that is not currently on screen is left alone: its handler
+ * gets a refresh when that panel is next shown, which can reapply the
+ * state then.
+ */
+void dlg_control_enable(dlgcontrol *ctrl, dlgparam *dp, bool enabled);
 void dlg_editbox_set(dlgcontrol *ctrl, dlgparam *dp, char const *text);
 void dlg_editbox_set_utf8(dlgcontrol *ctrl, dlgparam *dp, char const *text);
 char *dlg_editbox_get(dlgcontrol *ctrl, dlgparam *dp);   /* result must be freed by caller */

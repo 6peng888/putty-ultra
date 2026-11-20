@@ -3875,6 +3875,39 @@ bool dlg_checkbox_get(dlgcontrol *ctrl, dlgparam *dp)
     return 0 != IsDlgButtonChecked(dp->hwnd, c->base_id);
 }
 
+void dlg_control_enable(dlgcontrol *ctrl, dlgparam *dp, bool enabled)
+{
+    struct winctrl *c = dlg_findbyctrl(dp, ctrl);
+    int i, first = 0, n = 1;
+
+    /*
+     * Controls on panels that aren't currently shown don't exist, so
+     * there is nothing to grey out; their handler is refreshed when
+     * the panel is next created, and can set the state then.
+     */
+    if (!c)
+        return;
+
+    switch (c->ctrl->type) {
+      case CTRL_RADIO:
+        /*
+         * A group of radio buttons occupies the ids base_id+1 ..
+         * base_id+nbuttons; a single checkbox is just base_id.
+         */
+        first = 1;
+        n = c->ctrl->radio.nbuttons;
+        break;
+      case CTRL_CHECKBOX:
+        break;
+      default:
+        return;
+    }
+
+    for (i = 0; i < n; i++)
+        EnableWindow(GetDlgItem(dp->hwnd, c->base_id + first + i),
+                     enabled);
+}
+
 void dlg_editbox_set(dlgcontrol *ctrl, dlgparam *dp, char const *text)
 {
     struct winctrl *c = dlg_findbyctrl(dp, ctrl);
