@@ -428,6 +428,7 @@ static void sg_process_inbuf(SftpGui *g);
 static void sg_xfer_fail(SftpGui *g, const char *why);
 static void sg_xfer_next(SftpGui *g);
 static void sg_set_busy(SftpGui *g, bool busy);
+static void sg_update_transfer_buttons(SftpGui *g);
 static void sg_lv_fill(struct SgPane *p, struct SgEntry *ents, int n);
 static void sg_entries_free(struct SgEntry *ents, int n);
 static void sg_remote_fill(SftpGui *g);
@@ -1173,6 +1174,7 @@ static void sg_sort_column(SftpGui *g, HWND lv, int col)
         p->sort_desc = false;
     }
     sg_lv_fill(p, p->ents, p->nents);
+    sg_update_transfer_buttons(g);     /* refilling drops the selection */
 }
 
 static void sg_lv_fill(struct SgPane *p, struct SgEntry *ents, int n)
@@ -1275,6 +1277,47 @@ static int sg_lv_collect(HWND lv, int **out)
     }
     *out = idxs;
     return n;
+}
+
+/*
+ * How many entries of a pane are selected and can actually be sent.
+ * The ".." entry only navigates, and a local junction or symlink is
+ * not followed, so neither counts (cf. sg_enqueue_selection).
+ */
+static int sg_selected_count(struct SgPane *p, bool from_local)
+{
+    int *idxs = NULL;
+    int n = sg_lv_collect(p->list, &idxs), m = 0;
+
+    for (int i = 0; i < n; i++) {
+        struct SgEntry *e;
+
+        if (idxs[i] < 0 || idxs[i] >= p->nents)
+            continue;
+        e = &p->ents[idxs[i]];
+        if (!strcmp(e->name, ".."))
+            continue;
+        if (from_local && e->is_dir && e->reparse)
+            continue;
+        m++;
+    }
+    sfree(idxs);
+    return m;
+}
+
+/*
+ * Keep the transfer buttons in step with what is selected: Upload
+ * needs something selected in the local pane, Download something in
+ * the remote one, and neither is usable while a transfer is running.
+ */
+static void sg_update_transfer_buttons(SftpGui *g)
+{
+    if (!g->btn_upload || !g->btn_download)
+        return;
+    EnableWindow(g->btn_upload,
+                 !g->busy && sg_selected_count(&g->lcl, true) > 0);
+    EnableWindow(g->btn_download,
+                 !g->busy && sg_selected_count(&g->rmt, false) > 0);
 }
 
 /* ----------------------------------------------------------------------
@@ -1872,6 +1915,7 @@ static void sg_local_refresh(SftpGui *g)
     g->lcl.nents = n;
     sg_set_text(g->lcl.path, g->lcl.cwd);
     sg_lv_fill(&g->lcl, ents, n);
+    sg_update_transfer_buttons(g);     /* refilling drops the selection */
 }
 
 /* Move the local pane, keeping the old directory if it isn't readable. */
@@ -1896,6 +1940,7 @@ static void sg_local_goto(SftpGui *g, const char *path)
     g->lcl.nents = n;
     sg_set_text(g->lcl.path, abs);
     sg_lv_fill(&g->lcl, ents, n);
+    sg_update_transfer_buttons(g);     /* refilling drops the selection */
 }
 
 /* ----------------------------------------------------------------------
@@ -1923,6 +1968,7 @@ static void sg_remote_fill(SftpGui *g)
     g->rents = NULL;
     g->nrents = g->rents_size = 0;
     sg_lv_fill(&g->rmt, g->rmt.ents, g->rmt.nents);
+    sg_update_transfer_buttons(g);     /* refilling drops the selection */
 }
 
 static void sg_remote_refresh(SftpGui *g)
@@ -1978,8 +2024,7 @@ static void sg_remote_goto(SftpGui *g, const char *path)
 static void sg_set_busy(SftpGui *g, bool busy)
 {
     g->busy = busy;
-    EnableWindow(g->btn_upload, !busy);
-    EnableWindow(g->btn_download, !busy);
+    sg_update_transfer_buttons(g);
     EnableWindow(g->btn_cancel, busy);
     EnableWindow(g->rmt.up, !busy);
     EnableWindow(g->lcl.up, !busy);
@@ -4289,6 +4334,7 @@ static void sg_create_controls(SftpGui *g)
                          SG_ID_STATUS);
 
     EnableWindow(g->btn_cancel, FALSE);
+    sg_update_transfer_buttons(g);     /* nothing is selected yet */
 }
 
 static void sg_layout(SftpGui *g)
@@ -4767,6 +4813,18 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             if (nmlv->hdr.hwndFrom == g->lcl.list ||
                 nmlv->hdr.hwndFrom == g->rmt.list)
                 sg_sort_column(g, nmlv->hdr.hwndFrom, (int)nmlv->iSubItem);
+            return 0;
+        }
+        if (nm->code == LVN_ITEMCHANGED) {
+            /* A row was selected or deselected: the transfer buttons
+             * follow what is selected in each pane. */
+            NMLISTVIEW *nmlv = (NMLISTVIEW *)lParam;
+
+            if ((nmlv->hdr.hwndFrom == g->lcl.list ||
+                 nmlv->hdr.hwndFrom == g->rmt.list) &&
+                (nmlv->uChanged & LVIF_STATE) &&
+                ((nmlv->uOldState ^ nmlv->uNewState) & LVIS_SELECTED))
+                sg_update_transfer_buttons(g);
             return 0;
         }
         if (nm->code == LVN_BEGINLABELEDITW) {
