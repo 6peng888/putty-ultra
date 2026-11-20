@@ -49,10 +49,12 @@
 #define SG_ID_L_PATH     1101
 #define SG_ID_L_UP       1102
 #define SG_ID_L_LIST     1103
+#define SG_ID_L_REFRESH  1104
 #define SG_ID_R_LABEL    1110
 #define SG_ID_R_PATH     1111
 #define SG_ID_R_UP       1112
 #define SG_ID_R_LIST     1113
+#define SG_ID_R_REFRESH  1114
 #define SG_ID_UPLOAD     1120
 #define SG_ID_DOWNLOAD   1121
 #define SG_ID_CANCEL     1123
@@ -181,7 +183,7 @@ struct SgEntry {
 };
 
 struct SgPane {
-    HWND label, path, up, list;
+    HWND label, path, up, refresh, list;
     char *cwd;                  /* UTF-8 */
     struct SgEntry *ents;
     int nents, entsize;
@@ -1859,6 +1861,8 @@ static void sg_set_busy(SftpGui *g, bool busy)
     EnableWindow(g->btn_cancel, busy);
     EnableWindow(g->rmt.up, !busy);
     EnableWindow(g->lcl.up, !busy);
+    EnableWindow(g->rmt.refresh, !busy);
+    EnableWindow(g->lcl.refresh, !busy);
 
     /* The progress readout is driven by this timer while a transfer
      * runs, so that it keeps ticking whatever the data flow does. */
@@ -3416,6 +3420,8 @@ static void sg_fatal(SftpGui *g, const char *msg)
     EnableWindow(g->btn_cancel, FALSE);
     EnableWindow(g->rmt.up, FALSE);
     EnableWindow(g->lcl.up, FALSE);
+    EnableWindow(g->rmt.refresh, FALSE);
+    EnableWindow(g->lcl.refresh, FALSE);
     sg_status(g, msg);
     /* The tab goes struck through, the way a closed session's tab does. */
     if (g->frame)
@@ -4121,6 +4127,8 @@ static void sg_create_controls(SftpGui *g)
     g->lcl.path = sg_child(g, L"COMBOBOX", "", combo_style, 0, SG_ID_L_PATH);
     sg_subclass_combo(&g->lcl);
     g->lcl.up = sg_child(g, L"BUTTON", "..", BS_PUSHBUTTON, 0, SG_ID_L_UP);
+    g->lcl.refresh = sg_child(g, L"BUTTON", "Refresh", BS_PUSHBUTTON, 0,
+                              SG_ID_L_REFRESH);
     g->lcl.list = sg_child(g, WC_LISTVIEWW, "",
                            LVS_REPORT | LVS_SHOWSELALWAYS | LVS_EDITLABELS,
                            WS_EX_CLIENTEDGE, SG_ID_L_LIST);
@@ -4129,6 +4137,8 @@ static void sg_create_controls(SftpGui *g)
     g->rmt.path = sg_child(g, L"COMBOBOX", "", combo_style, 0, SG_ID_R_PATH);
     sg_subclass_combo(&g->rmt);
     g->rmt.up = sg_child(g, L"BUTTON", "..", BS_PUSHBUTTON, 0, SG_ID_R_UP);
+    g->rmt.refresh = sg_child(g, L"BUTTON", "Refresh", BS_PUSHBUTTON, 0,
+                              SG_ID_R_REFRESH);
     g->rmt.list = sg_child(g, WC_LISTVIEWW, "",
                            LVS_REPORT | LVS_SHOWSELALWAYS | LVS_EDITLABELS,
                            WS_EX_CLIENTEDGE, SG_ID_R_LIST);
@@ -4163,6 +4173,7 @@ static void sg_layout(SftpGui *g)
 {
     RECT rc;
     int W, H, m = 8, gap = 6, row = 24, midw = 96, prog_h = 16;
+    int upw = 28, rfw = 52;    /* the ".." and Refresh buttons */
     int pane_w, left_x, right_x, list_y, list_h, prog_y, status_y, bx, by;
     int namew, total_w;
     int i;
@@ -4191,13 +4202,17 @@ static void sg_layout(SftpGui *g)
      * sizes that from the font).
      */
     sg_place(g->lcl.label, left_x, m, 46, row);
-    sg_place(g->lcl.path, left_x + 48, m, pane_w - 48 - 30, row + 220);
-    sg_place(g->lcl.up, left_x + pane_w - 28, m, 28, row);
+    sg_place(g->lcl.path, left_x + 48, m,
+             pane_w - 48 - upw - 2 - rfw - 2, row + 220);
+    sg_place(g->lcl.refresh, left_x + pane_w - upw - 2 - rfw, m, rfw, row);
+    sg_place(g->lcl.up, left_x + pane_w - upw, m, upw, row);
     sg_place(g->lcl.list, left_x, list_y, pane_w, list_h);
 
     sg_place(g->rmt.label, right_x, m, 46, row);
-    sg_place(g->rmt.path, right_x + 48, m, pane_w - 48 - 30, row + 220);
-    sg_place(g->rmt.up, right_x + pane_w - 28, m, 28, row);
+    sg_place(g->rmt.path, right_x + 48, m,
+             pane_w - 48 - upw - 2 - rfw - 2, row + 220);
+    sg_place(g->rmt.refresh, right_x + pane_w - upw - 2 - rfw, m, rfw, row);
+    sg_place(g->rmt.up, right_x + pane_w - upw, m, upw, row);
     sg_place(g->rmt.list, right_x, list_y, pane_w, list_h);
 
     bx = m + pane_w + gap;
@@ -4518,6 +4533,12 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             sfree(p);
             return 0;
           }
+          case SG_ID_L_REFRESH:
+            sg_local_refresh(g);
+            return 0;
+          case SG_ID_R_REFRESH:
+            sg_remote_refresh(g);
+            return 0;
 
           case SG_ID_L_PATH:
             /* Refill the list every time it is opened, so a drive that
