@@ -17,7 +17,7 @@
 # ===== 标题栏 / 右键菜单 =====
 Ne&w Session...=新建会话(&W)...
 Reco&nnect Session=重新连接会话(&N)
-&Duplicate Session=复制会话(&D)
+Duplicate Session=复制会话
 Sa&ved Sessions=已保存会话(&V)
 Duplicate channel=复用连接通道
 &Copy=复制(&C)
@@ -33,9 +33,8 @@ Rese&t Terminal=重置终端(&T)
 C&opy All to Clipboard=全部复制到剪贴板(&O)
 Select All Text=选择全部文本
 &Restart Session=重新启动会话(&R)
-&File Transfer=文件传输(&F)
-&SFTP Transfer...=SFTP 传输(&S)...
-S&CP Transfer...=SCP 传输(&C)...
+SFTP Transfer...=SFTP 传输...
+SCP Transfer...=SCP 传输...
 
 # ===== 文件传输窗口 =====
 SFTP File Transfer=SFTP 文件传输

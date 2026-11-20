@@ -54,7 +54,6 @@
 #define IDM_PASTE     0x01A0
 #define IDM_RECONNECT 0x01B0
 #define IDM_DUPCHANNEL 0x01C0
-#define IDM_XFER      0x01D0     /* "File Transfer" submenu header */
 #define IDM_XFER_SFTP 0x01E0
 #define IDM_XFER_SCP  0x01F0     /* placeholder, not implemented yet */
 #define IDM_SPECIALSEP 0x0200
@@ -208,10 +207,7 @@ static int tab_active = -1;
 static bool g_quitting = false;
 static bool g_closing_all = false;   /* true while tearing down every tab on exit */
 static HMENU frame_savedsess_menu = NULL;
-static HMENU frame_xfer_menu = NULL;
 static HMENU frame_tab_menu = NULL;    /* context menu of the tab strip */
-static int frame_xfer_menu_pos = -1;   /* position of the submenu in the
-                                        * tab strip's context menu */
 static RECT g_tabrects[MAX_TABS];
 static RECT g_plusrect;
 static int g_tabcount = 0;
@@ -910,7 +906,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
             menu_add(m, MF_ENABLED, IDM_SHOWLOG, "&Event Log");
             AppendMenu(m, MF_SEPARATOR, 0, 0);
             menu_add(m, MF_ENABLED, IDM_NEWSESS, "Ne&w Session...");
-            menu_add(m, MF_ENABLED, IDM_DUPSESS, "&Duplicate Session");
+            menu_add(m, MF_ENABLED, IDM_DUPSESS, "Duplicate Session");
             menu_add(m, MF_POPUP | MF_ENABLED, (UINT_PTR)wgs->savedsess_menu,
                      "Sa&ved Sessions");
             menu_add(m, MF_ENABLED, IDM_RECONF, "Chan&ge Settings...");
@@ -2697,8 +2693,6 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
             }
             return 0;
         }
-        if ((wParam & ~0xF) == IDM_XFER)
-            return 0;   /* submenu header */
         if ((wParam & ~0xF) == IDM_XFER_SFTP) {
             /*
              * Open the two-pane SFTP window on the active session's own
@@ -2857,11 +2851,6 @@ static int message_box_i18n(HWND hwnd, const char *text, const char *caption,
  * Grey out the file-transfer submenu unless the active session is a
  * live SSH connection, since the SFTP window borrows that connection
  * rather than dialling a new one.
- *
- * The submenu itself has to be toggled by position. A popup item's
- * stored identifier is the submenu handle, not the id passed to
- * AppendMenu, so EnableMenuItem(..., MF_BYCOMMAND) would never find it
- * and the item would stay greyed for ever.
  */
 static void frame_update_xfer_menu(void)
 {
@@ -2869,17 +2858,10 @@ static void frame_update_xfer_menu(void)
                      tab_list[tab_active]->backend->vt->protocol == PROT_SSH);
     DWORD flags = live_ssh ? MF_ENABLED : MF_GRAYED;
 
-    if (frame_xfer_menu) {
-        EnableMenuItem(frame_xfer_menu, IDM_XFER_SFTP,
-                       MF_BYCOMMAND | flags);
-        EnableMenuItem(frame_xfer_menu, IDM_XFER_SCP,
-                       MF_BYCOMMAND | flags);
-    }
-
-    if (frame_xfer_menu_pos < 0 || !frame_tab_menu)
+    if (!frame_tab_menu)
         return;
-    EnableMenuItem(frame_tab_menu, (UINT)frame_xfer_menu_pos,
-                   MF_BYPOSITION | flags);
+    EnableMenuItem(frame_tab_menu, IDM_XFER_SFTP, MF_BYCOMMAND | flags);
+    EnableMenuItem(frame_tab_menu, IDM_XFER_SCP, MF_BYCOMMAND | flags);
 }
 
 static void frame_build_menu(void)
@@ -2920,25 +2902,18 @@ static void frame_build_menu(void)
     /* Enabled on demand in WM_INITMENUPOPUP: only when the selected
      * session's connection is down. */
     menu_add(frame_tab_menu, MF_GRAYED, IDM_RECONNECT, "Reco&nnect Session");
-    menu_add(frame_tab_menu, MF_ENABLED, IDM_DUPSESS, "&Duplicate Session");
+    menu_add(frame_tab_menu, MF_ENABLED, IDM_DUPSESS, "Duplicate Session");
     /* Enabled on demand in WM_INITMENUPOPUP: only when the selected
      * session is a live SSH connection it can share. */
     menu_add(frame_tab_menu, MF_GRAYED, IDM_DUPCHANNEL, "Duplicate channel");
     /*
-     * File transfer submenu. Also enabled on demand in
-     * WM_INITMENUPOPUP, because both entries need a live SSH session.
+     * File transfer sits in the menu itself rather than in a submenu,
+     * and is enabled on demand in WM_INITMENUPOPUP, because both
+     * entries need a live SSH connection to borrow.
      */
-    frame_xfer_menu = CreateMenu();
-    menu_add(frame_xfer_menu, MF_ENABLED, IDM_XFER_SFTP, "&SFTP Transfer...");
-    menu_add(frame_xfer_menu, MF_ENABLED, IDM_XFER_SCP, "S&CP Transfer...");
-    menu_add(frame_tab_menu, MF_POPUP | MF_GRAYED, (UINT_PTR)frame_xfer_menu,
-             "&File Transfer");
-    /*
-     * Remember where we put it. A popup item's identifier is the
-     * submenu handle rather than the id we passed, so it has to be
-     * enabled by position instead of by command.
-     */
-    frame_xfer_menu_pos = (int)GetMenuItemCount(frame_tab_menu) - 1;
+    AppendMenu(frame_tab_menu, MF_SEPARATOR, 0, 0);
+    menu_add(frame_tab_menu, MF_GRAYED, IDM_XFER_SFTP, "SFTP Transfer...");
+    menu_add(frame_tab_menu, MF_GRAYED, IDM_XFER_SCP, "SCP Transfer...");
     AppendMenu(frame_tab_menu, MF_SEPARATOR, 0, 0);
     menu_add(frame_tab_menu, MF_ENABLED, IDM_COPY, "&Copy");
     menu_add(frame_tab_menu, MF_ENABLED, IDM_SELALL, "Select All Text");
@@ -3157,7 +3132,7 @@ static void new_session_finish(WinGuiSeat *wgs)
             menu_add(m, MF_ENABLED, IDM_SHOWLOG, "&Event Log");
             AppendMenu(m, MF_SEPARATOR, 0, 0);
             menu_add(m, MF_ENABLED, IDM_NEWSESS, "Ne&w Session...");
-            menu_add(m, MF_ENABLED, IDM_DUPSESS, "&Duplicate Session");
+            menu_add(m, MF_ENABLED, IDM_DUPSESS, "Duplicate Session");
             menu_add(m, MF_POPUP | MF_ENABLED, (UINT_PTR)wgs->savedsess_menu,
                      "Sa&ved Sessions");
             menu_add(m, MF_ENABLED, IDM_RECONF, "Chan&ge Settings...");
