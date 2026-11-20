@@ -1230,11 +1230,44 @@ static wchar_t *tab_name_from_session(const char *sessname)
  */
 static void tab_label(int idx, wchar_t *buf, size_t buflen)
 {
-    const wchar_t *name = tab_list[idx]->tab_name;
-    if (!name || !*name)
-        name = tab_list[idx]->window_name;
+    WinGuiSeat *wgs = tab_list[idx];
+    const wchar_t *name = wgs->tab_name;
+    int downstream = 0;
 
-    _snwprintf(buf, buflen, L"%d: %s", idx + 1, name ? name : L"");
+    if (!name || !*name)
+        name = wgs->window_name;
+    if (!name)
+        name = L"";
+
+    /*
+     * A tab opened by "Duplicate channel" also carries the ordinal of
+     * that downstream channel among the open tabs sharing its name, in
+     * square brackets, so that several channels of one session can be
+     * told apart. Counting up to this tab (inclusive) renumbers them
+     * when tabs are opened or closed, the way the leading tab number
+     * already does.
+     */
+    if (wgs->dup_channel) {
+        for (int i = 0; i <= idx; i++) {
+            WinGuiSeat *w = tab_list[i];
+            const wchar_t *wname;
+
+            if (!w->dup_channel)
+                continue;
+            wname = w->tab_name;
+            if (!wname || !*wname)
+                wname = w->window_name;
+            if (!wname)
+                wname = L"";
+            if (!wcscmp(wname, name))
+                downstream++;
+        }
+    }
+
+    if (downstream)
+        _snwprintf(buf, buflen, L"%d: %s[%d]", idx + 1, name, downstream);
+    else
+        _snwprintf(buf, buflen, L"%d: %s", idx + 1, name);
     buf[buflen - 1] = L'\0';
 }
 
@@ -3151,6 +3184,14 @@ static void new_session(Conf *conf, const wchar_t *tab_name)
     wgs->caret_x = wgs->caret_y = -1;
     wgs->busy_status = BUSY_NOT;
     wgs->conf = conf;
+    /*
+     * A launch that may reuse an existing SSH connection got here
+     * through "Duplicate channel": CONF_ssh_share_pipe is set only by
+     * that command and is never loaded from a saved session. Its tab
+     * says so (see tab_label).
+     */
+    if (*conf_get_str(conf, CONF_ssh_share_pipe))
+        wgs->dup_channel = true;
     if (tab_name && *tab_name)
         wgs->tab_name = dupwcs(tab_name);
     new_session_finish(wgs);

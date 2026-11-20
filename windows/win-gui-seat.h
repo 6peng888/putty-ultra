@@ -133,6 +133,14 @@ struct WinGuiSeat {
      */
     wchar_t *tab_name;
 
+    /*
+     * True if this session was started by "Duplicate channel", i.e. it
+     * reuses an existing SSH connection instead of dialling its own.
+     * Such a tab also shows its ordinal among the open downstream
+     * channels of the same session (see tab_label).
+     */
+    bool dup_channel;
+
     int alt_numberpad_accumulator;
     int compose_state;
     int compose_char;
