@@ -41,6 +41,14 @@
 #include <shellapi.h>          /* SHGetFileInfoW: the system file icons */
 #include <shlobj.h>            /* SHGetFolderPathW: the shell's folders */
 
+/* The header's sort arrows, in case the headers are older than XP. */
+#ifndef HDF_SORTUP
+#define HDF_SORTUP   0x0400
+#endif
+#ifndef HDF_SORTDOWN
+#define HDF_SORTDOWN 0x0200
+#endif
+
 /* ----------------------------------------------------------------------
  * UI identifiers.
  */
@@ -187,6 +195,13 @@ struct SgPane {
     char *cwd;                  /* UTF-8 */
     struct SgEntry *ents;
     int nents, entsize;
+
+    /* How this pane's list is sorted: 0 = Name, 1 = Size, 2 = Type,
+     * 3 = Modified. Clicking a column's header sorts by it, and
+     * clicking the current sort column again reverses the order. The
+     * direction is shown with an arrow in the header. */
+    int sort_col;
+    bool sort_desc;
 
     /* The path box is an editable combo box with a drop-down history of
      * places worth jumping to (see sg_local_combo_build and
@@ -413,7 +428,7 @@ static void sg_process_inbuf(SftpGui *g);
 static void sg_xfer_fail(SftpGui *g, const char *why);
 static void sg_xfer_next(SftpGui *g);
 static void sg_set_busy(SftpGui *g, bool busy);
-static void sg_lv_fill(HWND lv, struct SgEntry *ents, int n);
+static void sg_lv_fill(struct SgPane *p, struct SgEntry *ents, int n);
 static void sg_entries_free(struct SgEntry *ents, int n);
 static void sg_remote_fill(SftpGui *g);
 static void sg_scp_ul_begin(SftpGui *g);
@@ -1064,10 +1079,116 @@ static void sg_combo_draw(const DRAWITEMSTRUCT *dis)
               DT_END_ELLIPSIS | DT_NOPREFIX);
 }
 
-static void sg_lv_fill(HWND lv, struct SgEntry *ents, int n)
+/*
+ * Sorting a pane's list.
+ *
+ * The rows are never sorted by the list view itself: everything else in
+ * this file finds a row's entry by using the row number as an index into
+ * the pane's entry array, so a sort reorders that array and the list is
+ * refilled from it. ".." stays at the top whatever the sort order.
+ *
+ * qsort() has no context argument, so the sort column and direction are
+ * passed through these variables, which are set immediately before the
+ * call and only used from the GUI thread.
+ */
+static int sg_sort_col;
+static bool sg_sort_desc;
+
+static int sg_fill_cmp(const void *av, const void *bv)
 {
+    const struct SgEntry *a = (const struct SgEntry *)av;
+    const struct SgEntry *b = (const struct SgEntry *)bv;
+    bool adot = !strcmp(a->name, ".."), bdot = !strcmp(b->name, "..");
+    int r = 0;
+
+    if (adot != bdot)
+        return adot ? -1 : +1;      /* the parent entry always comes first */
+
+    switch (sg_sort_col) {
+      case 1:                       /* Size */
+        if (a->size != b->size)
+            r = a->size < b->size ? -1 : +1;
+        break;
+      case 2: {                     /* Type: by the text in that column */
+        char *ta = sg_type_name(a->name, a->is_dir);
+        char *tb = sg_type_name(b->name, b->is_dir);
+
+        r = strcmp(ta, tb);
+        sfree(ta);
+        sfree(tb);
+        break;
+      }
+      case 3:                       /* Modified */
+        if (a->mtime != b->mtime)
+            r = a->mtime < b->mtime ? -1 : +1;
+        break;
+      default:                      /* Name: directories first, either way */
+        if (a->is_dir != b->is_dir)
+            return a->is_dir ? -1 : +1;
+        break;
+    }
+
+    if (r == 0)
+        r = stricmp(a->name, b->name);   /* ties, and Name order */
+
+    return sg_sort_desc ? -r : r;
+}
+
+/* Mark the sort column in the list's header, with the arrow pointing up
+ * for ascending and down for descending. */
+static void sg_sort_arrows(struct SgPane *p)
+{
+    HWND hdr = (HWND)SendMessageW(p->list, LVM_GETHEADER, 0, 0);
+
+    if (!hdr)
+        return;
+
+    for (int i = 0; i < 4; i++) {
+        HDITEMW it;
+
+        memset(&it, 0, sizeof(it));
+        it.mask = HDI_FORMAT;
+        if (!SendMessageW(hdr, HDM_GETITEMW, i, (LPARAM)&it))
+            continue;
+        it.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
+        if (i == p->sort_col)
+            it.fmt |= p->sort_desc ? HDF_SORTDOWN : HDF_SORTUP;
+        SendMessageW(hdr, HDM_SETITEMW, i, (LPARAM)&it);
+    }
+}
+
+/* Sort a pane by column `col', reversing the order if that column was
+ * already the sort column, and refill its list. */
+static void sg_sort_column(SftpGui *g, HWND lv, int col)
+{
+    struct SgPane *p = (lv == g->rmt.list) ? &g->rmt : &g->lcl;
+
+    if (col < 0 || col > 3)
+        return;
+
+    if (p->sort_col == col) {
+        p->sort_desc = !p->sort_desc;
+    } else {
+        p->sort_col = col;
+        p->sort_desc = false;
+    }
+    sg_lv_fill(p, p->ents, p->nents);
+}
+
+static void sg_lv_fill(struct SgPane *p, struct SgEntry *ents, int n)
+{
+    HWND lv = p->list;
     LVITEMW item;
     char sizebuf[32], timebuf[32];
+
+    /*
+     * Put the entries into the pane's current sort order. Sorting the
+     * array keeps row indices meaning entry indices.
+     */
+    sg_sort_col = p->sort_col;
+    sg_sort_desc = p->sort_desc;
+    if (n > 1)
+        qsort(ents, n, sizeof(struct SgEntry), sg_fill_cmp);
 
     SendMessageW(lv, WM_SETREDRAW, FALSE, 0);
     SendMessageW(lv, LVM_DELETEALLITEMS, 0, 0);
@@ -1123,6 +1244,7 @@ static void sg_lv_fill(HWND lv, struct SgEntry *ents, int n)
 
     SendMessageW(lv, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(lv, NULL, TRUE);
+    sg_sort_arrows(p);
 }
 
 /* Index of the one selected row, -1 for none, -2 for several. */
@@ -1749,7 +1871,7 @@ static void sg_local_refresh(SftpGui *g)
     g->lcl.ents = ents;
     g->lcl.nents = n;
     sg_set_text(g->lcl.path, g->lcl.cwd);
-    sg_lv_fill(g->lcl.list, ents, n);
+    sg_lv_fill(&g->lcl, ents, n);
 }
 
 /* Move the local pane, keeping the old directory if it isn't readable. */
@@ -1773,7 +1895,7 @@ static void sg_local_goto(SftpGui *g, const char *path)
     g->lcl.ents = ents;
     g->lcl.nents = n;
     sg_set_text(g->lcl.path, abs);
-    sg_lv_fill(g->lcl.list, ents, n);
+    sg_lv_fill(&g->lcl, ents, n);
 }
 
 /* ----------------------------------------------------------------------
@@ -1800,7 +1922,7 @@ static void sg_remote_fill(SftpGui *g)
     g->rmt.nents = g->nrents;
     g->rents = NULL;
     g->nrents = g->rents_size = 0;
-    sg_lv_fill(g->rmt.list, g->rmt.ents, g->rmt.nents);
+    sg_lv_fill(&g->rmt, g->rmt.ents, g->rmt.nents);
 }
 
 static void sg_remote_refresh(SftpGui *g)
@@ -4635,6 +4757,16 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                 sg_list_activate(g, true);
             else if (nm->hwndFrom == g->rmt.list)
                 sg_list_activate(g, false);
+            return 0;
+        }
+        if (nm->code == LVN_COLUMNCLICK) {
+            /* A column header was clicked: sort that pane by it, or
+             * reverse the order if it was already the sort column. */
+            NMLISTVIEW *nmlv = (NMLISTVIEW *)lParam;
+
+            if (nmlv->hdr.hwndFrom == g->lcl.list ||
+                nmlv->hdr.hwndFrom == g->rmt.list)
+                sg_sort_column(g, nmlv->hdr.hwndFrom, (int)nmlv->iSubItem);
             return 0;
         }
         if (nm->code == LVN_BEGINLABELEDITW) {
