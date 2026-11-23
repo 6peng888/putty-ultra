@@ -143,12 +143,16 @@ struct WinGuiSeat {
 
     /*
      * Nonzero if this session was started by "Duplicate channel", i.e.
-     * it reuses an existing SSH connection instead of dialling its own.
-     * The value is the ordinal of this child session among the
-     * downstreams of that connection, fixed when the tab is created: it
-     * is shown in the tab's caption and does not change when the tabs
-     * are reordered.
+     * it reuses an existing SSH connection instead of dialling its own:
+     * `share_parent' is the tab whose connection this one reuses (a
+     * tab that is itself a child names the same upstream its parent
+     * did, never the parent), and `dup_index' is this child session's
+     * ordinal among that tab's children. Both are fixed when the tab is
+     * created and shown in its caption as "[parent:child]", the parent
+     * part following that tab's current number; they are cleared when
+     * the session stops being a child at all.
      */
+    struct WinGuiSeat *share_parent;
     int dup_index;
 
     int alt_numberpad_accumulator;

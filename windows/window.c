@@ -1235,24 +1235,49 @@ static const wchar_t *tab_base_name(const WinGuiSeat *wgs)
 }
 
 /*
- * The ordinal for a new downstream of the session captioned `name': one
- * more than the highest ordinal any open downstream of that session
- * already carries. Ordinals are given out once, when a tab is created,
- * and never change afterwards - in particular, dragging the tabs around
- * the strip does not renumber them, so a suffix always identifies the
- * same child session.
+ * The ordinal for a new child session of the tab `up': one more than
+ * the highest ordinal any open child of that tab already carries.
+ * Ordinals are given out once, when a tab is created, and are otherwise
+ * kept - in particular, dragging the tabs around the strip does not
+ * renumber them, so a suffix always identifies the same child session.
+ * The only way a tab loses its ordinal is by ceasing to be a child at
+ * all (see tab_drop_shared_identity).
  */
-static int next_dup_index(const wchar_t *name)
+static int next_child_index(WinGuiSeat *up)
 {
     int n = 0;
 
     for (int i = 0; i < tab_count; i++) {
         int d = tab_list[i]->dup_index;
 
-        if (d > n && !wcscmp(tab_base_name(tab_list[i]), name))
+        if (d > n && tab_list[i]->share_parent == up)
             n = d;
     }
     return n + 1;
+}
+
+/*
+ * A "Duplicate channel" tab is presented as a child session only for as
+ * long as it really is one. The dedicated listening socket it attached
+ * to is named after the upstream that owned it and a counter that is
+ * never reused, so once that connection has gone, the name can never be
+ * dialled again: a reconnect makes a connection of its own instead.
+ * Forget the dead name, so the reconnect doesn't try to attach to a
+ * socket that cannot exist, and the ordinal, so the tab is no longer
+ * captioned as a child session.
+ */
+static void tab_drop_shared_identity(WinGuiSeat *wgs)
+{
+    if (!wgs->share_parent && wgs->dup_index <= 0 &&
+        !*conf_get_str(wgs->conf, CONF_ssh_share_pipe))
+        return;
+
+    conf_set_str(wgs->conf, CONF_ssh_share_pipe, "");
+    if (wgs->share_parent || wgs->dup_index > 0) {
+        wgs->share_parent = NULL;
+        wgs->dup_index = 0;
+        tab_relayout();
+    }
 }
 
 /*
@@ -1263,8 +1288,12 @@ static int next_dup_index(const wchar_t *name)
  * 0/2 escape; a tab whose session wasn't opened from a saved one shows
  * the window title as before.
  *
- * A tab opened by "Duplicate channel" carries the ordinal of that
- * child session in square brackets after the name (see dup_index).
+ * A tab opened by "Duplicate channel" says which tab it reuses the
+ * connection of, and which of that tab's child sessions it is, in
+ * square brackets after the name: "name [parent:child]" (see
+ * share_parent and dup_index). The parent part is worked out here,
+ * from that tab's current position, so it follows the parent around
+ * when the tabs are reordered.
  *
  * Nothing about the text depends on whether the tab is the active one:
  * the active tab is indicated by its background instead (see the
@@ -1273,11 +1302,13 @@ static int next_dup_index(const wchar_t *name)
  */
 static void tab_label(int idx, wchar_t *buf, size_t buflen)
 {
-    const wchar_t *name = tab_base_name(tab_list[idx]);
-    int dup = tab_list[idx]->dup_index;
+    WinGuiSeat *wgs = tab_list[idx];
+    const wchar_t *name = tab_base_name(wgs);
+    int parent = wgs->share_parent ? tab_find(wgs->share_parent) : -1;
 
-    if (dup > 0)
-        _snwprintf(buf, buflen, L"%d: %s[%d]", idx + 1, name, dup);
+    if (parent >= 0 && wgs->dup_index > 0)
+        _snwprintf(buf, buflen, L"%d: %s [%d:%d]", idx + 1, name,
+                   parent + 1, wgs->dup_index);
     else
         _snwprintf(buf, buflen, L"%d: %s", idx + 1, name);
     buf[buflen - 1] = L'\0';
@@ -2694,13 +2725,21 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
 
                     /*
                      * If the new tab reuses the connection, number it
-                     * as the next child session of the same session.
-                     * The number is fixed from here on, so it keeps
+                     * as the next child session of the tab whose
+                     * connection it reuses. A downstream has no
+                     * connection of its own, so duplicating a child
+                     * attaches to the same upstream its parent did:
+                     * that upstream is its parent for numbering too,
+                     * and its caption names that tab, not this one.
+                     * Both parts are fixed from here on, so they keep
                      * identifying that child however the tabs are
                      * rearranged afterwards.
                      */
                     if (*conf_get_str(w->conf, CONF_ssh_share_pipe)) {
-                        w->dup_index = next_dup_index(tab_base_name(src));
+                        WinGuiSeat *up = src->share_parent
+                            ? src->share_parent : src;
+                        w->share_parent = up;
+                        w->dup_index = next_child_index(up);
                         tab_relayout();
                     }
                 }
@@ -3193,8 +3232,8 @@ static void new_session_finish(WinGuiSeat *wgs)
  * tab should fall back to showing the window title.
  *
  * Returns the session, so that a caller needing to set anything else
- * about it (such as the downstream ordinal of a "Duplicate channel"
- * tab) can do so.
+ * about it (such as the shared-connection identity of a "Duplicate
+ * channel" tab) can do so.
  */
 static WinGuiSeat *new_session(Conf *conf, const wchar_t *tab_name,
                                const char *sessname)
@@ -4629,6 +4668,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                     tab_list[i] = tab_list[i + 1];
                 tab_count--;
                 /*
+                 * Any tab that was reusing this session's connection
+                 * has lost it along with the session: the listening
+                 * socket it was attached to goes away with the
+                 * upstream. It is not a child session of anything any
+                 * more, so stop captioning it as one (a reconnect dials
+                 * a connection of its own).
+                 */
+                for (int i = 0; i < tab_count; i++) {
+                    if (tab_list[i]->share_parent == wgs) {
+                        tab_list[i]->share_parent = NULL;
+                        tab_list[i]->dup_index = 0;
+                    }
+                }
+                /*
                  * Removing a tab renumbers the ones after it, so a drag
                  * in progress no longer knows which tab it is dragging.
                  * Abandon it rather than drop some other tab somewhere
@@ -4756,6 +4809,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
           case IDM_RESTART:
           case IDM_RECONNECT:   /* sent to the active tab by the frame */
             if (!wgs->backend) {
+                /*
+                 * The connection is gone, so if this tab had been
+                 * reusing an upstream's connection, the reconnect below
+                 * dials a connection of its own: stop presenting it as
+                 * a child session of the original one.
+                 */
+                tab_drop_shared_identity(wgs);
                 lp_eventlog(&wgs->logpolicy, "----- Session restarted -----");
                 term_pwron(wgs->term, false);
             
