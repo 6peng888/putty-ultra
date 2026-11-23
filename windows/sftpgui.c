@@ -58,11 +58,13 @@
 #define SG_ID_L_UP       1102
 #define SG_ID_L_LIST     1103
 #define SG_ID_L_REFRESH  1104
+#define SG_ID_L_FILTER   1105
 #define SG_ID_R_LABEL    1110
 #define SG_ID_R_PATH     1111
 #define SG_ID_R_UP       1112
 #define SG_ID_R_LIST     1113
 #define SG_ID_R_REFRESH  1114
+#define SG_ID_R_FILTER   1115
 #define SG_ID_UPLOAD     1120
 #define SG_ID_DOWNLOAD   1121
 #define SG_ID_CANCEL     1123
@@ -192,9 +194,21 @@ struct SgEntry {
 
 struct SgPane {
     HWND label, path, up, refresh, list;
+    HWND filtlabel, filtbox;    /* the filter row above the list */
     char *cwd;                  /* UTF-8 */
+
+    /*
+     * 'all' is everything the directory holds; 'ents' is the part of
+     * it the filter lets through, and is what the list view shows. The
+     * split means clearing the filter needs no new directory read, and
+     * it keeps a row's index equal to its index in 'ents', which is
+     * what the selection and rename code assumes.
+     */
     struct SgEntry *ents;
     int nents, entsize;
+    struct SgEntry *all;
+    int nall;
+    char *filter;               /* UTF-8 text from the filter box */
 
     /* How this pane's list is sorted: 0 = Name, 1 = Size, 2 = Type,
      * 3 = Modified. Clicking a column's header sorts by it, and
@@ -1395,6 +1409,77 @@ static void sg_update_transfer_buttons(SftpGui *g)
 }
 
 /* ----------------------------------------------------------------------
+ * Filtering a pane.
+ *
+ * The box takes a plain piece of text - no wildcards, no regular
+ * expressions - and the pane then shows only the entries whose names
+ * contain it, ignoring ASCII case. ".." is always shown, so the pane
+ * can still be navigated when nothing matches.
+ */
+
+static unsigned sg_filter_fold(unsigned char c)
+{
+    return (c >= 'A' && c <= 'Z') ? (unsigned)(c + 'a' - 'A') : (unsigned)c;
+}
+
+/* Does 'name' contain 'filter'? An empty filter matches everything. */
+static bool sg_filter_match(const char *name, const char *filter)
+{
+    size_t fl, nl;
+
+    if (!filter || !*filter)
+        return true;
+
+    fl = strlen(filter);
+    nl = strlen(name);
+    for (size_t i = 0; i + fl <= nl; i++) {
+        size_t j = 0;
+
+        while (j < fl &&
+               sg_filter_fold((unsigned char)name[i + j]) ==
+               sg_filter_fold((unsigned char)filter[j]))
+            j++;
+        if (j == fl)
+            return true;
+    }
+    return false;
+}
+
+/* Rebuild the rows a pane shows from its filter, and refill the list. */
+static void sg_pane_refilter(SftpGui *g, struct SgPane *p)
+{
+    struct SgEntry *vis = NULL;
+    int n = 0, size = 0;
+
+    for (int i = 0; i < p->nall; i++) {
+        /* ".." is a way out of the directory, not an entry to hide. */
+        if (strcmp(p->all[i].name, "..") != 0 &&
+            !sg_filter_match(p->all[i].name, p->filter))
+            continue;
+        sg_entry_push(&vis, &n, &size, p->all[i].name, p->all[i].wname,
+                      p->all[i].size, p->all[i].mtime, p->all[i].is_dir);
+        vis[n-1].reparse = p->all[i].reparse;
+    }
+
+    sg_entries_free(p->ents, p->nents);
+    p->ents = vis;
+    p->nents = n;
+    sg_lv_fill(p, p->ents, p->nents);
+    if (g)
+        sg_update_transfer_buttons(g); /* refilling drops the selection */
+}
+
+/* Hand a freshly read directory to a pane; takes ownership of 'ents'. */
+static void sg_pane_set_all(SftpGui *g, struct SgPane *p,
+                            struct SgEntry *ents, int n)
+{
+    sg_entries_free(p->all, p->nall);
+    p->all = ents;
+    p->nall = n;
+    sg_pane_refilter(g, p);
+}
+
+/* ----------------------------------------------------------------------
  * The SSH channel the SFTP protocol runs over.
  */
 
@@ -1984,12 +2069,8 @@ static void sg_local_refresh(SftpGui *g)
         sfree(err);
         return;
     }
-    sg_entries_free(g->lcl.ents, g->lcl.nents);
-    g->lcl.ents = ents;
-    g->lcl.nents = n;
     sg_set_text(g->lcl.path, g->lcl.cwd);
-    sg_lv_fill(&g->lcl, ents, n);
-    sg_update_transfer_buttons(g);     /* refilling drops the selection */
+    sg_pane_set_all(g, &g->lcl, ents, n);
 }
 
 /* Move the local pane, keeping the old directory if it isn't readable. */
@@ -2022,14 +2103,10 @@ static void sg_local_goto(SftpGui *g, const char *path)
         sg_set_text(g->lcl.path, g->lcl.cwd);
         return;
     }
-    sg_entries_free(g->lcl.ents, g->lcl.nents);
     sfree(g->lcl.cwd);
     g->lcl.cwd = abs;
-    g->lcl.ents = ents;
-    g->lcl.nents = n;
     sg_set_text(g->lcl.path, abs);
-    sg_lv_fill(&g->lcl, ents, n);
-    sg_update_transfer_buttons(g);     /* refilling drops the selection */
+    sg_pane_set_all(g, &g->lcl, ents, n);
 }
 
 /* ----------------------------------------------------------------------
@@ -2047,17 +2124,18 @@ static void sg_remote_send_readdir(SftpGui *g)
 
 static void sg_remote_fill(SftpGui *g)
 {
+    struct SgEntry *ents;
+    int n;
+
     if (strcmp(g->rmt.cwd, "/") != 0)
         sg_entry_push(&g->rents, &g->nrents, &g->rents_size,
                       "..", NULL, 0, 0, true);
     qsort(g->rents, g->nrents, sizeof(struct SgEntry), sg_entry_cmp);
-    sg_entries_free(g->rmt.ents, g->rmt.nents);
-    g->rmt.ents = g->rents;
-    g->rmt.nents = g->nrents;
+    ents = g->rents;
+    n = g->nrents;
     g->rents = NULL;
     g->nrents = g->rents_size = 0;
-    sg_lv_fill(&g->rmt, g->rmt.ents, g->rmt.nents);
-    sg_update_transfer_buttons(g);     /* refilling drops the selection */
+    sg_pane_set_all(g, &g->rmt, ents, n);
 }
 
 static void sg_remote_refresh(SftpGui *g)
@@ -3876,6 +3954,79 @@ static void sg_watch_label_edit(HWND edit)
 }
 
 /* ----------------------------------------------------------------------
+ * The filter boxes above the two lists.
+ *
+ * Like the path boxes, they need their keys turned into characters by
+ * hand, since the message loop never translates any (see sg_type_key).
+ */
+
+static WNDPROC sg_filt_origproc;
+
+/* The window and pane a filter box belongs to, or NULL. */
+static SftpGui *sg_filt_find(HWND hwnd, bool *is_local)
+{
+    for (SftpGui *g = sg_windows; g; g = g->next) {
+        if (hwnd == g->lcl.filtbox) {
+            *is_local = true;
+            return g;
+        }
+        if (hwnd == g->rmt.filtbox) {
+            *is_local = false;
+            return g;
+        }
+    }
+    return NULL;
+}
+
+/* Take the text in a pane's filter box and show only what matches. */
+static void sg_filt_apply(SftpGui *g, bool is_local)
+{
+    struct SgPane *p = is_local ? &g->lcl : &g->rmt;
+    wchar_t buf[256];
+    char *txt;
+
+    if (!p->filtbox)
+        return;
+    GetWindowTextW(p->filtbox, buf, lenof(buf));
+    txt = sg_to_utf8(buf);
+    sfree(p->filter);
+    p->filter = txt;
+    sg_pane_refilter(g, p);
+}
+
+static LRESULT CALLBACK sg_filt_proc(HWND hwnd, UINT msg, WPARAM wParam,
+                                     LPARAM lParam)
+{
+    if (msg == WM_KEYDOWN) {
+        if (wParam == VK_RETURN || wParam == VK_ESCAPE) {
+            bool is_local;
+            SftpGui *g = sg_filt_find(hwnd, &is_local);
+
+            if (wParam == VK_ESCAPE) {
+                /* Empty the box: the whole directory shows again. */
+                SetWindowTextW(hwnd, L"");
+                if (g)
+                    sg_filt_apply(g, is_local);
+            } else if (g) {
+                /* Return hands the list back for selecting from. */
+                SetFocus(is_local ? g->lcl.list : g->rmt.list);
+            }
+            return 0;
+        }
+        sg_type_key(hwnd, wParam, lParam);
+    }
+    return CallWindowProcW(sg_filt_origproc, hwnd, msg, wParam, lParam);
+}
+
+static void sg_subclass_filter(struct SgPane *p)
+{
+    if (!p->filtbox)
+        return;
+    sg_filt_origproc = (WNDPROC)SetWindowLongPtrW(
+        p->filtbox, GWLP_WNDPROC, (LONG_PTR)sg_filt_proc);
+}
+
+/* ----------------------------------------------------------------------
  * The list views' context menu: upload/download, delete and rename.
  *
  * The same menu serves both panes. The transfer item is the one
@@ -4408,6 +4559,18 @@ static void sg_create_controls(SftpGui *g)
                            LVS_REPORT | LVS_SHOWSELALWAYS | LVS_EDITLABELS,
                            WS_EX_CLIENTEDGE, SG_ID_R_LIST);
 
+    /* One filter box per pane: each hides what it does not match. */
+    g->lcl.filtlabel = sg_child(g, L"STATIC", "Filter", SS_LEFT, 0, 0);
+    g->lcl.filtbox = sg_child(g, L"EDIT", "",
+                              ES_LEFT | ES_AUTOHSCROLL | WS_TABSTOP,
+                              WS_EX_CLIENTEDGE, SG_ID_L_FILTER);
+    sg_subclass_filter(&g->lcl);
+    g->rmt.filtlabel = sg_child(g, L"STATIC", "Filter", SS_LEFT, 0, 0);
+    g->rmt.filtbox = sg_child(g, L"EDIT", "",
+                              ES_LEFT | ES_AUTOHSCROLL | WS_TABSTOP,
+                              WS_EX_CLIENTEDGE, SG_ID_R_FILTER);
+    sg_subclass_filter(&g->rmt);
+
     ListView_SetExtendedListViewStyle(
         g->lcl.list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
     ListView_SetExtendedListViewStyle(
@@ -4441,7 +4604,7 @@ static void sg_layout(SftpGui *g)
     int W, H, m = 8, gap = 6, row = 24, midw = 96, prog_h = 16;
     int upw = 28, rfw = 52;    /* the ".." and Refresh buttons */
     int pane_w, left_x, right_x, list_y, list_h, prog_y, status_y, bx, by;
-    int namew, total_w;
+    int filter_y, namew, total_w;
     int i;
 
     GetClientRect(g->hwnd, &rc);
@@ -4457,7 +4620,8 @@ static void sg_layout(SftpGui *g)
 
     status_y = H - m - row;
     prog_y = status_y - gap - prog_h;
-    list_y = m + row + gap;
+    filter_y = m + row + gap;
+    list_y = filter_y + row + gap;
     list_h = prog_y - gap - list_y;
     if (list_h < 60)
         list_h = 60;
@@ -4472,6 +4636,8 @@ static void sg_layout(SftpGui *g)
              pane_w - 48 - upw - 2 - rfw - 2, row + 220);
     sg_place(g->lcl.refresh, left_x + pane_w - upw - 2 - rfw, m, rfw, row);
     sg_place(g->lcl.up, left_x + pane_w - upw, m, upw, row);
+    sg_place(g->lcl.filtlabel, left_x, filter_y, 46, row);
+    sg_place(g->lcl.filtbox, left_x + 48, filter_y, pane_w - 48, row);
     sg_place(g->lcl.list, left_x, list_y, pane_w, list_h);
 
     sg_place(g->rmt.label, right_x, m, 46, row);
@@ -4479,6 +4645,8 @@ static void sg_layout(SftpGui *g)
              pane_w - 48 - upw - 2 - rfw - 2, row + 220);
     sg_place(g->rmt.refresh, right_x + pane_w - upw - 2 - rfw, m, rfw, row);
     sg_place(g->rmt.up, right_x + pane_w - upw, m, upw, row);
+    sg_place(g->rmt.filtlabel, right_x, filter_y, 46, row);
+    sg_place(g->rmt.filtbox, right_x + 48, filter_y, pane_w - 48, row);
     sg_place(g->rmt.list, right_x, list_y, pane_w, list_h);
 
     bx = m + pane_w + gap;
@@ -4560,7 +4728,11 @@ static void sg_free(SftpGui *g, bool channel_still_ours)
         g->sftpc = NULL;
     }
     sg_entries_free(g->lcl.ents, g->lcl.nents);
+    sg_entries_free(g->lcl.all, g->lcl.nall);
+    sfree(g->lcl.filter);
     sg_entries_free(g->rmt.ents, g->rmt.nents);
+    sg_entries_free(g->rmt.all, g->rmt.nall);
+    sfree(g->rmt.filter);
     sg_entries_free(g->rents, g->nrents);
     for (int i = 0; i < g->lcl.ncbpath; i++)
         sfree(g->lcl.cbpath[i]);
@@ -4804,6 +4976,15 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             return 0;
           case SG_ID_R_REFRESH:
             sg_remote_refresh(g);
+            return 0;
+
+          case SG_ID_L_FILTER:
+            if (HIWORD(wParam) == EN_CHANGE)
+                sg_filt_apply(g, true);
+            return 0;
+          case SG_ID_R_FILTER:
+            if (HIWORD(wParam) == EN_CHANGE)
+                sg_filt_apply(g, false);
             return 0;
 
           case SG_ID_L_PATH:
