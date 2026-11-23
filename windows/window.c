@@ -606,6 +606,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 
     setup_gui_timing();
 
+    /*
+     * Make sure the local secret key used to encrypt saved passwords
+     * exists. This is normally the first time the program has run, so
+     * this is where the key file is generated.
+     */
+    init_local_secret_key();
+
     WinGuiSeat *wgs = snew(WinGuiSeat);
     memset(wgs, 0, sizeof(*wgs));
     wgs_link(wgs);
@@ -8481,7 +8488,9 @@ static bool win_seat_eof(Seat *seat)
 static SeatPromptResult win_seat_configured_password(WinGuiSeat *wgs,
                                                      prompts_t *p)
 {
-    const char *password;
+    const char *password, *use;
+    char *decrypted = NULL;
+    bool ok = true;
 
     if (wgs->tried_configured_password || !wgs->conf)
         return SPR_INCOMPLETE;
@@ -8498,9 +8507,31 @@ static SeatPromptResult win_seat_configured_password(WinGuiSeat *wgs,
     if (p->n_prompts != 1 || p->prompts[0]->echo || !p->to_server)
         return SPR_INCOMPLETE;
 
-    wgs->tried_configured_password = true;
-    prompt_set_result(p->prompts[0], password);
-    return SPR_OK;
+    /*
+     * The stored password is normally encrypted with the local secret
+     * key; decrypt it now, at the moment we actually need it to log
+     * in. If we can't (e.g. the session file came from another
+     * machine, so we don't have its key), don't try to connect with
+     * nonsense: fall back to the interactive password prompt.
+     */
+    use = password;
+    if (local_secret_is_encrypted(password)) {
+        decrypted = local_secret_decrypt(password);
+        if (!decrypted)
+            ok = false;
+        else
+            use = decrypted;
+    }
+
+    if (ok) {
+        wgs->tried_configured_password = true;
+        prompt_set_result(p->prompts[0], use);
+    }
+
+    if (decrypted)
+        burnstr(decrypted);
+
+    return ok ? SPR_OK : SPR_INCOMPLETE;
 }
 
 static SeatPromptResult win_seat_get_userpass_input(Seat *seat, prompts_t *p)

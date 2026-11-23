@@ -796,6 +796,30 @@ int remove_from_jumplist_registry(const char *item);
 char *get_jumplist_registry_entries(void);
 
 /*
+ * The local secret key used to encrypt passwords in saved sessions,
+ * and the encryption and decryption functions built on it. All of
+ * these live in storage.c.
+ *
+ * init_local_secret_key() loads the key from
+ * %APPDATA%\PuTTY\local_secret.key, generating a fresh 32-byte key if
+ * the file doesn't exist yet. It returns false if no key could be made
+ * available (in which case passwords are stored in plaintext).
+ *
+ * local_secret_encrypt() returns a newly allocated encrypted form of a
+ * password, or NULL if the key isn't available.
+ *
+ * local_secret_is_encrypted() tells whether a stored value is in the
+ * encrypted form. local_secret_decrypt() returns the plaintext in a
+ * newly allocated string, or NULL if the value isn't encrypted or
+ * can't be decrypted with the current key. Wipe the result with
+ * burnstr() when finished.
+ */
+bool init_local_secret_key(void);
+bool local_secret_is_encrypted(const char *value);
+char *local_secret_encrypt(const char *plaintext);
+char *local_secret_decrypt(const char *stored);
+
+/*
  * Windows clipboard-UI wording.
  */
 #define CLIPNAME_IMPLICIT "Last selected text"

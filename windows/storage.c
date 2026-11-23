@@ -54,6 +54,16 @@ DECL_WINDOWS_FUNCTION(static, HRESULT, SHGetFolderPathA,
 #define SESSIONS_ORDER    "PuTTY\\.sessions-order"
 #define SESSIONS_EXPANDED "PuTTY\\.sessions-expanded"
 
+/*
+ * The local secret key used to encrypt saved passwords; see the long
+ * comment at the end of this file.
+ */
+#define SECRET_KEY_SUBPATH  "PuTTY\\local_secret.key"
+#define SECRET_KEY_BYTES    32
+#define PASSWORD_PREFIX     "AES1:"
+#define PASSWORD_PREFIX_LEN (sizeof(PASSWORD_PREFIX) - 1)
+#define PASSWORD_BLOCKLEN   16
+
 static void migrate_registry_sessions_if_needed(void);
 static void migrate_registry_session(HKEY parent, const char *subname,
                                      const char *sessionname);
@@ -432,8 +442,27 @@ settings_w *open_settings_w(const char *sessionname, char **errmsg)
 
 void write_setting_s(settings_w *handle, const char *key, const char *value)
 {
-    if (handle)
-        put_setting_line(handle->body, key, value);
+    if (!handle)
+        return;
+
+    /*
+     * The saved password is stored encrypted, using the local secret
+     * key. If it's already in encrypted form (that is, a saved session
+     * has been loaded into the config box and saved again without the
+     * password being changed), leave it exactly as it is, so that we
+     * don't encrypt the ciphertext a second time.
+     */
+    if (!strcmp(key, "Password") && *value &&
+        !local_secret_is_encrypted(value)) {
+        char *encrypted = local_secret_encrypt(value);
+        if (encrypted) {
+            put_setting_line(handle->body, key, encrypted);
+            burnstr(encrypted);
+            return;
+        }
+    }
+
+    put_setting_line(handle->body, key, value);
 }
 
 void write_setting_i(settings_w *handle, const char *key, int value)
@@ -1943,6 +1972,17 @@ void cleanup_all(void)
             DeleteFile(path);
             sfree(path);
         }
+
+        /*
+         * Delete the local secret key too: with the sessions that were
+         * encrypted with it gone, it has no further use, and leaving it
+         * behind would be a lingering secret.
+         */
+        path = appdata_subpath(SECRET_KEY_SUBPATH);
+        if (path) {
+            DeleteFile(path);
+            sfree(path);
+        }
     }
 
     /* ------------------------------------------------------------
@@ -1985,4 +2025,363 @@ void cleanup_all(void)
     /*
      * Now we're done.
      */
+}
+
+/* ======================================================================
+ * Local secret key, and encryption of saved passwords.
+ *
+ * The Password setting of a saved session is written out encrypted,
+ * so that anyone who can read the session file can't simply read the
+ * password out of it. The key used for that lives in
+ *
+ *     %APPDATA%\PuTTY\local_secret.key
+ *
+ * and is 32 random bytes, generated the first time PuTTY needs it
+ * (normally at startup, or the first time a password is saved).
+ *
+ * Passwords are encrypted with AES-256 in CBC mode, with a fresh
+ * random IV for each one. The stored value is
+ *
+ *     AES1:<base64 of IV || ciphertext>
+ *
+ * so it's a single safe `keyword=value' line, and it's easy to tell an
+ * encrypted password from a plaintext one (for backward compatibility
+ * with sessions saved before this feature existed).
+ *
+ * The key is never used to decrypt anything until the moment a real
+ * connection needs the password: the Conf holds the encrypted form for
+ * as long as the session is merely being edited or saved.
+ * ====================================================================== */
+
+/* The bits of bcrypt.dll we use. Loading it dynamically avoids making
+ * every consumer of storage.c link against it. (The declarations below
+ * are compatible with those in <bcrypt.h>, which gets included
+ * indirectly by some of the Windows headers.) */
+
+DECL_WINDOWS_FUNCTION(static, LONG, BCryptOpenAlgorithmProvider,
+                      (void **, const wchar_t *, const wchar_t *,
+                       unsigned long));
+DECL_WINDOWS_FUNCTION(static, LONG, BCryptCloseAlgorithmProvider,
+                      (void *, unsigned long));
+DECL_WINDOWS_FUNCTION(static, LONG, BCryptGetProperty,
+                      (void *, const wchar_t *, unsigned char *,
+                       unsigned long, unsigned long *, unsigned long));
+DECL_WINDOWS_FUNCTION(static, LONG, BCryptSetProperty,
+                      (void *, const wchar_t *, unsigned char *,
+                       unsigned long, unsigned long));
+DECL_WINDOWS_FUNCTION(static, LONG, BCryptGenerateSymmetricKey,
+                      (void *, void **, unsigned char *, unsigned long,
+                       unsigned char *, unsigned long, unsigned long));
+DECL_WINDOWS_FUNCTION(static, LONG, BCryptDestroyKey, (void *));
+DECL_WINDOWS_FUNCTION(static, LONG, BCryptEncrypt,
+                      (void *, unsigned char *, unsigned long, void *,
+                       unsigned char *, unsigned long, unsigned char *,
+                       unsigned long, unsigned long *, unsigned long));
+DECL_WINDOWS_FUNCTION(static, LONG, BCryptDecrypt,
+                      (void *, unsigned char *, unsigned long, void *,
+                       unsigned char *, unsigned long, unsigned char *,
+                       unsigned long, unsigned long *, unsigned long));
+DECL_WINDOWS_FUNCTION(static, LONG, BCryptGenRandom,
+                      (void *, unsigned char *, unsigned long, unsigned long));
+
+static bool bcrypt_loaded = false;
+static HMODULE bcrypt_module = NULL;
+
+static bool load_bcrypt(void)
+{
+    if (!bcrypt_loaded) {
+        bcrypt_loaded = true;
+        bcrypt_module = load_system32_dll("bcrypt.dll");
+        if (bcrypt_module) {
+            GET_WINDOWS_FUNCTION(bcrypt_module, BCryptOpenAlgorithmProvider);
+            GET_WINDOWS_FUNCTION(bcrypt_module, BCryptCloseAlgorithmProvider);
+            GET_WINDOWS_FUNCTION(bcrypt_module, BCryptGetProperty);
+            GET_WINDOWS_FUNCTION(bcrypt_module, BCryptSetProperty);
+            GET_WINDOWS_FUNCTION(bcrypt_module, BCryptGenerateSymmetricKey);
+            GET_WINDOWS_FUNCTION(bcrypt_module, BCryptDestroyKey);
+            GET_WINDOWS_FUNCTION(bcrypt_module, BCryptEncrypt);
+            GET_WINDOWS_FUNCTION(bcrypt_module, BCryptDecrypt);
+            GET_WINDOWS_FUNCTION(bcrypt_module, BCryptGenRandom);
+        }
+    }
+
+    return bcrypt_module &&
+        p_BCryptOpenAlgorithmProvider && p_BCryptCloseAlgorithmProvider &&
+        p_BCryptGetProperty && p_BCryptSetProperty &&
+        p_BCryptGenerateSymmetricKey && p_BCryptDestroyKey &&
+        p_BCryptEncrypt && p_BCryptDecrypt && p_BCryptGenRandom;
+}
+
+static bool bcrypt_random_bytes(unsigned char *buf, size_t len)
+{
+    if (!load_bcrypt())
+        return false;
+
+    return p_BCryptGenRandom(NULL, buf, (unsigned long)len,
+                             BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
+}
+
+/*
+ * AES-256-CBC over a whole number of blocks, in place. Returns false if
+ * anything goes wrong (including the crypto provider not being
+ * available at all).
+ */
+static bool aes256_cbc_crypt(bool encrypt, const unsigned char *key,
+                             const unsigned char *iv,
+                             unsigned char *data, size_t len)
+{
+    void *alg = NULL, *hkey = NULL;
+    unsigned char *keyobj = NULL;
+    unsigned char outiv[PASSWORD_BLOCKLEN];
+    unsigned char *out;
+    unsigned long objsize = 0, outlen = 0;
+    LONG status;
+    bool ok = false;
+
+    if (len == 0 || len % PASSWORD_BLOCKLEN != 0)
+        return false;
+    if (!load_bcrypt())
+        return false;
+
+    memcpy(outiv, iv, sizeof(outiv));
+    out = snewn(len, unsigned char);
+
+    if (p_BCryptOpenAlgorithmProvider(&alg, L"AES", NULL, 0) != 0)
+        goto out;
+
+    if (p_BCryptSetProperty(alg, L"ChainingMode",
+                            (unsigned char *)L"ChainingModeCBC",
+                            sizeof(L"ChainingModeCBC"), 0) != 0)
+        goto out;
+
+    if (p_BCryptGetProperty(alg, L"ObjectLength", (unsigned char *)&objsize,
+                            sizeof(objsize), &outlen, 0) != 0)
+        goto out;
+
+    keyobj = snewn(objsize, unsigned char);
+    if (p_BCryptGenerateSymmetricKey(alg, &hkey, keyobj, objsize,
+                                     (unsigned char *)key,
+                                     SECRET_KEY_BYTES, 0) != 0)
+        goto out;
+
+    if (encrypt) {
+        status = p_BCryptEncrypt(hkey, data, (unsigned long)len, NULL,
+                                 outiv, sizeof(outiv), out,
+                                 (unsigned long)len, &outlen, 0);
+    } else {
+        status = p_BCryptDecrypt(hkey, data, (unsigned long)len, NULL,
+                                 outiv, sizeof(outiv), out,
+                                 (unsigned long)len, &outlen, 0);
+    }
+
+    if (status == 0 && outlen == len) {
+        memcpy(data, out, len);
+        ok = true;
+    }
+
+  out:
+    if (hkey)
+        p_BCryptDestroyKey(hkey);
+    if (keyobj) {
+        smemclr(keyobj, objsize);
+        sfree(keyobj);
+    }
+    if (alg)
+        p_BCryptCloseAlgorithmProvider(alg, 0);
+    smemclr(outiv, sizeof(outiv));
+    smemclr(out, len);
+    sfree(out);
+    return ok;
+}
+
+/*
+ * The cached contents of the local secret key file. Loading it (and
+ * generating it if it doesn't exist yet) is attempted only once per
+ * process, unless it fails, in which case we'll try again next time.
+ */
+static bool secret_key_tried = false;
+static bool secret_key_ok = false;
+static unsigned char secret_key[SECRET_KEY_BYTES];
+
+static bool read_secret_key_file(void)
+{
+    char *path = appdata_subpath(SECRET_KEY_SUBPATH);
+    bool ok = false;
+
+    if (path) {
+        HANDLE f = CreateFile(path, GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (f != INVALID_HANDLE_VALUE) {
+            DWORD got = 0;
+            ok = ReadFile(f, secret_key, SECRET_KEY_BYTES, &got, NULL) &&
+                got == SECRET_KEY_BYTES;
+            CloseHandle(f);
+        }
+        sfree(path);
+    }
+
+    return ok;
+}
+
+static bool write_secret_key_file(const unsigned char *key)
+{
+    char *path = appdata_subpath(SECRET_KEY_SUBPATH);
+    char *tmp = path ? dupcat(path, ".tmp") : NULL;
+    bool ok = false;
+
+    if (path && tmp) {
+        char *dir = appdata_subpath("PuTTY");
+        if (dir) {
+            create_dir_tree(dir);
+            sfree(dir);
+        }
+
+        /*
+         * Write to a temporary file and rename it into place, so that
+         * an interrupted write can't leave a truncated key behind: if
+         * that happened, every password encrypted with the old key
+         * would become undecryptable.
+         */
+        HANDLE f = CreateFile(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, NULL);
+        if (f != INVALID_HANDLE_VALUE) {
+            DWORD wrote = 0;
+            ok = WriteFile(f, key, SECRET_KEY_BYTES, &wrote, NULL) &&
+                wrote == SECRET_KEY_BYTES;
+            CloseHandle(f);
+            if (ok)
+                ok = MoveFileEx(tmp, path, MOVEFILE_REPLACE_EXISTING);
+            if (!ok)
+                DeleteFile(tmp);
+        }
+    }
+
+    sfree(tmp);
+    sfree(path);
+    return ok;
+}
+
+static const unsigned char *get_secret_key(void)
+{
+    if (!secret_key_tried) {
+        secret_key_tried = true;
+
+        if (read_secret_key_file()) {
+            secret_key_ok = true;
+        } else {
+            /*
+             * No usable key file yet, so this must be the first time
+             * PuTTY has run (or the file has been damaged): invent a
+             * fresh key and store it. If installing it fails, another
+             * instance may have won the race to create the file, so
+             * try reading it back and use that key instead.
+             */
+            if (bcrypt_random_bytes(secret_key, SECRET_KEY_BYTES) &&
+                (write_secret_key_file(secret_key) ||
+                 read_secret_key_file())) {
+                secret_key_ok = true;
+            } else {
+                smemclr(secret_key, sizeof(secret_key));
+            }
+        }
+    }
+
+    return secret_key_ok ? secret_key : NULL;
+}
+
+bool init_local_secret_key(void)
+{
+    return get_secret_key() != NULL;
+}
+
+bool local_secret_is_encrypted(const char *value)
+{
+    return value && !strncmp(value, PASSWORD_PREFIX, PASSWORD_PREFIX_LEN);
+}
+
+char *local_secret_encrypt(const char *plaintext)
+{
+    const unsigned char *key = get_secret_key();
+    size_t len, padlen, clen;
+    unsigned char *blob;
+    strbuf *b64;
+    char *ret;
+
+    if (!key)
+        return NULL;
+
+    len = strlen(plaintext);
+    padlen = PASSWORD_BLOCKLEN - len % PASSWORD_BLOCKLEN;
+    clen = len + padlen;
+
+    blob = snewn(PASSWORD_BLOCKLEN + clen, unsigned char);
+
+    /* Fresh random IV, stored alongside the ciphertext. */
+    if (!bcrypt_random_bytes(blob, PASSWORD_BLOCKLEN)) {
+        smemclr(blob, PASSWORD_BLOCKLEN + clen);
+        sfree(blob);
+        return NULL;
+    }
+
+    memcpy(blob + PASSWORD_BLOCKLEN, plaintext, len);
+    memset(blob + PASSWORD_BLOCKLEN + len, (int)padlen, padlen);
+
+    if (!aes256_cbc_crypt(true, key, blob, blob + PASSWORD_BLOCKLEN, clen)) {
+        smemclr(blob, PASSWORD_BLOCKLEN + clen);
+        sfree(blob);
+        return NULL;
+    }
+
+    b64 = base64_encode_sb(
+        make_ptrlen(blob, PASSWORD_BLOCKLEN + clen), 0);
+    ret = dupcat(PASSWORD_PREFIX, b64->s);
+
+    strbuf_free(b64);
+    smemclr(blob, PASSWORD_BLOCKLEN + clen);
+    sfree(blob);
+    return ret;
+}
+
+char *local_secret_decrypt(const char *stored)
+{
+    const unsigned char *key;
+    strbuf *blob;
+    char *ret = NULL;
+    size_t bodylen = 0, plen;
+    unsigned char padlen;
+    bool good;
+
+    if (!local_secret_is_encrypted(stored))
+        return NULL;
+
+    key = get_secret_key();
+    if (!key)
+        return NULL;
+
+    blob = base64_decode_sb(
+        ptrlen_from_asciz(stored + PASSWORD_PREFIX_LEN));
+
+    if (blob->len >= 2 * PASSWORD_BLOCKLEN &&
+        (bodylen = blob->len - PASSWORD_BLOCKLEN) % PASSWORD_BLOCKLEN == 0 &&
+        aes256_cbc_crypt(false, key, (unsigned char *)blob->s,
+                         (unsigned char *)blob->s + PASSWORD_BLOCKLEN,
+                         bodylen)) {
+        /* Strip and verify the PKCS#7 padding. */
+        padlen = (unsigned char)blob->s[blob->len - 1];
+        good = (padlen >= 1 && padlen <= PASSWORD_BLOCKLEN);
+        for (size_t i = 0; good && i < padlen; i++)
+            good = ((unsigned char)blob->s[blob->len - 1 - i] == padlen);
+
+        if (good) {
+            plen = bodylen - padlen;
+            ret = snewn(plen + 1, char);
+            memcpy(ret, blob->s + PASSWORD_BLOCKLEN, plen);
+            ret[plen] = '\0';
+        }
+    }
+
+    smemclr(blob->s, blob->len);
+    strbuf_free(blob);
+    return ret;
 }

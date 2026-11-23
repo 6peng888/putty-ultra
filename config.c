@@ -2852,8 +2852,9 @@ void setup_config_box(struct controlbox *b, bool midsession,
              * The password to use for password authentication, so that
              * the user doesn't have to be prompted for it. This is the
              * same thing as the -pw command-line option, except that it
-             * is stored with the session - in plain text, so it should
-             * only be used where that's acceptable.
+             * is stored with the session - encrypted with the local
+             * secret key in %APPDATA%\PuTTY\local_secret.key, and
+             * decrypted only when a connection actually needs it.
              */
             c = ctrl_editbox(s, "Password", 'p', 50,
                              HELPCTX(connection_password),
