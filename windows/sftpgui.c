@@ -779,6 +779,80 @@ static char *sg_local_list(const char *cwd,
     return err;
 }
 
+/*
+ * Follow a junction or symbolic link to the directory it names, or
+ * return NULL if the path is not one, or cannot be resolved.
+ *
+ * The compatibility junctions in a user profile - "My Documents",
+ * "Application Data" and their friends - carry a deny-read ACE of
+ * their own (see the "My Documents: Error 5" case), so the directory
+ * behind them cannot be listed through the junction at all. Opening
+ * the junction with no access still works, and the name the handle
+ * resolves to is the real directory, which is where the pane should
+ * go instead.
+ */
+static char *sg_local_reparse_target(const char *path)
+{
+    wchar_t *w = sg_w(path), *buf;
+    const wchar_t *use;
+    DWORD attr, len, cap;
+    HANDLE h;
+    char *ret = NULL;
+
+    attr = GetFileAttributesW(w);
+    if (attr == INVALID_FILE_ATTRIBUTES ||
+        !(attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        sfree(w);
+        return NULL;
+    }
+
+    h = CreateFileW(w, 0, FILE_SHARE_READ | FILE_SHARE_WRITE |
+                    FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        sfree(w);
+        return NULL;
+    }
+
+    cap = 64;
+    buf = snewn(cap, wchar_t);
+    while ((len = GetFinalPathNameByHandleW(h, buf, cap,
+                                            FILE_NAME_NORMALIZED)) >= cap) {
+        sfree(buf);
+        cap = len + 1;
+        buf = snewn(cap, wchar_t);
+    }
+    CloseHandle(h);
+    if (!len) {
+        sfree(buf);
+        sfree(w);
+        return NULL;
+    }
+
+    /* The name comes back in the \\?\ form: unwrap it. */
+    use = buf;
+    if (!wcsncmp(buf, L"\\\\?\\UNC\\", 8)) {
+        size_t n = wcslen(buf + 8);
+        wchar_t *u = snewn(n + 3, wchar_t);
+
+        u[0] = u[1] = L'\\';
+        memcpy(u + 2, buf + 8, (n + 1) * sizeof(wchar_t));
+        sfree(buf);
+        buf = u;
+        use = buf;
+    } else if (!wcsncmp(buf, L"\\\\?\\", 4) || !wcsncmp(buf, L"\\??\\", 4)) {
+        use = buf + 4;
+    }
+
+    /* Nothing is gained if the path resolves to itself. */
+    if (wcscmp(use, w))
+        ret = sg_to_utf8(use);
+
+    sfree(buf);
+    sfree(w);
+    return ret;
+}
+
 /* ----------------------------------------------------------------------
  * List view plumbing.
  */
@@ -1926,6 +2000,21 @@ static void sg_local_goto(SftpGui *g, const char *path)
     int n = 0;
     char *err = sg_local_list(abs, &ents, &n);
 
+    if (err) {
+        /*
+         * A compatibility junction such as "My Documents" refuses to
+         * be listed through; go to the directory it points at instead,
+         * which is what the user meant by clicking it.
+         */
+        char *tgt = sg_local_reparse_target(abs);
+
+        if (tgt) {
+            sfree(err);
+            sfree(abs);
+            abs = tgt;
+            err = sg_local_list(abs, &ents, &n);
+        }
+    }
     if (err) {
         sg_status(g, err);
         sfree(err);
