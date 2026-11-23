@@ -134,6 +134,14 @@ struct WinGuiSeat {
     wchar_t *tab_name;
 
     /*
+     * The full name of the saved session this one was started from, with
+     * its folder prefix intact, or NULL: the file-transfer window keys
+     * its path bookmarks on it. A duplicate of the session keeps the
+     * same name, since it is the same session as far as bookmarks go.
+     */
+    char *sessname;
+
+    /*
      * Nonzero if this session was started by "Duplicate channel", i.e.
      * it reuses an existing SSH connection instead of dialling its own.
      * The value is the ordinal of this child session among the

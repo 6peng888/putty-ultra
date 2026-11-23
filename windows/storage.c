@@ -1098,6 +1098,136 @@ void write_expanded_folders(strbuf *data)
     write_arrangement_file(SESSIONS_EXPANDED, data);
 }
 
+/* ======================================================================
+ * Path bookmarks for the file-transfer window.
+ *
+ * The bookmarks belong to a saved session - each one has its own list
+ * for the local pane and for the remote one - and are kept in the same
+ * directory as the session arrangement files, in one file holding every
+ * session's entries.
+ *
+ * The file is a sequence of NUL-terminated records, each starting with
+ * a letter saying what it is: 'S' starts a session and names it, 'L' is
+ * a local bookmark and 'R' a remote one. Records are positional only in
+ * so far as they follow the 'S' they belong to; anything before the
+ * first 'S' is ignored.
+ * ====================================================================== */
+
+#define SFTP_BOOKMARKS    "PuTTY\\.sftp-bookmarks"
+
+/* Visit every record of the bookmarks file. */
+typedef void (*bookmark_record_fn)(void *ctx, const char *rec, size_t len);
+
+static void scan_bookmark_records(strbuf *sb, bookmark_record_fn fn, void *ctx)
+{
+    const char *p, *end;
+
+    if (!sb)
+        return;
+
+    p = sb->s;
+    end = sb->s + sb->len;
+    while (p < end) {
+        const char *z = memchr(p, '\0', (size_t)(end - p));
+        size_t len = z ? (size_t)(z - p) : (size_t)(end - p);
+
+        if (len)
+            fn(ctx, p, len);
+        p += len + 1;
+    }
+}
+
+struct bm_read_ctx {
+    const char *session;
+    bool inside;
+    strbuf *out;
+};
+
+static void bm_read_record(void *vctx, const char *rec, size_t len)
+{
+    struct bm_read_ctx *ctx = (struct bm_read_ctx *)vctx;
+
+    if (rec[0] == 'S') {
+        ctx->inside = (strlen(ctx->session) == len - 1 &&
+                       !memcmp(rec + 1, ctx->session, len - 1));
+    } else if (ctx->inside && (rec[0] == 'L' || rec[0] == 'R')) {
+        if (!ctx->out)
+            ctx->out = strbuf_new();
+        put_data(ctx->out, rec, len + 1);
+    }
+}
+
+strbuf *read_sftp_bookmarks(const char *session)
+{
+    strbuf *all, *ret;
+    struct bm_read_ctx ctx;
+
+    if (!session || !*session)
+        return NULL;
+
+    all = read_arrangement_file(SFTP_BOOKMARKS);
+    ctx.session = session;
+    ctx.inside = false;
+    ctx.out = NULL;
+    scan_bookmark_records(all, bm_read_record, &ctx);
+    if (all)
+        strbuf_free(all);
+
+    ret = ctx.out;
+    return ret;
+}
+
+struct bm_write_ctx {
+    const char *session;
+    bool inside;
+    strbuf *out;
+};
+
+static void bm_write_record(void *vctx, const char *rec, size_t len)
+{
+    struct bm_write_ctx *ctx = (struct bm_write_ctx *)vctx;
+
+    if (rec[0] == 'S') {
+        ctx->inside = (strlen(ctx->session) == len - 1 &&
+                       !memcmp(rec + 1, ctx->session, len - 1));
+        if (ctx->inside)
+            return;                    /* its entries are rewritten below */
+    } else if (ctx->inside) {
+        if (rec[0] == 'L' || rec[0] == 'R')
+            return;                    /* replaced by the new list */
+    }
+    put_data(ctx->out, rec, len);
+    put_byte(ctx->out, '\0');
+}
+
+void write_sftp_bookmarks(const char *session, strbuf *entries)
+{
+    strbuf *all, *out;
+    struct bm_write_ctx ctx;
+
+    if (!session || !*session)
+        return;
+
+    all = read_arrangement_file(SFTP_BOOKMARKS);
+    out = strbuf_new();
+    ctx.session = session;
+    ctx.inside = false;
+    ctx.out = out;
+    scan_bookmark_records(all, bm_write_record, &ctx);
+    if (all)
+        strbuf_free(all);
+
+    if (entries && entries->len) {
+        put_byte(out, 'S');
+        put_data(out, session, strlen(session));
+        put_byte(out, '\0');
+        put_data(out, entries->s, entries->len);
+    }
+
+    write_arrangement_file(SFTP_BOOKMARKS, out);
+    strbuf_free(out);
+}
+
 /*
  * Copy a session out of the Registry and into a file, and then record
  * that we've done that, so we never do it again unless the marker file

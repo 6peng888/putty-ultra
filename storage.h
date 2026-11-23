@@ -103,6 +103,20 @@ void write_sessions_order(strbuf *data);
 strbuf *read_expanded_folders(void);
 void write_expanded_folders(strbuf *data);
 
+/*
+ * The directory bookmarks of the file-transfer window, kept per saved
+ * session. Each session has its own lists for the local pane and for
+ * the remote one.
+ *
+ * read returns that session's entries as NUL-terminated strings, each
+ * prefixed with 'L' or 'R' to say which pane it belongs to - or NULL if
+ * the session has none. The caller frees what it gets back. write
+ * replaces that session's entries with the given ones (in the same
+ * form) and leaves every other session's alone.
+ */
+strbuf *read_sftp_bookmarks(const char *session);
+void write_sftp_bookmarks(const char *session, strbuf *entries);
+
 /* ----------------------------------------------------------------------
  * Functions to access PuTTY's host key database.
  */

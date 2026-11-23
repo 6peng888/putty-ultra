@@ -31,6 +31,7 @@
 
 #include "putty.h"
 #include "i18n.h"
+#include "storage.h"           /* read_sftp_bookmarks: the saved paths */
 #include "ssh.h"
 #include "ssh/channel.h"
 #include "ssh/sftp.h"
@@ -59,12 +60,14 @@
 #define SG_ID_L_LIST     1103
 #define SG_ID_L_REFRESH  1104
 #define SG_ID_L_FILTER   1105
+#define SG_ID_L_BMARK    1106
 #define SG_ID_R_LABEL    1110
 #define SG_ID_R_PATH     1111
 #define SG_ID_R_UP       1112
 #define SG_ID_R_LIST     1113
 #define SG_ID_R_REFRESH  1114
 #define SG_ID_R_FILTER   1115
+#define SG_ID_R_BMARK    1116
 #define SG_ID_UPLOAD     1120
 #define SG_ID_DOWNLOAD   1121
 #define SG_ID_CANCEL     1123
@@ -105,6 +108,8 @@
 #define SG_CH_PICK_REMOTE 7     /* a remote drop-down item was chosen */
 #define SG_CH_RENAME      8     /* a name has been typed into a label edit */
 #define SG_CH_RENAME_EDIT 9     /* start editing a row's name in place */
+#define SG_CH_BM_UNSAVE  10     /* drop a bookmark chosen in a drop-down */
+#define SG_CH_BM_RESHOW  11     /* put a path box's drop-down back up */
 
 /*
  * State of the single SFTP request the window has outstanding outside
@@ -193,7 +198,7 @@ struct SgEntry {
 };
 
 struct SgPane {
-    HWND label, path, up, refresh, list;
+    HWND label, path, up, refresh, bmark, list;
     HWND filtlabel, filtbox;    /* the filter row above the list */
     char *cwd;                  /* UTF-8 */
 
@@ -220,10 +225,16 @@ struct SgPane {
     /* The path box is an editable combo box with a drop-down history of
      * places worth jumping to (see sg_local_combo_build and
      * sg_remote_combo_build). 'edit' is the combo's real edit control,
-     * which is what the keyboard subclass is installed on. */
-    HWND edit;
+     * which is what the keyboard subclass is installed on, and
+     * 'droplist' is its drop-down list box, which the context menu for
+     * unsaving a bookmark is installed on. */
+    HWND edit, droplist;
     char **cbpath;              /* the full path behind each drop item */
     int ncbpath, cbcap;
+
+    /* The session's saved paths for this pane (see sg_bm_*). */
+    char **bmarks;
+    int nbmarks, bmcap;
 };
 
 /* What to do next in a transfer batch. */
@@ -324,6 +335,18 @@ struct SftpGui {
     HWND prog, status;
     HWND progtext;              /* "12.3 MB / 45.6 MB   1.2 MB/s" */
 
+    /* The saved session this page belongs to, or NULL if it wasn't
+     * started from one; path bookmarks are kept per saved session. */
+    char *sessname;
+
+    /*
+     * A bookmark being unsaved from a drop-down. The removal itself runs
+     * from a posted message, once the menu has gone and the drop-down
+     * can be rebuilt (cf. 'pick' above).
+     */
+    char *bm_path;
+    bool bm_local;
+
     /* Realtime transfer rate, smoothed over successive samples. */
     double speed;               /* bytes per second */
     uint64_t speed_mark;        /* done_bytes at the last sample */
@@ -390,6 +413,7 @@ struct SftpGui {
 static SftpGui *sg_windows;     /* every open page, in tab order */
 static const char *sg_startup_error;
 static bool sg_pending_scp;     /* mode for the window being created */
+static const char *sg_pending_sessname; /* saved session it belongs to */
 
 static SftpGui *sg_by_client(struct sftp_client *client)
 {
@@ -1025,6 +1049,122 @@ static int sg_icon_for_path(const wchar_t *wpath)
     return -1;
 }
 
+/* ----------------------------------------------------------------------
+ * Path bookmarks.
+ *
+ * Each saved session remembers its own local directories and its own
+ * remote ones (see read_sftp_bookmarks in storage.c). They head the
+ * lists of the path boxes' drop-downs, and the button beside each path
+ * box saves the directory the pane is in - or unsaves it, if it is
+ * already there.
+ */
+
+/* Find a bookmark, or -1. Windows paths ignore case, server paths do
+ * not. */
+static int sg_bm_find(struct SgPane *p, const char *path, bool is_local)
+{
+    for (int i = 0; i < p->nbmarks; i++)
+        if (is_local ? !stricmp(p->bmarks[i], path) : !strcmp(p->bmarks[i],
+                                                             path))
+            return i;
+    return -1;
+}
+
+static void sg_bm_insert(struct SgPane *p, const char *path)
+{
+    if (p->nbmarks >= p->bmcap) {
+        p->bmcap = p->bmcap ? p->bmcap * 2 : 8;
+        p->bmarks = sresize(p->bmarks, p->bmcap, char *);
+    }
+    p->bmarks[p->nbmarks++] = dupstr(path);
+}
+
+static void sg_bm_delete(struct SgPane *p, int idx)
+{
+    sfree(p->bmarks[idx]);
+    memmove(p->bmarks + idx, p->bmarks + idx + 1,
+            (size_t)(p->nbmarks - idx - 1) * sizeof(char *));
+    p->nbmarks--;
+}
+
+/* Write this page's bookmarks back, unless there is no saved session to
+ * keep them under (in which case they last as long as the window). */
+static void sg_bm_save(SftpGui *g)
+{
+    strbuf *sb;
+
+    if (!g->sessname)
+        return;
+
+    sb = strbuf_new();
+    for (int i = 0; i < g->lcl.nbmarks; i++) {
+        put_byte(sb, 'L');
+        put_data(sb, g->lcl.bmarks[i], strlen(g->lcl.bmarks[i]));
+        put_byte(sb, '\0');         /* records are NUL-terminated */
+    }
+    for (int i = 0; i < g->rmt.nbmarks; i++) {
+        put_byte(sb, 'R');
+        put_data(sb, g->rmt.bmarks[i], strlen(g->rmt.bmarks[i]));
+        put_byte(sb, '\0');
+    }
+    write_sftp_bookmarks(g->sessname, sb);
+    strbuf_free(sb);
+}
+
+/* Read this page's bookmarks, if the session has any saved. */
+static void sg_bm_load(SftpGui *g)
+{
+    strbuf *sb = read_sftp_bookmarks(g->sessname);
+    const char *p, *end;
+
+    if (!sb)
+        return;
+
+    p = sb->s;
+    end = sb->s + sb->len;
+    while (p < end) {
+        const char *z = memchr(p, '\0', (size_t)(end - p));
+        size_t len = z ? (size_t)(z - p) : (size_t)(end - p);
+
+        if (len > 1 && (p[0] == 'L' || p[0] == 'R')) {
+            char *path = snewn(len, char);
+
+            memcpy(path, p + 1, len - 1);
+            path[len - 1] = '\0';
+            sg_bm_insert(p[0] == 'L' ? &g->lcl : &g->rmt, path);
+            sfree(path);
+        }
+        p += len + 1;
+    }
+    strbuf_free(sb);
+}
+
+/* The "Bookmark" button: save the pane's directory, or unsave it if it
+ * is saved already. */
+static void sg_bm_toggle(SftpGui *g, bool is_local)
+{
+    struct SgPane *p = is_local ? &g->lcl : &g->rmt;
+    int i = sg_bm_find(p, p->cwd, is_local);
+
+    if (i >= 0) {
+        sg_bm_delete(p, i);
+        sg_statusf(g, i18n_or("Bookmark removed: %s"), p->cwd);
+    } else {
+        sg_bm_insert(p, p->cwd);
+        sg_statusf(g, i18n_or("Bookmarked: %s"), p->cwd);
+    }
+    sg_bm_save(g);
+
+    /*
+     * Bookmarks are kept with the session, so a session that was never
+     * saved has nowhere to keep them; say so rather than let them
+     * quietly disappear with the window.
+     */
+    if (!g->sessname)
+        sg_status(g, i18n_or("This session is not saved, so its bookmarks "
+                             "last only as long as this window."));
+}
+
 static void sg_local_combo_build(SftpGui *g)
 {
     static const struct { int csidl; const char *label; } shell[] = {
@@ -1037,7 +1177,19 @@ static void sg_local_combo_build(SftpGui *g)
 
     sg_combo_reset(&g->lcl);
 
-    /* A few of the shell's own folders first, like Explorer's address
+    /* The session's own bookmarks first: they are what the user put
+     * there on purpose. */
+    for (int i = 0; i < g->lcl.nbmarks; i++) {
+        wchar_t *w = sg_w(g->lcl.bmarks[i]);
+        char *disp = dupprintf("★ %s", g->lcl.bmarks[i]);
+        int icon = sg_icon_for_path(w);
+
+        sg_combo_add(&g->lcl, disp, g->lcl.bmarks[i], icon);
+        sfree(disp);
+        sfree(w);
+    }
+
+    /* A few of the shell's own folders next, like Explorer's address
      * bar does, since those are what people reach for most often. */
     for (size_t i = 0; i < lenof(shell); i++) {
         if (SHGetFolderPathW(NULL, shell[i].csidl, NULL, 0, buf) == S_OK) {
@@ -1094,8 +1246,16 @@ static void sg_remote_combo_build(SftpGui *g)
 
     sg_combo_reset(&g->rmt);
 
-    /* The root, then one entry per path component, each of which is a
-     * complete path in its own right. */
+    /* The session's own bookmarks first, then the root and one entry per
+     * path component, each of which is a complete path in its own
+     * right. */
+    for (int i = 0; i < g->rmt.nbmarks; i++) {
+        char *disp = dupprintf("★ %s", g->rmt.bmarks[i]);
+
+        sg_combo_add(&g->rmt, disp, g->rmt.bmarks[i], icon);
+        sfree(disp);
+    }
+
     sg_combo_add(&g->rmt, "/", "/", icon);
 
     for (p = cwd; *p; ) {
@@ -1126,6 +1286,30 @@ static void sg_remote_combo_build(SftpGui *g)
         }
     }
     sg_set_text(g->rmt.path, g->rmt.cwd);
+}
+
+/* Unsave one path, and rebuild the pane's drop-down without it. */
+static void sg_bm_remove_path(SftpGui *g, bool is_local, const char *path)
+{
+    struct SgPane *p = is_local ? &g->lcl : &g->rmt;
+    int i = sg_bm_find(p, path, is_local);
+
+    if (i < 0)
+        return;
+
+    sg_bm_delete(p, i);
+    sg_bm_save(g);
+    sg_statusf(g, i18n_or("Bookmark removed: %s"), path);
+
+    if (is_local)
+        sg_local_combo_build(g);
+    else
+        sg_remote_combo_build(g);
+
+    /* Put the list back up where the user left it, with the bookmark
+     * they removed gone from it. */
+    SetFocus(p->path);
+    SendMessageW(p->path, CB_SHOWDROPDOWN, TRUE, 0);
 }
 
 /* Draw one drop-down entry: its icon, then its text. */
@@ -4517,9 +4701,151 @@ static void sg_lv_columns(HWND lv)
 }
 
 /*
+ * The drop-down list of a path box: right-clicking one of the saved
+ * bookmarks at the head of it offers to unsave that path. The list box
+ * is a child of the combo, and its mouse messages never reach the page
+ * window, so it has to be subclassed to see them.
+ */
+static WNDPROC sg_drop_origproc;
+
+static SftpGui *sg_drop_find(HWND hwnd, bool *is_local)
+{
+    for (SftpGui *g = sg_windows; g; g = g->next) {
+        if (hwnd == g->lcl.droplist) {
+            *is_local = true;
+            return g;
+        }
+        if (hwnd == g->rmt.droplist) {
+            *is_local = false;
+            return g;
+        }
+    }
+    return NULL;
+}
+
+/* Which drop-down item the mouse is over, or -1. */
+static int sg_drop_item_at(struct SgPane *p, LPARAM lParam)
+{
+    int count = (int)SendMessageW(p->path, CB_GETCOUNT, 0, 0);
+    int top = (int)SendMessageW(p->path, CB_GETTOPINDEX, 0, 0);
+    int hgt = (int)SendMessageW(p->path, CB_GETITEMHEIGHT, 0, 0);
+    int y = (short)HIWORD(lParam);
+    int idx;
+
+    if (hgt <= 0 || y < 0)
+        return -1;
+    idx = top + y / hgt;
+    return (idx >= 0 && idx < count) ? idx : -1;
+}
+
+/* The bookmark at drop-down item 'idx', or -1 if that item is not one. */
+static int sg_drop_bookmark(struct SgPane *p, bool is_local, int idx)
+{
+    if (idx < 0 || idx >= p->ncbpath || idx >= p->nbmarks)
+        return -1;
+    return sg_bm_find(p, p->cbpath[idx], is_local) >= 0 ? idx : -1;
+}
+
+/* A path shortened for use as a menu label: its tail is the part that
+ * tells one directory from another. */
+static wchar_t *sg_short_path_w(const char *path)
+{
+    size_t len = strlen(path);
+    wchar_t *ret;
+
+    if (len > 72) {
+        const char *tail = path + len - 68;
+        char *s;
+
+        while (((unsigned char)*tail & 0xC0) == 0x80)
+            tail++;                    /* never cut a UTF-8 character */
+        s = dupprintf("...%s", tail);
+        ret = sg_w(s);
+        sfree(s);
+    } else {
+        ret = sg_w(path);
+    }
+    return ret;
+}
+
+/*
+ * Offer to unsave the bookmark at drop-down item 'idx'.
+ *
+ * The combo closes its list as soon as the menu opens - that is how
+ * every Windows combo box behaves - so the menu has to say which path
+ * it is about, rather than relying on the highlighted item still being
+ * on screen. Once the bookmark is gone the list is opened again, so the
+ * user can carry on from where they were.
+ */
+static void sg_drop_menu(SftpGui *g, bool is_local, int idx)
+{
+    struct SgPane *p = is_local ? &g->lcl : &g->rmt;
+    HMENU m;
+    wchar_t *wpath, *wtext;
+    POINT pt;
+    int cmd;
+
+    wpath = sg_short_path_w(p->cbpath[idx]);
+    wtext = sg_w(i18n_or("Remove bookmark"));
+    m = CreatePopupMenu();
+    /* The path is a label, not a command: disabled but not greyed. */
+    AppendMenuW(m, MF_STRING | MF_DISABLED, 0, wpath);
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, 1, wtext);
+    sfree(wpath);
+    sfree(wtext);
+
+    GetCursorPos(&pt);
+    SetForegroundWindow(g->hwnd);
+    cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                              pt.x, pt.y, 0, g->hwnd, NULL);
+    DestroyMenu(m);
+
+    if (cmd == 1) {
+        sfree(g->bm_path);
+        g->bm_path = dupstr(p->cbpath[idx]);
+        g->bm_local = is_local;
+        PostMessage(g->hwnd, WM_SG_NOTIFY, SG_CH_BM_UNSAVE, 0);
+        return;                    /* the posted handler reopens the list */
+    }
+
+    /*
+     * Nothing was chosen: put the list back the way the user left it,
+     * unless the menu was dismissed by going to another window.
+     */
+    if (g->frame && GetForegroundWindow() == g->frame->hwnd) {
+        g->bm_local = is_local;
+        PostMessage(g->hwnd, WM_SG_NOTIFY, SG_CH_BM_RESHOW, 0);
+    }
+}
+
+static LRESULT CALLBACK sg_drop_proc(HWND hwnd, UINT msg, WPARAM wParam,
+                                     LPARAM lParam)
+{
+    if (msg == WM_RBUTTONDOWN) {
+        bool is_local;
+        SftpGui *g = sg_drop_find(hwnd, &is_local);
+
+        if (g) {
+            struct SgPane *p = is_local ? &g->lcl : &g->rmt;
+            int idx = sg_drop_bookmark(p, is_local,
+                                       sg_drop_item_at(p, lParam));
+
+            if (idx >= 0) {
+                sg_drop_menu(g, is_local, idx);
+                return 0;
+            }
+        }
+        /* Not a bookmark: leave the click to the combo box. */
+    }
+    return CallWindowProcW(sg_drop_origproc, hwnd, msg, wParam, lParam);
+}
+
+/*
  * A path box is an editable combo box. Its real edit control is a child
  * window, and that is where the Return key has to be intercepted, so
- * subclass it rather than the combo.
+ * subclass it rather than the combo. Its drop-down list is where the
+ * bookmark context menu goes, for the same reason.
  */
 static void sg_subclass_combo(struct SgPane *p)
 {
@@ -4527,10 +4853,17 @@ static void sg_subclass_combo(struct SgPane *p)
 
     memset(&ci, 0, sizeof(ci));
     ci.cbSize = sizeof(ci);
-    if (GetComboBoxInfo(p->path, &ci) && ci.hwndItem) {
-        p->edit = ci.hwndItem;
-        sg_edit_origproc = (WNDPROC)SetWindowLongPtrW(
-            p->edit, GWLP_WNDPROC, (LONG_PTR)sg_edit_proc);
+    if (GetComboBoxInfo(p->path, &ci)) {
+        if (ci.hwndItem) {
+            p->edit = ci.hwndItem;
+            sg_edit_origproc = (WNDPROC)SetWindowLongPtrW(
+                p->edit, GWLP_WNDPROC, (LONG_PTR)sg_edit_proc);
+        }
+        if (ci.hwndList) {
+            p->droplist = ci.hwndList;
+            sg_drop_origproc = (WNDPROC)SetWindowLongPtrW(
+                p->droplist, GWLP_WNDPROC, (LONG_PTR)sg_drop_proc);
+        }
     }
 }
 
@@ -4543,6 +4876,8 @@ static void sg_create_controls(SftpGui *g)
     g->lcl.path = sg_child(g, L"COMBOBOX", "", combo_style, 0, SG_ID_L_PATH);
     sg_subclass_combo(&g->lcl);
     g->lcl.up = sg_child(g, L"BUTTON", "..", BS_PUSHBUTTON, 0, SG_ID_L_UP);
+    g->lcl.bmark = sg_child(g, L"BUTTON", "Bookmark", BS_PUSHBUTTON, 0,
+                            SG_ID_L_BMARK);
     g->lcl.refresh = sg_child(g, L"BUTTON", "Refresh", BS_PUSHBUTTON, 0,
                               SG_ID_L_REFRESH);
     g->lcl.list = sg_child(g, WC_LISTVIEWW, "",
@@ -4553,6 +4888,8 @@ static void sg_create_controls(SftpGui *g)
     g->rmt.path = sg_child(g, L"COMBOBOX", "", combo_style, 0, SG_ID_R_PATH);
     sg_subclass_combo(&g->rmt);
     g->rmt.up = sg_child(g, L"BUTTON", "..", BS_PUSHBUTTON, 0, SG_ID_R_UP);
+    g->rmt.bmark = sg_child(g, L"BUTTON", "Bookmark", BS_PUSHBUTTON, 0,
+                            SG_ID_R_BMARK);
     g->rmt.refresh = sg_child(g, L"BUTTON", "Refresh", BS_PUSHBUTTON, 0,
                               SG_ID_R_REFRESH);
     g->rmt.list = sg_child(g, WC_LISTVIEWW, "",
@@ -4602,7 +4939,7 @@ static void sg_layout(SftpGui *g)
 {
     RECT rc;
     int W, H, m = 8, gap = 6, row = 24, midw = 96, prog_h = 16;
-    int upw = 28, rfw = 52;    /* the ".." and Refresh buttons */
+    int upw = 28, rfw = 52, bmw = 58;  /* "..", Refresh and Bookmark */
     int pane_w, left_x, right_x, list_y, list_h, prog_y, status_y, bx, by;
     int filter_y, namew, total_w;
     int i;
@@ -4633,7 +4970,9 @@ static void sg_layout(SftpGui *g)
      */
     sg_place(g->lcl.label, left_x, m, 46, row);
     sg_place(g->lcl.path, left_x + 48, m,
-             pane_w - 48 - upw - 2 - rfw - 2, row + 220);
+             pane_w - 48 - upw - 2 - rfw - 2 - bmw - 2, row + 220);
+    sg_place(g->lcl.bmark, left_x + pane_w - upw - 2 - rfw - 2 - bmw, m,
+             bmw, row);
     sg_place(g->lcl.refresh, left_x + pane_w - upw - 2 - rfw, m, rfw, row);
     sg_place(g->lcl.up, left_x + pane_w - upw, m, upw, row);
     sg_place(g->lcl.filtlabel, left_x, filter_y, 46, row);
@@ -4642,7 +4981,9 @@ static void sg_layout(SftpGui *g)
 
     sg_place(g->rmt.label, right_x, m, 46, row);
     sg_place(g->rmt.path, right_x + 48, m,
-             pane_w - 48 - upw - 2 - rfw - 2, row + 220);
+             pane_w - 48 - upw - 2 - rfw - 2 - bmw - 2, row + 220);
+    sg_place(g->rmt.bmark, right_x + pane_w - upw - 2 - rfw - 2 - bmw, m,
+             bmw, row);
     sg_place(g->rmt.refresh, right_x + pane_w - upw - 2 - rfw, m, rfw, row);
     sg_place(g->rmt.up, right_x + pane_w - upw, m, upw, row);
     sg_place(g->rmt.filtlabel, right_x, filter_y, 46, row);
@@ -4742,6 +5083,14 @@ static void sg_free(SftpGui *g, bool channel_still_ours)
     sfree(g->rmt.cbpath);
     sfree(g->lcl.cwd);
     sfree(g->rmt.cwd);
+    for (int i = 0; i < g->lcl.nbmarks; i++)
+        sfree(g->lcl.bmarks[i]);
+    sfree(g->lcl.bmarks);
+    for (int i = 0; i < g->rmt.nbmarks; i++)
+        sfree(g->rmt.bmarks[i]);
+    sfree(g->rmt.bmarks);
+    sfree(g->sessname);
+    sfree(g->bm_path);
     sfree(g->target_path);
     sfree(g->pick);
     sfree(g->ren_name);
@@ -4752,7 +5101,8 @@ static void sg_free(SftpGui *g, bool channel_still_ours)
     sfree(g);
 }
 
-static SftpGui *sg_create(HWND hwnd, Backend *be, bool scp)
+static SftpGui *sg_create(HWND hwnd, Backend *be, bool scp,
+                          const char *sessname)
 {
     SftpGui *g = snew(SftpGui);
     wchar_t wcwd[MAX_PATH];
@@ -4768,8 +5118,11 @@ static SftpGui *sg_create(HWND hwnd, Backend *be, bool scp)
     g->lfh = INVALID_HANDLE_VALUE;
     g->pend = SG_P_NONE;
     g->rmt.cwd = dupstr("/");
+    if (sessname && *sessname)
+        g->sessname = dupstr(sessname);
 
     sg_create_controls(g);
+    sg_bm_load(g);
 
     /* Start in the user's home directory, not in whatever working
      * directory the process happened to inherit. */
@@ -4839,7 +5192,7 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       case WM_CREATE: {
         CREATESTRUCTW *cs = (CREATESTRUCTW *)lParam;
         SftpGui *ng = sg_create(hwnd, (Backend *)cs->lpCreateParams,
-                                sg_pending_scp);
+                                sg_pending_scp, sg_pending_sessname);
         if (!ng)
             return -1;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)ng);
@@ -4933,6 +5286,24 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
           case SG_CH_RENAME_EDIT:
             sg_start_label_edit(g, g->ren_local, g->ren_idx);
             break;
+          case SG_CH_BM_UNSAVE: {
+            char *path = g->bm_path;
+            bool is_local = g->bm_local;
+
+            g->bm_path = NULL;
+            if (path) {
+                sg_bm_remove_path(g, is_local, path);
+                sfree(path);
+            }
+            break;
+          }
+          case SG_CH_BM_RESHOW: {
+            struct SgPane *p = g->bm_local ? &g->lcl : &g->rmt;
+
+            SetFocus(p->path);
+            SendMessageW(p->path, CB_SHOWDROPDOWN, TRUE, 0);
+            break;
+          }
           case SG_CH_OPENFAILED: {
             char *text = (char *)lParam;
             sg_fatal(g, text);
@@ -4978,6 +5349,13 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             sg_remote_refresh(g);
             return 0;
 
+          case SG_ID_L_BMARK:
+            sg_bm_toggle(g, true);
+            return 0;
+          case SG_ID_R_BMARK:
+            sg_bm_toggle(g, false);
+            return 0;
+
           case SG_ID_L_FILTER:
             if (HIWORD(wParam) == EN_CHANGE)
                 sg_filt_apply(g, true);
@@ -5005,6 +5383,14 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                      */
                     PostMessage(hwnd, WM_SG_NOTIFY, SG_CH_PICK_LOCAL, 0);
                 }
+            } else if (HIWORD(wParam) == CBN_CLOSEUP) {
+                /*
+                 * Moving over the items previews them in the edit field,
+                 * so a list closed without choosing anything would leave
+                 * a bookmark's text there instead of the directory. Put
+                 * the directory back.
+                 */
+                sg_set_text(g->lcl.path, g->lcl.cwd);
             }
             return 0;
 
@@ -5018,6 +5404,8 @@ static LRESULT CALLBACK SgWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                     g->pick = dupstr(g->rmt.cbpath[i]);
                     PostMessage(hwnd, WM_SG_NOTIFY, SG_CH_PICK_REMOTE, 0);
                 }
+            } else if (HIWORD(wParam) == CBN_CLOSEUP) {
+                sg_set_text(g->rmt.path, g->rmt.cwd);
             }
             return 0;
         }
@@ -5657,7 +6045,7 @@ void sftpgui_tab_label_changed(Backend *be, const wchar_t *tab_label)
 }
 
 static void sg_open(HWND parent, Backend *be, bool scp,
-                    const wchar_t *tab_label)
+                    const wchar_t *tab_label, const char *sessname)
 {
     static bool registered;
     HINSTANCE inst = GetModuleHandleW(NULL);
@@ -5698,6 +6086,7 @@ static void sg_open(HWND parent, Backend *be, bool scp,
 
     sg_startup_error = NULL;
     sg_pending_scp = scp;
+    sg_pending_sessname = sessname;
 
     page = CreateWindowExW(0, SG_CLASSNAME, L"", WS_CHILD | WS_CLIPCHILDREN,
                            0, 0, 10, 10, frame, NULL, inst, be);
@@ -5719,12 +6108,14 @@ static void sg_open(HWND parent, Backend *be, bool scp,
     SetForegroundWindow(frame);
 }
 
-void sftp_gui_open(HWND parent, Backend *be, const wchar_t *tab_label)
+void sftp_gui_open(HWND parent, Backend *be, const wchar_t *tab_label,
+                   const char *session_name)
 {
-    sg_open(parent, be, false, tab_label);
+    sg_open(parent, be, false, tab_label, session_name);
 }
 
-void scp_gui_open(HWND parent, Backend *be, const wchar_t *tab_label)
+void scp_gui_open(HWND parent, Backend *be, const wchar_t *tab_label,
+                  const char *session_name)
 {
-    sg_open(parent, be, true, tab_label);
+    sg_open(parent, be, true, tab_label, session_name);
 }

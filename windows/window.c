@@ -137,7 +137,8 @@ static void conf_cache_data(WinGuiSeat *wgs);
 /* Tabbed multi-session support (added modification) */
 static LRESULT CALLBACK FrameWndProc(HWND, UINT, WPARAM, LPARAM);
 static void new_session_finish(WinGuiSeat *wgs);
-static WinGuiSeat *new_session(Conf *conf, const wchar_t *tab_name);
+static WinGuiSeat *new_session(Conf *conf, const wchar_t *tab_name,
+                               const char *sessname);
 static void tab_add(WinGuiSeat *wgs);
 static void tab_activate(int idx);
 static wchar_t *tab_name_from_session(const char *sessname);
@@ -645,6 +646,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
      * of the Conf.
      */
     wgs->tab_name = tab_name_from_session(settings_loaded_session_name());
+    if (settings_loaded_session_name() && *settings_loaded_session_name())
+        wgs->sessname = dupstr(settings_loaded_session_name());
 
     memset(&wgs->ucsdata, 0, sizeof(wgs->ucsdata));
 
@@ -1093,6 +1096,7 @@ static void wgs_cleanup(WinGuiSeat *wgs)
         sfree(wgs->icon_name);
     if (wgs->tab_name)
         sfree(wgs->tab_name);
+    sfree(wgs->sessname);
     if (wgs->savedsess_menu)
         DestroyMenu(wgs->savedsess_menu);
     if (wgs->specials_menu)
@@ -1695,9 +1699,10 @@ static void open_new_session_dialog(void)
      */
     do_defaults(NULL, c);
     if (do_config(c)) {
-        wchar_t *tab_name = tab_name_from_session(settings_loaded_session_name());
+        const char *sessname = settings_loaded_session_name();
+        wchar_t *tab_name = tab_name_from_session(sessname);
         prepare_session(c);
-        new_session(c, tab_name);
+        new_session(c, tab_name, sessname);
         sfree(tab_name);
         /* ... and any others the box asked for (a batch open). */
         open_pending_batch_sessions();
@@ -1720,7 +1725,7 @@ static void open_pending_batch_sessions(void)
         if (load_settings(name, c)) {
             wchar_t *tab_name = tab_name_from_session(name);
             prepare_session(c);
-            new_session(c, tab_name);
+            new_session(c, tab_name, name);
             sfree(tab_name);
         } else {
             conf_free(c);
@@ -2624,7 +2629,8 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
                 conf_set_str(c, CONF_ssh_share_pipe, "");
                 /* A duplicate is the same session as its original, so
                  * its tab is captioned the same way. */
-                new_session(c, tab_list[tab_active]->tab_name);
+                new_session(c, tab_list[tab_active]->tab_name,
+                            tab_list[tab_active]->sessname);
             }
             return 0;
         }
@@ -2676,7 +2682,8 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
                                 "this tab will make a new connection");
                 }
                 {
-                    WinGuiSeat *w = new_session(c, src->tab_name);
+                    WinGuiSeat *w = new_session(c, src->tab_name,
+                                                src->sessname);
 
                     /*
                      * If the new tab reuses the connection, number it
@@ -2707,7 +2714,7 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
 
                 tab_label(tab_active, label, lenof(label));
                 sftp_gui_open(tab_frame_hwnd, tab_list[tab_active]->backend,
-                              label);
+                              label, tab_list[tab_active]->sessname);
             }
             return 0;
         }
@@ -2721,7 +2728,7 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
 
                 tab_label(tab_active, label, lenof(label));
                 scp_gui_open(tab_frame_hwnd, tab_list[tab_active]->backend,
-                             label);
+                             label, tab_list[tab_active]->sessname);
             }
             return 0;
         }
@@ -2733,7 +2740,7 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
                     wchar_t *tab_name = tab_name_from_session(
                         sesslist.sessions[p + 1]);
                     prepare_session(c);
-                    new_session(c, tab_name);
+                    new_session(c, tab_name, sesslist.sessions[p + 1]);
                     sfree(tab_name);
                 }
                 else
@@ -3182,7 +3189,8 @@ static void new_session_finish(WinGuiSeat *wgs)
  * about it (such as the downstream ordinal of a "Duplicate channel"
  * tab) can do so.
  */
-static WinGuiSeat *new_session(Conf *conf, const wchar_t *tab_name)
+static WinGuiSeat *new_session(Conf *conf, const wchar_t *tab_name,
+                               const char *sessname)
 {
     WinGuiSeat *wgs = snew(WinGuiSeat);
     memset(wgs, 0, sizeof(*wgs));
@@ -3195,6 +3203,8 @@ static WinGuiSeat *new_session(Conf *conf, const wchar_t *tab_name)
     wgs->conf = conf;
     if (tab_name && *tab_name)
         wgs->tab_name = dupwcs(tab_name);
+    if (sessname && *sessname)
+        wgs->sessname = dupstr(sessname);
     new_session_finish(wgs);
     return wgs;
 }
@@ -4716,7 +4726,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                 conf_set_str(c, CONF_ssh_share_pipe, "");
                 /* A duplicate is the same session as its original, so
                  * its tab is captioned the same way. */
-                new_session(c, wgs->tab_name);
+                new_session(c, wgs->tab_name, wgs->sessname);
             }
             break;
           case IDM_SAVEDSESS: {
@@ -4728,7 +4738,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                     wchar_t *tab_name = tab_name_from_session(
                         sesslist.sessions[sessno]);
                     prepare_session(c);
-                    new_session(c, tab_name);
+                    new_session(c, tab_name, sesslist.sessions[sessno]);
                     sfree(tab_name);
                 }
                 else

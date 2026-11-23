@@ -22,9 +22,16 @@
  * brings its tab to the front. Each tab keeps its own SFTP request table
  * (see sftp_client_new), so transfers in different tabs do not disturb
  * each other.
+ *
+ * 'session_name' is the name of the saved session the connection was
+ * started from, or NULL if it was not started from one; the window keys
+ * its path bookmarks on it, so that each saved session remembers its
+ * own favourite local and remote directories.
  */
-void sftp_gui_open(HWND parent, Backend *be, const wchar_t *tab_label);
-void scp_gui_open(HWND parent, Backend *be, const wchar_t *tab_label);
+void sftp_gui_open(HWND parent, Backend *be, const wchar_t *tab_label,
+                   const char *session_name);
+void scp_gui_open(HWND parent, Backend *be, const wchar_t *tab_label,
+                  const char *session_name);
 
 /*
  * Called when a session's tab label changes - reordering the tabs
