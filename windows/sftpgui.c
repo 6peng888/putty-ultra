@@ -3813,13 +3813,22 @@ static int sg_ctx_selection(struct SgPane *p, int **out)
 static bool sg_ctx_hit_test(HWND lv, POINT screen)
 {
     LVHITTESTINFO ht;
+    UINT state;
 
     memset(&ht, 0, sizeof(ht));
     ht.pt = screen;
     ScreenToClient(lv, &ht.pt);
     if ((int)SendMessageW(lv, LVM_HITTEST, 0, (LPARAM)&ht) < 0)
         return false;
-    if (!(ht.flags & LVIS_SELECTED)) {
+    /*
+     * A right-click on a row that is already part of a multi-selection
+     * must leave that selection alone - otherwise the user cannot act
+     * on several files at once. Note that ht.flags holds LVHT_* bits,
+     * not item state, so the selection has to be queried separately.
+     */
+    state = (UINT)SendMessageW(lv, LVM_GETITEMSTATE, (WPARAM)ht.iItem,
+                              LVIS_SELECTED);
+    if (!(state & LVIS_SELECTED)) {
         ListView_SetItemState(lv, -1, 0, LVIS_SELECTED);
         ListView_SetItemState(lv, ht.iItem, LVIS_SELECTED | LVIS_FOCUSED,
                               LVIS_SELECTED | LVIS_FOCUSED);
