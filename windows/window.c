@@ -1750,16 +1750,24 @@ static bool font_zoom_key(WinGuiSeat *wgs, int vk)
 }
 
 /*
- * Rebuild the fonts at a new zoom level and re-fit the terminal to it,
- * the same way applying the Change Settings box does: reset_window()
- * reloads the fonts (init_fonts applies font_zoom to the configured
- * size) and sizes the terminal window to a whole character grid, and
- * tab_relayout() then hands that window back to the frame, whose
- * WM_SIZE recalculates the rows and columns for the new font and tells
- * the server about them.
+ * Rebuild the fonts at a new zoom level and re-fit the terminal to the
+ * space it occupies.
+ *
+ * The terminal window in this build is a child of the tab frame and is
+ * sized by the frame (tab_relayout), not by us, so its geometry does
+ * not change when the font does - which means no WM_SIZE arrives, and
+ * anything that waited for one to recalculate the character grid never
+ * runs (the text would be drawn at the new size into the grid computed
+ * for the old one, leaving the bottom rows, cursor line included, off
+ * the window). So do the calculation WM_SIZE would have done, here and
+ * now: work out how many rows and columns of the new font fit into the
+ * current client area, hand that to the terminal, and repaint. Rows and
+ * columns therefore change with the zoom, exactly as they do when the
+ * frame itself is resized.
  */
 static void font_zoom_apply(WinGuiSeat *wgs, int delta)
 {
+    RECT cr;
     int zoom;
 
     if (!wgs || !wgs->term || !wgs->term_hwnd)
@@ -1775,8 +1783,54 @@ static void font_zoom_apply(WinGuiSeat *wgs, int delta)
 
     wgs->font_zoom = zoom;
 
-    reset_window(wgs, 2);
-    tab_relayout();
+    deinit_fonts(wgs);
+    init_fonts(wgs, 0, 0);
+
+    /*
+     * The system caret is a bitmap the size of one character cell, so
+     * it has to be rebuilt to match the new font as well, or CreateCaret
+     * will reject it as being the wrong size.
+     */
+    {
+        int size = (wgs->font_width + 15) / 16 * 2 * wgs->font_height;
+        char *bits = snewn(size, char);
+        HBITMAP newbm;
+
+        memset(bits, 0, size);
+        newbm = CreateBitmap(wgs->font_width, wgs->font_height, 1, 1, bits);
+        sfree(bits);
+
+        if (newbm) {
+            CreateCaret(wgs->term_hwnd, newbm,
+                        wgs->font_width, wgs->font_height);
+            if (wgs->caretbm)
+                DeleteObject(wgs->caretbm);
+            wgs->caretbm = newbm;
+            if (GetFocus() == wgs->term_hwnd)
+                ShowCaret(wgs->term_hwnd);
+        }
+    }
+
+    GetClientRect(wgs->term_hwnd, &cr);
+    wm_size_resize_term(wgs, MAKELPARAM(cr.right - cr.left,
+                                        cr.bottom - cr.top));
+
+    recompute_window_offset(wgs);
+
+    /*
+     * Keep the window-furniture measurements in step with the new cell
+     * size, so that any later sizing calculation (WM_SIZING, a backend
+     * resize request) still works in terms of the new font.
+     */
+    {
+        RECT wr;
+        GetWindowRect(wgs->term_hwnd, &wr);
+        wgs->extra_width = wr.right - wr.left - cr.right + cr.left +
+            wgs->offset_width*2;
+        wgs->extra_height = wr.bottom - wr.top - cr.bottom + cr.top +
+            wgs->offset_height*2;
+    }
+
     InvalidateRect(wgs->term_hwnd, NULL, true);
 }
 
