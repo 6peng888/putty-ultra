@@ -138,6 +138,8 @@ static void recompute_window_offset(WinGuiSeat *wgs);
 static void wm_size_resize_term(WinGuiSeat *wgs, LPARAM lParam);
 static bool font_zoom_key(WinGuiSeat *wgs, int vk);
 static void font_zoom_apply(WinGuiSeat *wgs, int delta);
+static void font_caret_rebuild(WinGuiSeat *wgs);
+static void refit_terminal_to_font(WinGuiSeat *wgs);
 
 static void flash_window(WinGuiSeat *wgs, int mode);
 static void sys_cursor_update(WinGuiSeat *wgs);
@@ -1750,24 +1752,87 @@ static bool font_zoom_key(WinGuiSeat *wgs, int vk)
 }
 
 /*
- * Rebuild the fonts at a new zoom level and re-fit the terminal to the
- * space it occupies.
+ * The system caret is a bitmap the size of one character cell, so it
+ * has to be rebuilt whenever the font metrics change, or CreateCaret
+ * rejects it as being the wrong size and the caret is lost.
+ */
+static void font_caret_rebuild(WinGuiSeat *wgs)
+{
+    int size;
+    char *bits;
+    HBITMAP newbm;
+
+    if (!wgs || !wgs->term_hwnd || wgs->font_width < 1 ||
+        wgs->font_height < 1)
+        return;
+
+    size = (wgs->font_width + 15) / 16 * 2 * wgs->font_height;
+    bits = snewn(size, char);
+    memset(bits, 0, size);
+    newbm = CreateBitmap(wgs->font_width, wgs->font_height, 1, 1, bits);
+    sfree(bits);
+
+    if (!newbm)
+        return;
+
+    CreateCaret(wgs->term_hwnd, newbm, wgs->font_width, wgs->font_height);
+    if (wgs->caretbm)
+        DeleteObject(wgs->caretbm);
+    wgs->caretbm = newbm;
+    if (GetFocus() == wgs->term_hwnd)
+        ShowCaret(wgs->term_hwnd);
+}
+
+/*
+ * Re-fit the terminal to the font it is currently using: work out how
+ * many of the new character cells fit into the window's client area,
+ * give that to the terminal, and repaint.
  *
  * The terminal window in this build is a child of the tab frame and is
- * sized by the frame (tab_relayout), not by us, so its geometry does
- * not change when the font does - which means no WM_SIZE arrives, and
- * anything that waited for one to recalculate the character grid never
- * runs (the text would be drawn at the new size into the grid computed
- * for the old one, leaving the bottom rows, cursor line included, off
- * the window). So do the calculation WM_SIZE would have done, here and
- * now: work out how many rows and columns of the new font fit into the
- * current client area, hand that to the terminal, and repaint. Rows and
- * columns therefore change with the zoom, exactly as they do when the
- * frame itself is resized.
+ * sized by the frame (tab_relayout), not by PuTTY itself, so its
+ * geometry does not change when the font does - which means no WM_SIZE
+ * arrives, and anything that was waiting for one to recalculate the
+ * character grid never runs. Without this the text is drawn at the new
+ * size into the grid computed for the old one, and the rows that no
+ * longer fit (the cursor line among them) are cut off the bottom of the
+ * window until some unrelated resize forces the calculation. So do the
+ * calculation WM_SIZE would have done, here and now; rows and columns
+ * therefore change with the font, exactly as they do when the frame
+ * itself is resized.
+ */
+static void refit_terminal_to_font(WinGuiSeat *wgs)
+{
+    RECT cr, wr;
+
+    if (!wgs || !wgs->term || !wgs->term_hwnd)
+        return;
+
+    GetClientRect(wgs->term_hwnd, &cr);
+    wm_size_resize_term(wgs, MAKELPARAM(cr.right - cr.left,
+                                        cr.bottom - cr.top));
+
+    recompute_window_offset(wgs);
+
+    /*
+     * Keep the window-furniture measurements in step with the new cell
+     * size, so that any later sizing calculation (WM_SIZING, a backend
+     * resize request) still works in terms of the new font.
+     */
+    GetWindowRect(wgs->term_hwnd, &wr);
+    wgs->extra_width = wr.right - wr.left - cr.right + cr.left +
+        wgs->offset_width*2;
+    wgs->extra_height = wr.bottom - wr.top - cr.bottom + cr.top +
+        wgs->offset_height*2;
+
+    InvalidateRect(wgs->term_hwnd, NULL, true);
+}
+
+/*
+ * Rebuild the fonts at a new zoom level and re-fit the terminal to the
+ * space it occupies.
  */
 static void font_zoom_apply(WinGuiSeat *wgs, int delta)
 {
-    RECT cr;
     int zoom;
 
     if (!wgs || !wgs->term || !wgs->term_hwnd)
@@ -1785,53 +1850,8 @@ static void font_zoom_apply(WinGuiSeat *wgs, int delta)
 
     deinit_fonts(wgs);
     init_fonts(wgs, 0, 0);
-
-    /*
-     * The system caret is a bitmap the size of one character cell, so
-     * it has to be rebuilt to match the new font as well, or CreateCaret
-     * will reject it as being the wrong size.
-     */
-    {
-        int size = (wgs->font_width + 15) / 16 * 2 * wgs->font_height;
-        char *bits = snewn(size, char);
-        HBITMAP newbm;
-
-        memset(bits, 0, size);
-        newbm = CreateBitmap(wgs->font_width, wgs->font_height, 1, 1, bits);
-        sfree(bits);
-
-        if (newbm) {
-            CreateCaret(wgs->term_hwnd, newbm,
-                        wgs->font_width, wgs->font_height);
-            if (wgs->caretbm)
-                DeleteObject(wgs->caretbm);
-            wgs->caretbm = newbm;
-            if (GetFocus() == wgs->term_hwnd)
-                ShowCaret(wgs->term_hwnd);
-        }
-    }
-
-    GetClientRect(wgs->term_hwnd, &cr);
-    wm_size_resize_term(wgs, MAKELPARAM(cr.right - cr.left,
-                                        cr.bottom - cr.top));
-
-    recompute_window_offset(wgs);
-
-    /*
-     * Keep the window-furniture measurements in step with the new cell
-     * size, so that any later sizing calculation (WM_SIZING, a backend
-     * resize request) still works in terms of the new font.
-     */
-    {
-        RECT wr;
-        GetWindowRect(wgs->term_hwnd, &wr);
-        wgs->extra_width = wr.right - wr.left - cr.right + cr.left +
-            wgs->offset_width*2;
-        wgs->extra_height = wr.bottom - wr.top - cr.bottom + cr.top +
-            wgs->offset_height*2;
-    }
-
-    InvalidateRect(wgs->term_hwnd, NULL, true);
+    font_caret_rebuild(wgs);
+    refit_terminal_to_font(wgs);
 }
 
 static void tab_add(WinGuiSeat *wgs)
@@ -5185,13 +5205,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                  * above (to the exact character grid, as reset_window
                  * always does) must be undone by handing the window back
                  * to the frame: that restores the terminal to the full
-                 * frame area, and the resulting WM_SIZE re-fits the
-                 * terminal (and the server-side pty size) to its new
-                 * font properly. Without this the session's panel would
+                 * frame area. Without this the session's panel would
                  * come out slightly smaller than the frame every time
                  * settings were applied.
                  */
                 tab_relayout();
+
+                /*
+                 * Re-fit the terminal to its (possibly new) font here
+                 * rather than relying on the WM_SIZE that the resize
+                 * above may or may not generate: if the frame hands the
+                 * window back at the size it already had, no WM_SIZE
+                 * arrives at all and the grid would keep the old font's
+                 * dimensions, leaving the bottom rows (and the cursor
+                 * line) outside the window after a font change.
+                 */
+                font_caret_rebuild(wgs);
+                refit_terminal_to_font(wgs);
             }
 
             InvalidateRect(hwnd, NULL, true);
