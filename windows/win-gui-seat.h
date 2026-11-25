@@ -62,6 +62,14 @@ struct WinGuiSeat {
 
     int extra_width, extra_height;
     int font_width, font_height;
+    /*
+     * Runtime font zoom, in percent of the configured font size
+     * (100 = the font size from the configuration). Changed by
+     * Ctrl+= / Ctrl+- in the terminal window and applied by
+     * init_fonts when it builds the font from the configuration
+     * rather than from the window size.
+     */
+    int font_zoom;
     bool font_dualwidth, font_varpitch;
     int offset_width, offset_height;
     bool was_zoomed;

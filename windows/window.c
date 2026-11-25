@@ -101,6 +101,16 @@
 #define VK_PACKET 0xE7
 #endif
 
+/*
+ * Runtime font zoom (Ctrl+= / Ctrl+-): the size of the font as a
+ * percentage of the size in the configuration, the step per keystroke,
+ * and the range the zoom is clamped to.
+ */
+#define FONT_ZOOM_NORMAL 100
+#define FONT_ZOOM_STEP 10
+#define FONT_ZOOM_MIN 30
+#define FONT_ZOOM_MAX 400
+
 static Mouse_Button translate_button(WinGuiSeat *wgs, Mouse_Button button);
 static void show_mouseptr(WinGuiSeat *wgs, bool show);
 static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -126,6 +136,8 @@ static void setup_clipboards(Terminal *, Conf *);
 static void reset_window(WinGuiSeat *wgs, int reinit);
 static void recompute_window_offset(WinGuiSeat *wgs);
 static void wm_size_resize_term(WinGuiSeat *wgs, LPARAM lParam);
+static bool font_zoom_key(WinGuiSeat *wgs, int vk);
+static void font_zoom_apply(WinGuiSeat *wgs, int delta);
 
 static void flash_window(WinGuiSeat *wgs, int mode);
 static void sys_cursor_update(WinGuiSeat *wgs);
@@ -623,6 +635,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 
     wgs->caret_x = wgs->caret_y = -1;
     wgs->busy_status = BUSY_NOT;
+    wgs->font_zoom = FONT_ZOOM_NORMAL;
 
     wgs->conf = conf_new();
 
@@ -1704,6 +1717,67 @@ static bool tab_close_key(int vk, LPARAM lParam)
 
     close_tab(tab_active, true);
     return true;
+}
+
+/*
+ * Ctrl+= / Ctrl++ enlarge the terminal font, and Ctrl+- shrink it, in
+ * steps of FONT_ZOOM_STEP percent of the size in the configuration.
+ * Shift is allowed, so Ctrl+Shift+= (which is what produces '+' on
+ * layouts where the plus needs a shift) zooms in as well; Alt is not,
+ * because Ctrl+Alt+... is AltGr on keyboard layouts that use it for
+ * real characters.
+ *
+ * Key auto-repeat is deliberately not suppressed, so holding the chord
+ * down zooms continuously.
+ *
+ * Returns true if the keystroke was consumed (i.e. it was a zoom
+ * chord).
+ */
+static bool font_zoom_key(WinGuiSeat *wgs, int vk)
+{
+    if (!(GetKeyState(VK_CONTROL) & 0x8000) ||
+        (GetKeyState(VK_MENU) & 0x8000))
+        return false;
+
+    if (vk == VK_OEM_PLUS || vk == VK_ADD)
+        font_zoom_apply(wgs, +FONT_ZOOM_STEP);
+    else if (vk == VK_OEM_MINUS || vk == VK_SUBTRACT)
+        font_zoom_apply(wgs, -FONT_ZOOM_STEP);
+    else
+        return false;
+
+    return true;
+}
+
+/*
+ * Rebuild the fonts at a new zoom level and re-fit the terminal to it,
+ * the same way applying the Change Settings box does: reset_window()
+ * reloads the fonts (init_fonts applies font_zoom to the configured
+ * size) and sizes the terminal window to a whole character grid, and
+ * tab_relayout() then hands that window back to the frame, whose
+ * WM_SIZE recalculates the rows and columns for the new font and tells
+ * the server about them.
+ */
+static void font_zoom_apply(WinGuiSeat *wgs, int delta)
+{
+    int zoom;
+
+    if (!wgs || !wgs->term || !wgs->term_hwnd)
+        return;
+
+    zoom = wgs->font_zoom + delta;
+    if (zoom < FONT_ZOOM_MIN)
+        zoom = FONT_ZOOM_MIN;
+    if (zoom > FONT_ZOOM_MAX)
+        zoom = FONT_ZOOM_MAX;
+    if (zoom == wgs->font_zoom)
+        return;
+
+    wgs->font_zoom = zoom;
+
+    reset_window(wgs, 2);
+    tab_relayout();
+    InvalidateRect(wgs->term_hwnd, NULL, true);
 }
 
 static void tab_add(WinGuiSeat *wgs)
@@ -3246,6 +3320,7 @@ static WinGuiSeat *new_session(Conf *conf, const wchar_t *tab_name,
     wgs->termwin.vt = &windows_termwin_vt;
     wgs->caret_x = wgs->caret_y = -1;
     wgs->busy_status = BUSY_NOT;
+    wgs->font_zoom = FONT_ZOOM_NORMAL;
     wgs->conf = conf;
     if (tab_name && *tab_name)
         wgs->tab_name = dupwcs(tab_name);
@@ -3835,6 +3910,21 @@ static void init_fonts(WinGuiSeat *wgs, int pick_width, int pick_height)
         if (wgs->font_height > 0) {
             wgs->font_height = -MulDiv(
                 wgs->font_height, wgs->dpi_info.cur_dpi.y, 72);
+        }
+        /*
+         * Apply the runtime zoom from Ctrl+= / Ctrl+-. This scales the
+         * pixel height we derived above rather than the point size in
+         * the configuration, so zooming never modifies the saved
+         * session settings, and it composes with the DPI scaling.
+         */
+        if (wgs->font_height != 0 &&
+            wgs->font_zoom != FONT_ZOOM_NORMAL) {
+            int h = wgs->font_height < 0 ? -wgs->font_height :
+                wgs->font_height;
+            h = (h * wgs->font_zoom + FONT_ZOOM_NORMAL/2) / FONT_ZOOM_NORMAL;
+            if (h < 1)
+                h = 1;
+            wgs->font_height = wgs->font_height < 0 ? -h : h;
         }
     }
     wgs->font_width = pick_width;
@@ -5011,6 +5101,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                     resize_action != conf_get_int(prev_conf,
                                                   CONF_resize_action))
                     init_lvl = 2;
+
+                /*
+                 * A font change made in the settings box is an explicit
+                 * instruction about how big the text should be, so drop
+                 * any Ctrl+= / Ctrl+- zoom and use the new size as it
+                 * was entered.
+                 */
+                if (strcmp(font->name, prev_font->name) ||
+                    font->isbold != prev_font->isbold ||
+                    font->height != prev_font->height ||
+                    font->charset != prev_font->charset ||
+                    conf_get_int(wgs->conf, CONF_font_quality) !=
+                    conf_get_int(prev_conf, CONF_font_quality))
+                    wgs->font_zoom = FONT_ZOOM_NORMAL;
             }
 
             /*
@@ -5741,13 +5845,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
 
         /*
          * Ctrl+1..Ctrl+9 jump to the tab with that number, and
-         * Ctrl+Shift+W closes the active one. Intercepted ahead of
-         * TranslateKey so the keystroke never reaches the session at
-         * all, whether or not a tab with that number exists.
+         * Ctrl+Shift+W closes the active one; Ctrl+= / Ctrl+- zoom the
+         * font. Intercepted ahead of TranslateKey so the keystroke
+         * never reaches the session at all, whether or not a tab with
+         * that number exists.
          */
         if (message == WM_KEYDOWN && tab_switch_key((int)wParam))
             return 0;
         if (message == WM_KEYDOWN && tab_close_key((int)wParam, lParam))
+            return 0;
+        if (message == WM_KEYDOWN && font_zoom_key(wgs, (int)wParam))
             return 0;
 
         /*
