@@ -56,6 +56,7 @@
 #define SFTP_PROTO_VERSION 3
 
 #define PERMS_DIRECTORY   040000
+#define PERMS_SYMLINK     0120000
 
 /*
  * External references. The sftp client module sftp.c expects to be

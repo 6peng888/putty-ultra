@@ -122,6 +122,8 @@ enum {
     SG_P_REALPATH,         /* changing the remote directory */
     SG_P_OPENDIR,
     SG_P_READDIR,
+    SG_P_LINKSTAT,         /* looking up whether a symlink points at a
+                            * directory (listings report the link itself) */
     SG_P_CLOSE_DIR,
     SG_P_TASKMKDIR,        /* batch: create a remote directory */
     SG_P_TASKOPENDIR,      /* batch: start listing a remote directory */
@@ -195,6 +197,8 @@ struct SgEntry {
     time_t mtime;
     bool is_dir;
     bool reparse;               /* junction or symlink: don't recurse into */
+    bool is_link;               /* remote entry that is a symbolic link */
+    bool link_checked;          /* its target has been looked at already */
 };
 
 struct SgPane {
@@ -373,6 +377,8 @@ struct SftpGui {
     /* Remote directory listing under construction. */
     struct SgEntry *rents;
     int nrents, rents_size;
+    int link_scan;              /* next rents[] entry to look a symlink up
+                                 * in, while building a listing */
 
     /* Bulk transfer state. */
     bool busy, uploading, cancel;
@@ -740,6 +746,8 @@ static void sg_entry_push(struct SgEntry **arr, int *n, int *size,
     e->mtime = mt;
     e->is_dir = dir;
     e->reparse = false;
+    e->is_link = false;
+    e->link_checked = false;
 }
 
 static int sg_entry_cmp(const void *av, const void *bv)
@@ -1643,6 +1651,8 @@ static void sg_pane_refilter(SftpGui *g, struct SgPane *p)
         sg_entry_push(&vis, &n, &size, p->all[i].name, p->all[i].wname,
                       p->all[i].size, p->all[i].mtime, p->all[i].is_dir);
         vis[n-1].reparse = p->all[i].reparse;
+        vis[n-1].is_link = p->all[i].is_link;
+        vis[n-1].link_checked = p->all[i].link_checked;
     }
 
     sg_entries_free(p->ents, p->nents);
@@ -2084,6 +2094,10 @@ static bool sg_parse_ls_line(char *line, struct SgEntry *e)
         *arrow = '\0';
 
     e->is_dir = (type == 'd');
+    /* "ls -l" describes the link itself; whether it points at a
+     * directory is worked out from the dereferenced listing that
+     * sg_scp_ls_start asks for as well. */
+    e->is_link = (type == 'l');
     e->name = dupstr(name);
     e->wname = NULL;
     if (type == 'd' || type == '-' || type == 'l')
@@ -2119,9 +2133,23 @@ static bool sg_parse_ls_line(char *line, struct SgEntry *e)
 }
 
 /*
- * Turn the output of "cd DIR && pwd && ls -lA" into a canonical path
- * plus a list of entries. Either output pointer may be NULL. 'out' is
- * modified in place.
+ * The remote shell echoes this between the plain "ls -lA" listing and
+ * the dereferenced "ls -lLA" one, so that the parser can tell them
+ * apart. See sg_scp_ls_start.
+ */
+#define SG_LS_SYMLINK_MARK "__SG_LS_FOLLOWED_LINKS__"
+
+/*
+ * Turn the output of
+ *
+ *     cd DIR && pwd && ls -lA && echo MARK && ( ls -lLA; true )
+ *
+ * into a canonical path plus a list of entries. Either output pointer
+ * may be NULL. 'out' is modified in place.
+ *
+ * The first listing reports a symbolic link as such, so a link to a
+ * directory would look like a file; the second listing follows links,
+ * and any name it reports as a directory is marked as one here.
  */
 static void sg_parse_ls(char *out, char **canon_p,
                         struct SgEntry **ents_p, int *nents_p)
@@ -2129,7 +2157,7 @@ static void sg_parse_ls(char *out, char **canon_p,
     struct SgEntry *ents = NULL;
     int n = 0, size = 0;
     char *p = out, *canon = NULL;
-    bool first = true;
+    bool first = true, followed = false;
 
     while (p && *p) {
         char *line = p;
@@ -2153,15 +2181,40 @@ static void sg_parse_ls(char *out, char **canon_p,
         }
         if (!*line)
             continue;
+        if (!strcmp(line, SG_LS_SYMLINK_MARK)) {
+            followed = true;
+            continue;
+        }
 
         struct SgEntry e;
-        if (sg_parse_ls_line(line, &e)) {
+        if (!sg_parse_ls_line(line, &e))
+            continue;
+
+        if (!followed) {
             if (n >= size) {
                 size = size ? size * 2 : 64;
                 ents = sresize(ents, size, struct SgEntry);
             }
             ents[n++] = e;
+            continue;
         }
+
+        /*
+         * Second listing: a directory here means the name is either a
+         * plain directory (already right) or a link that resolves to
+         * one. Broken links are missing from this listing and so stay
+         * files, which is the best that can be said about them.
+         */
+        if (e.is_dir) {
+            for (int i = 0; i < n; i++) {
+                if (ents[i].is_link && !strcmp(ents[i].name, e.name)) {
+                    ents[i].is_dir = true;
+                    break;
+                }
+            }
+        }
+        sfree(e.name);
+        sfree(e.wname);
     }
 
     if (canon_p)
@@ -2185,13 +2238,23 @@ static void sg_scp_ls_start(SftpGui *g, const char *dir, bool walk)
 {
     char *q, *cmd;
 
+    /*
+     * The second listing follows symlinks, so that the parser can tell
+     * a link to a directory from a link to a file. Its exit status is
+     * forced to success because "ls -L" complains about links whose
+     * target does not exist.
+     */
     if (dir && *dir) {
         q = sg_shquote(dir);
-        cmd = dupprintf("cd %s && pwd && LC_ALL=C ls -lA", q);
+        cmd = dupprintf("cd %s && pwd && LC_ALL=C ls -lA && echo %s && "
+                        "( LC_ALL=C ls -lLA; true )",
+                        q, SG_LS_SYMLINK_MARK);
         sfree(q);
     } else {
         /* No directory given: start where the login puts us. */
-        cmd = dupstr("pwd && LC_ALL=C ls -lA");
+        cmd = dupprintf("pwd && LC_ALL=C ls -lA && echo %s && "
+                        "( LC_ALL=C ls -lLA; true )",
+                        SG_LS_SYMLINK_MARK);
     }
 
     g->exec_walk = walk;
@@ -2306,6 +2369,32 @@ static void sg_remote_send_readdir(SftpGui *g)
     sftp_register(req);
 }
 
+/*
+ * A directory listing reports a symbolic link as the link itself, so a
+ * link to a directory arrives looking like a file. Ask the server about
+ * each link in turn (SSH_FXP_STAT follows the link) before carrying on
+ * with the listing, and mark the ones that turn out to be directories.
+ * Once every link has been looked at, the next READDIR goes out.
+ */
+static void sg_remote_next_link(SftpGui *g)
+{
+    while (g->link_scan < g->nrents) {
+        struct SgEntry *e = &g->rents[g->link_scan];
+
+        if (e->is_link && !e->link_checked) {
+            char *path = sg_join(g->rmt.cwd, e->name, '/');
+
+            e->link_checked = true;
+            g->pend = SG_P_LINKSTAT;
+            sftp_register(fxp_stat_send(path));
+            sfree(path);
+            return;
+        }
+        g->link_scan++;
+    }
+    sg_remote_send_readdir(g);
+}
+
 static void sg_remote_fill(SftpGui *g)
 {
     struct SgEntry *ents;
@@ -2319,6 +2408,7 @@ static void sg_remote_fill(SftpGui *g)
     n = g->nrents;
     g->rents = NULL;
     g->nrents = g->rents_size = 0;
+    g->link_scan = 0;
     sg_pane_set_all(g, &g->rmt, ents, n);
 }
 
@@ -2332,6 +2422,7 @@ static void sg_remote_refresh(SftpGui *g)
     sg_entries_free(g->rents, g->nrents);
     g->rents = NULL;
     g->nrents = g->rents_size = 0;
+    g->link_scan = 0;
 
     sg_set_text(g->rmt.path, g->rmt.cwd);
 
@@ -3409,7 +3500,11 @@ static void sg_exec_done(SftpGui *g)
                 l = sg_join(g->walk_local, ents[i].name, '\\');
                 r = sg_join(g->walk_remote, ents[i].name, '/');
                 if (ents[i].is_dir) {
-                    sg_task_push(g, SG_T_RDIR, l, r, 0);
+                    /* A link to a directory is not followed down the
+                     * tree: it may point back at something already being
+                     * copied, which would make the walk endless. */
+                    if (!ents[i].is_link)
+                        sg_task_push(g, SG_T_RDIR, l, r, 0);
                 } else {
                     sg_task_push(g, SG_T_FILE, l, r, ents[i].size);
                     g->total_bytes += ents[i].size;
@@ -3643,12 +3738,19 @@ static void sg_handle_packet(SftpGui *g, struct sftp_packet *pktin)
         }
         for (int i = 0; i < names->nnames; i++) {
             struct fxp_name *fn = &names->names[i];
-            bool isdir =
-                ((fn->attrs.flags & SSH_FILEXFER_ATTR_PERMISSIONS) &&
-                 (fn->attrs.permissions & 0170000) == PERMS_DIRECTORY);
+            unsigned long type = 0;
+            bool isdir, islink;
 
             if (!strcmp(fn->filename, ".") || !strcmp(fn->filename, ".."))
                 continue;
+            if (fn->attrs.flags & SSH_FILEXFER_ATTR_PERMISSIONS)
+                type = fn->attrs.permissions & 0170000;
+            isdir = (type == PERMS_DIRECTORY);
+            /* Without permissions from the server, the long name is the
+             * only clue that an entry is a link ("lrwxrwxrwx ..."). */
+            islink = (type == PERMS_SYMLINK) ||
+                (!type && fn->longname && fn->longname[0] == 'l');
+
             sg_entry_push(&g->rents, &g->nrents, &g->rents_size,
                           fn->filename, NULL,
                           (fn->attrs.flags & SSH_FILEXFER_ATTR_SIZE) ?
@@ -3656,9 +3758,27 @@ static void sg_handle_packet(SftpGui *g, struct sftp_packet *pktin)
                           (fn->attrs.flags & SSH_FILEXFER_ATTR_ACMODTIME) ?
                           (time_t)fn->attrs.mtime : 0,
                           isdir);
+            if (islink)
+                g->rents[g->nrents-1].is_link = true;
         }
         fxp_free_names(names);
-        sg_remote_send_readdir(g);
+        sg_remote_next_link(g);
+        break;
+      }
+
+      case SG_P_LINKSTAT: {
+        struct fxp_attrs attrs;
+        bool ok = fxp_stat_recv(pktin, req, &attrs);
+
+        g->pend = SG_P_NONE;
+        if (ok && g->link_scan < g->nrents &&
+            (attrs.flags & SSH_FILEXFER_ATTR_PERMISSIONS) &&
+            (attrs.permissions & 0170000) == PERMS_DIRECTORY) {
+            /* A link to a directory is browsed into like the real
+             * thing. Its size stays the link's own, as "ls -l" shows. */
+            g->rents[g->link_scan].is_dir = true;
+        }
+        sg_remote_next_link(g);
         break;
       }
 
@@ -4371,7 +4491,9 @@ static void sg_remote_delete(SftpGui *g, int *idxs, int n)
         struct SgEntry *e = &g->rmt.ents[idxs[i]];
         char *path = sg_join(g->rmt.cwd, e->name, '/');
 
-        sg_del_push(g, path, e->is_dir);
+        /* A link is removed as the link: deleting it must not empty the
+         * directory it points at. */
+        sg_del_push(g, path, e->is_dir && !e->is_link);
         sfree(path);
     }
     sg_del_run(g);
