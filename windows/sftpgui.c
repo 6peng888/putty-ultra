@@ -71,9 +71,8 @@
 #define SG_ID_UPLOAD     1120
 #define SG_ID_DOWNLOAD   1121
 #define SG_ID_CANCEL     1123
-#define SG_ID_PROGRESS   1130
 #define SG_ID_STATUS     1131
-#define SG_ID_PROGTEXT   1132
+#define SG_ID_STATS      1132
 
 /* Items of the list views' context menu. */
 #define SG_ID_CTX_XFER   1140
@@ -183,9 +182,15 @@ enum {
 #define SG_TAG_READ  1
 #define SG_TAG_WRITE 2
 
-/* How much we ask for in one go, and how many requests we keep in flight. */
+/*
+ * How much we ask for in one go, and how many requests we keep in
+ * flight. The pipeline depth is what sets the achievable throughput on
+ * a link with any round-trip time, so this matches the 1 MB window that
+ * pscp and psftp use rather than the handful of requests a single-file
+ * transfer seems to need.
+ */
 #define SG_CHUNK      32768
-#define SG_INFLIGHT   4
+#define SG_INFLIGHT   32
 
 typedef struct SftpGui SftpGui;
 
@@ -336,8 +341,8 @@ struct SftpGui {
 
     struct SgPane lcl, rmt;     /* local and remote panes */
     HWND btn_upload, btn_download, btn_cancel;
-    HWND prog, status;
-    HWND progtext;              /* "12.3 MB / 45.6 MB   1.2 MB/s" */
+    HWND status;                /* what the transfer is doing, on the left */
+    HWND stats;                 /* counts, rate and time, on the right */
 
     /* The saved session this page belongs to, or NULL if it wasn't
      * started from one; path bookmarks are kept per saved session. */
@@ -355,6 +360,11 @@ struct SftpGui {
     double speed;               /* bytes per second */
     uint64_t speed_mark;        /* done_bytes at the last sample */
     DWORD speed_tick;           /* GetTickCount() at the last sample */
+
+    /* File counts and elapsed time for the same readout. */
+    uint64_t total_files, done_files;
+    DWORD start_tick;           /* GetTickCount() when the batch started */
+    DWORD elapsed_ms;           /* frozen when the batch ends */
 
     /* Reassembly buffer for incoming SFTP data. */
     char *inbuf;
@@ -613,6 +623,17 @@ static void sg_fmt_time(char *buf, size_t n, time_t t)
     tm = localtime(&t);
     if (!tm || !strftime(buf, n, "%Y-%m-%d %H:%M", tm))
         snprintf(buf, n, "-");
+}
+
+/* Elapsed time as HH:MM:SS, for the transfer readout. */
+static void sg_fmt_elapsed(char *buf, size_t n, uint64_t ms)
+{
+    uint64_t secs = ms / 1000;
+
+    snprintf(buf, n, "%02llu:%02llu:%02llu",
+             (unsigned long long)(secs / 3600),
+             (unsigned long long)((secs / 60) % 60),
+             (unsigned long long)(secs % 60));
 }
 
 /* Join two path elements with a separator, avoiding a doubled one. */
@@ -1766,6 +1787,15 @@ static void sg_chan_open_failed(Channel *chan, const char *errtext)
     PostMessage(c->g->hwnd, WM_SG_NOTIFY, SG_CH_OPENFAILED, (LPARAM)msg);
 }
 
+/*
+ * Channel data from the SSH layer. The return value is not "how much we
+ * took": the connection layer treats it as the amount still sitting
+ * unconsumed in this channel and uses it to size the receive window and
+ * to decide whether to throttle the connection. Since everything here is
+ * copied into our own buffers and processed before returning, there is
+ * no backlog to report - returning len instead pins the window at its
+ * 16 KB starting size and caps a transfer at one window per round trip.
+ */
 static size_t sg_chan_send(Channel *chan, bool is_stderr,
                            const void *data, size_t len)
 {
@@ -1773,7 +1803,7 @@ static size_t sg_chan_send(Channel *chan, bool is_stderr,
     SftpGui *g = c->g;
 
     if (!g)
-        return len;
+        return 0;
 
     if (c->kind != SG_CHAN_SFTP) {
         char **buf = is_stderr ? &c->err : &c->out;
@@ -1793,11 +1823,11 @@ static size_t sg_chan_send(Channel *chan, bool is_stderr,
 
         if (c->interactive && g->exec_chan == c)
             sg_scp_rx(g, c);
-        return len;
+        return 0;
     }
 
     if (is_stderr)
-        return len;                     /* nothing useful in stderr */
+        return 0;                       /* nothing useful in stderr */
     if (g->inlen + len > g->incap) {
         size_t want = g->incap ? g->incap : 16384;
         while (want < g->inlen + len)
@@ -1811,7 +1841,7 @@ static size_t sg_chan_send(Channel *chan, bool is_stderr,
      * belong to this window's table. */
     sftp_client_select(g->sftpc);
     sg_process_inbuf(g);
-    return len;
+    return 0;
 }
 
 static void sg_chan_send_eof(Channel *chan)
@@ -2481,20 +2511,8 @@ static void sg_set_busy(SftpGui *g, bool busy)
         KillTimer(g->hwnd, SG_TIMER_PROGRESS);
 }
 
-/* Advance the progress bar. Cheap enough to call per chunk of data. */
-static void sg_progress(SftpGui *g)
-{
-    int permille = 0;
-
-    if (g->total_bytes > 0)
-        permille = (int)((g->done_bytes * 1000) / g->total_bytes);
-    if (permille > 1000)
-        permille = 1000;
-    SendMessageW(g->prog, PBM_SETPOS, (WPARAM)permille, 0);
-}
-
 /*
- * Refresh the "transferred / total   rate" text.
+ * Refresh the "files, transferred / total, rate, elapsed" readout.
  *
  * This runs off a timer rather than off incoming data, because SCP
  * hands a whole burst to the SSH layer in one go: keyed to the data, the
@@ -2502,11 +2520,28 @@ static void sg_progress(SftpGui *g)
  * stays live for both protocols, and the smoothing makes the rate read
  * as a rate instead of jittering with every sample.
  */
+static void sg_show_stats(SftpGui *g, uint64_t elapsed)
+{
+    char done[32], total[32], spd[32], tm[32], text[192];
+
+    sg_fmt_size(done, sizeof(done), g->done_bytes);
+    sg_fmt_size(total, sizeof(total), g->total_bytes);
+    sg_fmt_size(spd, sizeof(spd), (uint64_t)g->speed);
+    sg_fmt_elapsed(tm, sizeof(tm), elapsed);
+    snprintf(text, sizeof(text),
+             "文件 %llu/%llu   %s / %s   %s/s   用时 %s",
+             (unsigned long long)g->done_files,
+             (unsigned long long)g->total_files,
+             done, total, spd, tm);
+    sg_set_text(g->stats, text);
+}
+
 static void sg_progress_refresh(SftpGui *g)
 {
     DWORD now = GetTickCount();
     DWORD dt = now - g->speed_tick;
-    char done[32], total[32], spd[32], text[160];
+    uint64_t elapsed = g->busy ? (uint64_t)(now - g->start_tick)
+                               : (uint64_t)g->elapsed_ms;
 
     if (dt >= 100) {
         double instant = (double)(g->done_bytes - g->speed_mark) * 1000.0 / dt;
@@ -2519,28 +2554,20 @@ static void sg_progress_refresh(SftpGui *g)
         g->speed_tick = now;
     }
 
-    sg_fmt_size(done, sizeof(done), g->done_bytes);
-    sg_fmt_size(total, sizeof(total), g->total_bytes);
-    if (g->speed >= 1024.0) {
-        sg_fmt_size(spd, sizeof(spd), (uint64_t)g->speed);
-        snprintf(text, sizeof(text), "%s / %s   %s/s", done, total, spd);
-    } else {
-        snprintf(text, sizeof(text), "%s / %s", done, total);
-    }
-    sg_set_text(g->progtext, text);
-    sg_progress(g);
+    sg_show_stats(g, elapsed);
 }
 
-/* The final figures, with no rate: shown once a batch has ended. */
+/* The final figures, with the average rate over the whole batch. */
 static void sg_progress_final(SftpGui *g)
 {
-    char done[32], total[32], text[96];
+    uint64_t elapsed = (uint64_t)(GetTickCount() - g->start_tick);
 
-    g->speed = 0.0;
-    sg_fmt_size(done, sizeof(done), g->done_bytes);
-    sg_fmt_size(total, sizeof(total), g->total_bytes);
-    snprintf(text, sizeof(text), "%s / %s", done, total);
-    sg_set_text(g->progtext, text);
+    if (elapsed > 0)
+        g->speed = (double)g->done_bytes * 1000.0 / (double)elapsed;
+    else
+        g->speed = 0.0;
+    g->elapsed_ms = (DWORD)elapsed;
+    sg_show_stats(g, elapsed);
 }
 
 /* ----------------------------------------------------------------------
@@ -2563,6 +2590,8 @@ static void sg_task_push(SftpGui *g, int kind, const char *local,
     t->local = dupstr(local);
     t->remote = dupstr(remote);
     t->size = size;
+    if (kind == SG_T_FILE)
+        g->total_files++;
 }
 
 static void sg_tasks_free(SftpGui *g)
@@ -2649,6 +2678,7 @@ static void sg_dl_check_done(SftpGui *g)
 
     if (!g->at_eof || g->inflight > 0)
         return;
+    g->done_files++;
     if (g->lfh != INVALID_HANDLE_VALUE) {
         CloseHandle(g->lfh);
         g->lfh = INVALID_HANDLE_VALUE;
@@ -2707,6 +2737,7 @@ static void sg_ul_check_done(SftpGui *g)
 
     if (!g->at_eof || g->inflight > 0)
         return;
+    g->done_files++;
     if (g->lfh != INVALID_HANDLE_VALUE) {
         CloseHandle(g->lfh);
         g->lfh = INVALID_HANDLE_VALUE;
@@ -2928,15 +2959,17 @@ static void sg_start_batch(SftpGui *g, bool uploading)
 {
     g->uploading = uploading;
     g->cancel = false;
-    /* total_bytes was worked out while queueing the selection, so it
-     * must not be cleared here. */
+    /* total_bytes and total_files were worked out while queueing the
+     * selection, so they must not be cleared here. */
     g->done_bytes = 0;
+    g->done_files = 0;
     g->any_error = false;
     g->speed = 0.0;
     g->speed_mark = 0;
     g->speed_tick = GetTickCount();
-    SendMessageW(g->prog, PBM_SETPOS, 0, 0);
-    sg_set_text(g->progtext, "");
+    g->start_tick = g->speed_tick;
+    g->elapsed_ms = 0;
+    sg_progress_refresh(g);
     sg_set_busy(g, true);
     sg_xfer_next(g);
 }
@@ -3084,7 +3117,6 @@ static void sg_scp_ul_pump(SftpGui *g)
         sg_exec_write(g, buf, got);
         g->scp_sent += got;
         g->done_bytes += got;
-        sg_progress_refresh(g);
     }
 
     /* End of the file body. */
@@ -3253,6 +3285,7 @@ static void sg_scp_rx(SftpGui *g, struct SgChan *c)
                 return;
             }
             sg_exec_consume(c, 1);
+            g->done_files++;
             g->batch_pos++;
             if (g->batch_pos < g->nbatch) {
                 sg_scp_ul_next_file(g);
@@ -3378,7 +3411,6 @@ static void sg_scp_rx(SftpGui *g, struct SgChan *c)
             sg_exec_consume(c, take);
             g->scp_remaining -= take;
             g->done_bytes += take;
-            sg_progress_refresh(g);
             again = true;
             break;
           }
@@ -3392,6 +3424,7 @@ static void sg_scp_rx(SftpGui *g, struct SgChan *c)
             }
             sg_exec_consume(c, 1);
             sg_exec_write(g, "", 1);   /* acknowledge the file */
+            g->done_files++;
             g->batch_pos++;
             /* Back for the next C record, or for the source's EOF
              * marker if that was the last file. */
@@ -3623,7 +3656,6 @@ static void sg_handle_read_reply(SftpGui *g, struct sftp_request *req,
             return;
         }
         g->done_bytes += n;
-        sg_progress_refresh(g);
     }
     sfree(ctx->buf);
     sfree(ctx);
@@ -3655,7 +3687,6 @@ static void sg_handle_write_reply(SftpGui *g, struct sftp_request *req,
     }
     g->done_bytes += ctx->len;
     sfree(ctx);
-    sg_progress_refresh(g);
 
     if (g->cancel) {
         g->at_eof = true;
@@ -4123,8 +4154,10 @@ static void sg_enqueue_selection(SftpGui *g, bool from_local)
     int n = sg_lv_collect(lv, &idxs);
     int count = 0;
 
-    /* Sizes are accumulated here; the batch starts with none. */
+    /* Sizes and file counts are accumulated here; the batch starts
+     * with none. */
     g->total_bytes = 0;
+    g->total_files = 0;
 
     for (int i = 0; i < n; i++) {
         struct SgEntry *e;
@@ -5044,14 +5077,11 @@ static void sg_create_controls(SftpGui *g)
     g->btn_cancel = sg_child(g, L"BUTTON", "Cancel Transfer", BS_PUSHBUTTON, 0,
                              SG_ID_CANCEL);
 
-    g->prog = sg_child(g, PROGRESS_CLASSW, "", 0, 0, SG_ID_PROGRESS);
-    SendMessageW(g->prog, PBM_SETRANGE32, 0, 1000);
+    g->stats = sg_child(g, L"STATIC", "", SS_RIGHT | SS_CENTERIMAGE, 0,
+                        SG_ID_STATS);
 
-    g->progtext = sg_child(g, L"STATIC", "", SS_RIGHT | SS_CENTERIMAGE, 0,
-                           SG_ID_PROGTEXT);
-
-    g->status = sg_child(g, L"STATIC", "", SS_LEFT | SS_ENDELLIPSIS, 0,
-                         SG_ID_STATUS);
+    g->status = sg_child(g, L"STATIC", "", SS_LEFT | SS_CENTERIMAGE |
+                         SS_ENDELLIPSIS, 0, SG_ID_STATUS);
 
     EnableWindow(g->btn_cancel, FALSE);
     sg_update_transfer_buttons(g);     /* nothing is selected yet */
@@ -5060,10 +5090,10 @@ static void sg_create_controls(SftpGui *g)
 static void sg_layout(SftpGui *g)
 {
     RECT rc;
-    int W, H, m = 8, gap = 6, row = 24, midw = 96, prog_h = 16;
+    int W, H, m = 8, gap = 6, row = 24, midw = 96;
     int upw = 28, rfw = 52, bmw = 58;  /* "..", Refresh and Bookmark */
-    int pane_w, left_x, right_x, list_y, list_h, prog_y, status_y, bx, by;
-    int filter_y, namew, total_w;
+    int pane_w, left_x, right_x, list_y, list_h, status_y, bx, by;
+    int filter_y, namew, total_w, stats_w;
     int i;
 
     GetClientRect(g->hwnd, &rc);
@@ -5078,10 +5108,9 @@ static void sg_layout(SftpGui *g)
     total_w = right_x + pane_w - left_x;
 
     status_y = H - m - row;
-    prog_y = status_y - gap - prog_h;
     filter_y = m + row + gap;
     list_y = filter_y + row + gap;
-    list_h = prog_y - gap - list_y;
+    list_h = status_y - gap - list_y;
     if (list_h < 60)
         list_h = 60;
 
@@ -5120,11 +5149,17 @@ static void sg_layout(SftpGui *g)
     by += row + gap * 2;
     sg_place(g->btn_cancel, bx, by, midw, row);
 
-    /* The bar, with the transferred/total bytes and the rate beside it. */
-    sg_place(g->prog, left_x, prog_y, total_w - 300, prog_h);
-    sg_place(g->progtext, left_x + total_w - 296, prog_y - 2, 296,
-             prog_h + 4);
-    sg_place(g->status, left_x, status_y, total_w, row);
+    /*
+     * One status line: what is happening on the left, and the file and
+     * byte counts, rate and elapsed time right-aligned beside it.
+     */
+    stats_w = 460;
+    if (stats_w > total_w - 160)
+        stats_w = total_w - 160;
+    if (stats_w < 220)
+        stats_w = 220;
+    sg_place(g->stats, left_x + total_w - stats_w, status_y, stats_w, row);
+    sg_place(g->status, left_x, status_y, total_w - stats_w - gap, row);
 
     /*
      * Size, Type and Modified are fixed; Name takes whatever is left.
